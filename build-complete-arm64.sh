@@ -526,8 +526,8 @@ build_android() {
         -DANDROID_STL=c++_shared \
         -DANDROID_NATIVE_API_LEVEL=23
     
-    # Build
-    cmake --build . --config Release
+    # Build with parallel jobs (use all available CPU cores)
+    cmake --build . --config Release --parallel $(nproc)
     
     # The library should already be in the correct location from CMake
     # Just verify it exists
