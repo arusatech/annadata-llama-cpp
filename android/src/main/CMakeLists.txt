@@ -83,15 +83,9 @@ set(
     ${CMAKE_SOURCE_DIR}/jni.cpp
 )
 
-# Find Android libraries - use proper Android approach
+# Find Android libraries
 find_library(LOG_LIB log)
 find_library(ANDROID_LIB android)
-
-# Debug library paths
-message(STATUS "LOG_LIB found at: ${LOG_LIB}")
-message(STATUS "ANDROID_LIB found at: ${ANDROID_LIB}")
-message(STATUS "CMAKE_SYSROOT: ${CMAKE_SYSROOT}")
-message(STATUS "CMAKE_ANDROID_ARCH_ABI: ${CMAKE_ANDROID_ARCH_ABI}")
 
 # ARM64 specific build function for real devices
 function(build_library_arm64 target_name)
