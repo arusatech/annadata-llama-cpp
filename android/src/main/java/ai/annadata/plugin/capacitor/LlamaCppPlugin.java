@@ -247,7 +247,20 @@ public class LlamaCppPlugin extends Plugin {
                 JSObject jsResult = new JSObject();
                 Map<String, Object> data = result.getData();
                 for (Map.Entry<String, Object> entry : data.entrySet()) {
-                    jsResult.put(entry.getKey(), entry.getValue());
+                    String key = entry.getKey();
+                    Object value = entry.getValue();
+                    
+                    // Convert Java arrays to JSArray
+                    if (value instanceof Integer[]) {
+                        Integer[] intArray = (Integer[]) value;
+                        JSArray jsArray = new JSArray();
+                        for (Integer item : intArray) {
+                            jsArray.put(item);
+                        }
+                        jsResult.put(key, jsArray);
+                    } else {
+                        jsResult.put(key, value);
+                    }
                 }
                 call.resolve(jsResult);
             } else {

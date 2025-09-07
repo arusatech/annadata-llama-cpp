@@ -51,8 +51,11 @@ file(GLOB SOURCES_TOOLS
     "${CMAKE_SOURCE_DIR}/../../../cpp/tools/mtmd/*.cpp"
 )
 
+# Add JNI bridge source file
+set(JNI_SOURCES "${CMAKE_SOURCE_DIR}/jni.cpp")
+
 # Combine all sources - explicitly exclude arch-specific directories
-set(SOURCES ${SOURCES_MAIN} ${SOURCES_GGML_CPU} ${SOURCES_TOOLS})
+set(SOURCES ${SOURCES_MAIN} ${SOURCES_GGML_CPU} ${SOURCES_TOOLS} ${JNI_SOURCES})
 
 # Remove architecture-specific files to avoid duplicates
 list(FILTER SOURCES EXCLUDE REGEX ".*/arch/.*")

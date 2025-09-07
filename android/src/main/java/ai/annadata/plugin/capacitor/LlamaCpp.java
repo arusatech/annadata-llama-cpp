@@ -273,8 +273,35 @@ public class LlamaCpp {
 
     static {
         try {
-            System.loadLibrary("llama-cpp-x86_64");
-            Log.i(TAG, "Successfully loaded llama-cpp native library");
+
+            // Detect the current architecture and load the appropriate library
+            String arch = System.getProperty("os.arch");
+            String abi = android.os.Build.SUPPORTED_ABIS[0]; // Get primary ABI
+            String libraryName;
+            
+            // Map Android ABI to library name
+            switch (abi) {
+                case "arm64-v8a":
+                    libraryName = "llama-cpp-arm64-v8a";
+                    break;
+                case "armeabi-v7a":
+                    libraryName = "llama-cpp-armeabi-v7a";
+                    break;
+                case "x86":
+                    libraryName = "llama-cpp-x86";
+                    break;
+                case "x86_64":
+                    libraryName = "llama-cpp-x86_64";
+                    break;
+                default:
+                    Log.w(TAG, "Unsupported ABI: " + abi + ", falling back to arm64-v8a");
+                    libraryName = "llama-cpp-arm64-v8a";
+                    break;
+            }
+            
+            Log.i(TAG, "Loading native library for ABI: " + abi + " (library: " + libraryName + ")");
+            System.loadLibrary(libraryName);
+            Log.i(TAG, "Successfully loaded llama-cpp native library: " + libraryName);
         } catch (UnsatisfiedLinkError e) {
             Log.e(TAG, "Failed to load llama-cpp native library: " + e.getMessage());
             throw e;
@@ -891,6 +918,8 @@ public class LlamaCpp {
             File externalStorage = Environment.getExternalStorageDirectory();
             paths.add(externalStorage.getAbsolutePath() + "/Documents/" + filename);
             paths.add(externalStorage.getAbsolutePath() + "/Download/" + filename);
+            paths.add(externalStorage.getAbsolutePath() + "/Downloads/" + filename);
+            paths.add(externalStorage.getAbsolutePath() + "/Downloads/models/" + filename);
         }
         
         return paths.toArray(new String[0]);

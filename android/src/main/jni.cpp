@@ -182,11 +182,14 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_initContextNative(
         bool file_found = false;
         
         for (const auto& path : paths_to_check) {
+            LOGI("Checking path: %s", path.c_str());
             if (std::filesystem::exists(path)) {
                 full_model_path = path;
                 file_found = true;
                 LOGI("Found model file at: %s", path.c_str());
                 break;
+            } else {
+                LOGE("Path not found: %s", path.c_str());
             }
         }
         
