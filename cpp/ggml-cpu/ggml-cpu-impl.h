@@ -78,6 +78,36 @@ struct lm_ggml_compute_params {
 #include <sys/prctl.h>
 #endif
 
+// NEON compatibility layer
+#if defined(__ARM_NEON)
+    #include <arm_neon.h>
+    
+    // Only define vcvtnq_s32_f32 for older ARM architectures that don't have it
+    // NDK 29+ includes this function for ARMv8 and newer
+    #if !defined(__aarch64__) && !defined(__ARM_ARCH_8A__) && defined(__ARM_ARCH) && __ARM_ARCH < 8
+        // Emulate vcvtn (round to nearest) for ARMv7
+        inline static int32x4_t vcvtnq_s32_f32(float32x4_t v) {
+            // Round to nearest integer
+            const float32x4_t vhalf = vdupq_n_f32(0.5f);
+            const float32x4_t vnhalf = vdupq_n_f32(-0.5f);
+            const float32x4_t vzero = vdupq_n_f32(0.0f);
+            uint32x4_t mask = vcgeq_f32(v, vzero);
+            float32x4_t rounded = vbslq_f32(mask, vaddq_f32(v, vhalf), vsubq_f32(v, vhalf));
+            return vcvtq_s32_f32(rounded);
+        }
+    #endif
+#endif
+
+#if defined(__s390x__) && defined(LM_GGML_NNPA)
+#ifndef __NNPA__
+#define __NNPA__
+#endif  // __NNPA__
+#endif  // __s390x__ && LM_GGML_NNPA
+
+#if defined(__ARM_FEATURE_SVE)
+#include <sys/prctl.h>
+#endif
+
 #if defined(__ARM_NEON)
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/5404
