@@ -762,6 +762,139 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_getAvailableModelsNative(
     }
 }
 
+// MARK: - Tokenization methods
+
+JNIEXPORT jobject JNICALL
+Java_ai_annadata_plugin_capacitor_LlamaCpp_tokenizeNative(
+    JNIEnv* env, jobject thiz, jlong contextId, jstring text, jobjectArray imagePaths) {
+    
+    try {
+        LOGI("Tokenizing with context ID: %ld", contextId);
+        
+        std::string text_str = jni_utils::jstring_to_string(env, text);
+        LOGI("Text to tokenize: %s", text_str.c_str());
+        
+        // Find the context
+        auto it = contexts.find(contextId);
+        if (it == contexts.end()) {
+            LOGE("Context not found: %ld", contextId);
+            throw_java_exception(env, "java/lang/RuntimeException", "Context not found");
+            return nullptr;
+        }
+        
+        auto& ctx = it->second;
+        if (!ctx || !ctx->ctx) {
+            LOGE("Invalid context or llama context is null");
+            throw_java_exception(env, "java/lang/RuntimeException", "Invalid context");
+            return nullptr;
+        }
+        
+        // Tokenize the text using the context's tokenize method
+        capllama::llama_cap_tokenize_result tokenize_result = ctx->tokenize(text_str, {});
+        std::vector<llama_token> tokens = tokenize_result.tokens;
+        
+        LOGI("Tokenized %zu tokens", tokens.size());
+        
+        // Create Java HashMap for result
+        jclass hashMapClass = env->FindClass("java/util/HashMap");
+        jmethodID hashMapConstructor = env->GetMethodID(hashMapClass, "<init>", "()V");
+        jmethodID putMethod = env->GetMethodID(hashMapClass, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+        
+        jobject resultMap = env->NewObject(hashMapClass, hashMapConstructor);
+        
+        // Create Java ArrayList for tokens
+        jclass arrayListClass = env->FindClass("java/util/ArrayList");
+        jmethodID arrayListConstructor = env->GetMethodID(arrayListClass, "<init>", "()V");
+        jmethodID addMethod = env->GetMethodID(arrayListClass, "add", "(Ljava/lang/Object;)Z");
+        
+        jobject tokensArray = env->NewObject(arrayListClass, arrayListConstructor);
+        
+        // Add tokens to ArrayList
+        jclass integerClass = env->FindClass("java/lang/Integer");
+        jmethodID integerConstructor = env->GetMethodID(integerClass, "<init>", "(I)V");
+        
+        for (llama_token token : tokens) {
+            jobject jToken = env->NewObject(integerClass, integerConstructor, static_cast<jint>(token));
+            env->CallBooleanMethod(tokensArray, addMethod, jToken);
+            env->DeleteLocalRef(jToken);
+        }
+        
+        // Create empty arrays for other fields
+        jobject emptyBitmapHashes = env->NewObject(arrayListClass, arrayListConstructor);
+        jobject emptyChunkPos = env->NewObject(arrayListClass, arrayListConstructor);
+        jobject emptyChunkPosImages = env->NewObject(arrayListClass, arrayListConstructor);
+        
+        // Put all data into result map
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "tokens"), tokensArray);
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "has_images"), 
+            env->NewObject(env->FindClass("java/lang/Boolean"), 
+                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), JNI_FALSE));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "bitmap_hashes"), emptyBitmapHashes);
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "chunk_pos"), emptyChunkPos);
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "chunk_pos_images"), emptyChunkPosImages);
+        
+        LOGI("Tokenization completed successfully");
+        return resultMap;
+        
+    } catch (const std::exception& e) {
+        LOGE("Exception in tokenize: %s", e.what());
+        throw_java_exception(env, "java/lang/RuntimeException", e.what());
+        return nullptr;
+    }
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_annadata_plugin_capacitor_LlamaCpp_detokenizeNative(
+    JNIEnv* env, jobject thiz, jlong contextId, jintArray tokens) {
+    
+    try {
+        LOGI("Detokenizing with context ID: %ld", contextId);
+        
+        // Find the context
+        auto it = contexts.find(contextId);
+        if (it == contexts.end()) {
+            LOGE("Context not found: %ld", contextId);
+            throw_java_exception(env, "java/lang/RuntimeException", "Context not found");
+            return nullptr;
+        }
+        
+        auto& ctx = it->second;
+        if (!ctx || !ctx->ctx) {
+            LOGE("Invalid context or llama context is null");
+            throw_java_exception(env, "java/lang/RuntimeException", "Invalid context");
+            return nullptr;
+        }
+        
+        // Convert Java int array to C++ vector
+        jsize length = env->GetArrayLength(tokens);
+        jint* tokenArray = env->GetIntArrayElements(tokens, nullptr);
+        
+        std::vector<llama_token> llamaTokens;
+        for (jsize i = 0; i < length; i++) {
+            llamaTokens.push_back(static_cast<llama_token>(tokenArray[i]));
+        }
+        
+        env->ReleaseIntArrayElements(tokens, tokenArray, JNI_ABORT);
+        
+        // Detokenize using llama.cpp
+        std::string result = capllama::tokens_to_str(ctx->ctx, llamaTokens.begin(), llamaTokens.end());
+        
+        LOGI("Detokenized to: %s", result.c_str());
+        
+        return jni_utils::string_to_jstring(env, result);
+        
+    } catch (const std::exception& e) {
+        LOGE("Exception in detokenize: %s", e.what());
+        throw_java_exception(env, "java/lang/RuntimeException", e.what());
+        return nullptr;
+    }
+}
+
 } // extern "C"
 
 } // namespace jni_utils

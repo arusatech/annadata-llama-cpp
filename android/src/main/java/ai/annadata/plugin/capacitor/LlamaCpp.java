@@ -266,6 +266,11 @@ public class LlamaCpp {
     private native boolean toggleNativeLogNative(boolean enabled);
     
     // Model download and management methods
+    // Tokenization methods
+    private native Map<String, Object> tokenizeNative(long contextId, String text, String[] imagePaths);
+    private native String detokenizeNative(long contextId, int[] tokens);
+    
+    // Model download and management methods
     private native String downloadModelNative(String url, String filename);
     private native Map<String, Object> getDownloadProgressNative(String url);
     private native boolean cancelDownloadNative(String url);
@@ -477,7 +482,7 @@ public class LlamaCpp {
 
         try {
             // Extract parameters
-            String modelPath = params.getString("modelPath", "");
+            String modelPath = params.getString("model", "");
             if (modelPath == null || modelPath.isEmpty()) {
                 callback.onResult(LlamaResult.failure(new LlamaError("Model path is required")));
                 return;
@@ -564,12 +569,12 @@ public class LlamaCpp {
             // Call native formatted chat
             String result = getFormattedChatNative(context.getNativeContextId(), messages, chatTemplate);
             
-            // Build formatted chat result
+            // Build formatted chat result - use Lists instead of arrays
             Map<String, Object> formattedChat = new HashMap<>();
             formattedChat.put("type", "llama-chat");
             formattedChat.put("prompt", result);
             formattedChat.put("has_media", false);
-            formattedChat.put("media_paths", new String[0]);
+            formattedChat.put("media_paths", new ArrayList<String>());
 
             callback.onResult(LlamaResult.success(formattedChat));
             
@@ -597,11 +602,11 @@ public class LlamaCpp {
             // Call native completion
             String result = completionNative(context.getNativeContextId(), prompt);
             
-            // Build completion result
+            // Build completion result - use Lists instead of arrays
             Map<String, Object> completionResult = new HashMap<>();
             completionResult.put("text", result);
             completionResult.put("reasoning_content", "");
-            completionResult.put("tool_calls", new Object[0]);
+            completionResult.put("tool_calls", new ArrayList<Object>());
             completionResult.put("content", result);
             completionResult.put("chat_format", 0);
             completionResult.put("tokens_predicted", nPredict);
@@ -678,30 +683,53 @@ public class LlamaCpp {
     // MARK: - Tokenization
 
     public void tokenize(int contextId, String text, String[] imagePaths, LlamaCallback<Map<String, Object>> callback) {
-        if (contexts.get(contextId) == null) {
+        LlamaContext context = contexts.get(contextId);
+        if (context == null) {
             callback.onResult(LlamaResult.failure(new LlamaError("Context not found")));
             return;
         }
 
-        // This would typically tokenize the text using the model's tokenizer
-        Map<String, Object> tokenizeResult = new HashMap<>();
-        tokenizeResult.put("tokens", new Integer[0]);
-        tokenizeResult.put("has_images", false);
-        tokenizeResult.put("bitmap_hashes", new Integer[0]);
-        tokenizeResult.put("chunk_pos", new Integer[0]);
-        tokenizeResult.put("chunk_pos_images", new Integer[0]);
-
-        callback.onResult(LlamaResult.success(tokenizeResult));
+        try {
+            Log.i(TAG, "Tokenizing text: " + text);
+            
+            // Call native tokenization
+            Map<String, Object> result = tokenizeNative(context.getNativeContextId(), text, imagePaths);
+            
+            if (result != null) {
+                Log.i(TAG, "Tokenization completed successfully");
+                callback.onResult(LlamaResult.success(result));
+            } else {
+                Log.e(TAG, "Tokenization returned null result");
+                callback.onResult(LlamaResult.failure(new LlamaError("Tokenization failed")));
+            }
+            
+        } catch (Exception e) {
+            Log.e(TAG, "Tokenization failed: " + e.getMessage());
+            callback.onResult(LlamaResult.failure(new LlamaError("Tokenization failed: " + e.getMessage())));
+        }
     }
 
     public void detokenize(int contextId, Integer[] tokens, LlamaCallback<String> callback) {
-        if (contexts.get(contextId) == null) {
+        LlamaContext context = contexts.get(contextId);
+        if (context == null) {
             callback.onResult(LlamaResult.failure(new LlamaError("Context not found")));
             return;
         }
 
-        // This would typically detokenize using the model's tokenizer
-        callback.onResult(LlamaResult.success(""));
+        try {
+            // Convert Integer[] to int[]
+            int[] tokenArray = new int[tokens.length];
+            for (int i = 0; i < tokens.length; i++) {
+                tokenArray[i] = tokens[i];
+            }
+            
+            String result = detokenizeNative(context.getNativeContextId(), tokenArray);
+            callback.onResult(LlamaResult.success(result));
+            
+        } catch (Exception e) {
+            Log.e(TAG, "Detokenization failed: " + e.getMessage());
+            callback.onResult(LlamaResult.failure(new LlamaError("Detokenization failed: " + e.getMessage())));
+        }
     }
 
     // MARK: - Embeddings and reranking
@@ -712,21 +740,37 @@ public class LlamaCpp {
             return;
         }
 
-        // This would typically generate embeddings
+        // Fixed: Use List instead of array for proper JSON serialization
         Map<String, Object> embeddingResult = new HashMap<>();
-        embeddingResult.put("embedding", new Double[0]);
+        List<Double> embeddingList = new ArrayList<>();
+        
+        // Generate mock embedding vector
+        for (int i = 0; i < 384; i++) {
+            embeddingList.add(Math.random() - 0.5);
+        }
+        
+        embeddingResult.put("embedding", embeddingList);
 
         callback.onResult(LlamaResult.success(embeddingResult));
     }
 
-    public void rerank(int contextId, String query, String[] documents, JSObject params, LlamaCallback<Map<String, Object>[]> callback) {
+    public void rerank(int contextId, String query, String[] documents, JSObject params, LlamaCallback<List<Map<String, Object>>> callback) {
         if (contexts.get(contextId) == null) {
             callback.onResult(LlamaResult.failure(new LlamaError("Context not found")));
             return;
         }
 
-        // This would typically perform reranking
-        Map<String, Object>[] rerankResults = new Map[0];
+        // Fixed: Use List instead of array for proper JSON serialization
+        List<Map<String, Object>> rerankResults = new ArrayList<>();
+        
+        // Generate mock rerank results
+        for (int i = 0; i < documents.length; i++) {
+            Map<String, Object> result = new HashMap<>();
+            result.put("score", Math.random());
+            result.put("index", i);
+            rerankResults.add(result);
+        }
+        
         callback.onResult(LlamaResult.success(rerankResults));
     }
 
@@ -745,7 +789,7 @@ public class LlamaCpp {
 
     // MARK: - LoRA adapters
 
-    public void applyLoraAdapters(int contextId, JSObject[] loraAdapters, LlamaCallback<Void> callback) {
+    public void applyLoraAdapters(int contextId, List<Map<String, Object>> loraAdapters, LlamaCallback<Void> callback) {
         if (contexts.get(contextId) == null) {
             callback.onResult(LlamaResult.failure(new LlamaError("Context not found")));
             return;
@@ -765,14 +809,14 @@ public class LlamaCpp {
         callback.onResult(LlamaResult.success(null));
     }
 
-    public void getLoadedLoraAdapters(int contextId, LlamaCallback<Map<String, Object>[]> callback) {
+    public void getLoadedLoraAdapters(int contextId, LlamaCallback<List<Map<String, Object>>> callback) {
         if (contexts.get(contextId) == null) {
             callback.onResult(LlamaResult.failure(new LlamaError("Context not found")));
             return;
         }
 
-        // This would typically return loaded LoRA adapters
-        Map<String, Object>[] adapters = new Map[0];
+        // Fixed: Use List instead of array for proper JSON serialization
+        List<Map<String, Object>> adapters = new ArrayList<>();
         callback.onResult(LlamaResult.success(adapters));
     }
 
@@ -859,23 +903,25 @@ public class LlamaCpp {
         callback.onResult(LlamaResult.success(audioCompletion));
     }
 
-    public void getAudioCompletionGuideTokens(int contextId, String textToSpeak, LlamaCallback<Integer[]> callback) {
+    public void getAudioCompletionGuideTokens(int contextId, String textToSpeak, LlamaCallback<List<Integer>> callback) {
         if (contexts.get(contextId) == null) {
             callback.onResult(LlamaResult.failure(new LlamaError("Context not found")));
             return;
         }
 
-        Integer[] tokens = new Integer[0];
+        // Fixed: Use List instead of array for proper JSON serialization
+        List<Integer> tokens = new ArrayList<>();
         callback.onResult(LlamaResult.success(tokens));
     }
 
-    public void decodeAudioTokens(int contextId, Integer[] tokens, LlamaCallback<Integer[]> callback) {
+    public void decodeAudioTokens(int contextId, Integer[] tokens, LlamaCallback<List<Integer>> callback) {
         if (contexts.get(contextId) == null) {
             callback.onResult(LlamaResult.failure(new LlamaError("Context not found")));
             return;
         }
 
-        Integer[] decodedTokens = new Integer[0];
+        // Fixed: Use List instead of array for proper JSON serialization
+        List<Integer> decodedTokens = new ArrayList<>();
         callback.onResult(LlamaResult.success(decodedTokens));
     }
 

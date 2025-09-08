@@ -1,76 +1,131 @@
-cmake_minimum_required(VERSION 3.18.1)
-project("llama-cpp")
+cmake_minimum_required(VERSION 3.10)
 
-# Set C++ standard
+project(llama-cpp)
+
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(LLAMACPP_LIB_DIR ${CMAKE_SOURCE_DIR}/../../../cpp)
 
-# Set architecture-specific flags correctly
-if(${ANDROID_ABI} STREQUAL "arm64-v8a")
-    # Fix: Separate -march and -mtune flags
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=armv8-a -mtune=cortex-a76")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8-a -mtune=cortex-a76")
-    add_definitions(-D__ARM_ARCH_8A__ -D__ARM_NEON)
-elseif(${ANDROID_ABI} STREQUAL "armeabi-v7a")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=armv7-a -mfpu=neon -mfloat-abi=softfp")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv7-a -mfpu=neon -mfloat-abi=softfp")
-    add_definitions(-D__ARM_ARCH_7A__ -D__ARM_NEON)
-elseif(${ANDROID_ABI} STREQUAL "x86")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=i686 -mtune=intel -mssse3 -mfpmath=sse")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=i686 -mtune=intel -mssse3 -mfpmath=sse")
-elseif(${ANDROID_ABI} STREQUAL "x86_64")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=x86-64 -mtune=intel -msse4.2 -mpopcnt")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=x86-64 -mtune=intel -msse4.2 -mpopcnt")
-endif()
-
-# Add optimization flags
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -DNDEBUG -DLM_GGML_USE_CPU -DLM_GGML_CPU_GENERIC -fno-finite-math-only -funroll-loops")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -DNDEBUG -DLM_GGML_USE_CPU -DLM_GGML_CPU_GENERIC -fno-finite-math-only -funroll-loops")
-
-# Include directories
 include_directories(
-    ${CMAKE_SOURCE_DIR}/../../../cpp
-    ${CMAKE_SOURCE_DIR}/../../../cpp/ggml-cpu
-    ${CMAKE_SOURCE_DIR}/../../../cpp/tools/mtmd
+    ${LLAMACPP_LIB_DIR}
+    ${LLAMACPP_LIB_DIR}/ggml-cpu
+    ${LLAMACPP_LIB_DIR}/tools/mtmd
 )
 
-# Source files - EXCLUDE architecture-specific implementations
-# We only want the generic implementations for Android
-file(GLOB SOURCES_MAIN
-    "${CMAKE_SOURCE_DIR}/../../../cpp/*.c"
-    "${CMAKE_SOURCE_DIR}/../../../cpp/*.cpp"
+set(
+    SOURCE_FILES
+    ${LLAMACPP_LIB_DIR}/ggml.c
+    ${LLAMACPP_LIB_DIR}/ggml-alloc.c
+    ${LLAMACPP_LIB_DIR}/ggml-backend.cpp
+    ${LLAMACPP_LIB_DIR}/ggml-backend-reg.cpp
+    ${LLAMACPP_LIB_DIR}/ggml-cpu/amx/amx.cpp
+    ${LLAMACPP_LIB_DIR}/ggml-cpu/amx/mmq.cpp
+    ${LLAMACPP_LIB_DIR}/ggml-cpu/ggml-cpu.c
+    ${LLAMACPP_LIB_DIR}/ggml-cpu/ggml-cpu.cpp
+    ${LLAMACPP_LIB_DIR}/ggml-cpu/quants.c
+    ${LLAMACPP_LIB_DIR}/ggml-cpu/traits.cpp
+    ${LLAMACPP_LIB_DIR}/ggml-cpu/repack.cpp
+    ${LLAMACPP_LIB_DIR}/ggml-cpu/unary-ops.cpp
+    ${LLAMACPP_LIB_DIR}/ggml-cpu/binary-ops.cpp
+    ${LLAMACPP_LIB_DIR}/ggml-cpu/vec.cpp
+    ${LLAMACPP_LIB_DIR}/ggml-cpu/ops.cpp
+    ${LLAMACPP_LIB_DIR}/ggml-opt.cpp
+    ${LLAMACPP_LIB_DIR}/ggml-threading.cpp
+    ${LLAMACPP_LIB_DIR}/ggml-quants.c
+    ${LLAMACPP_LIB_DIR}/gguf.cpp
+    ${LLAMACPP_LIB_DIR}/log.cpp
+    ${LLAMACPP_LIB_DIR}/llama-impl.cpp
+    ${LLAMACPP_LIB_DIR}/chat-parser.cpp
+    ${LLAMACPP_LIB_DIR}/json-partial.cpp
+    ${LLAMACPP_LIB_DIR}/regex-partial.cpp
+    # Multimodal support
+    ${LLAMACPP_LIB_DIR}/tools/mtmd/mtmd.cpp
+    ${LLAMACPP_LIB_DIR}/tools/mtmd/mtmd-audio.cpp
+    ${LLAMACPP_LIB_DIR}/tools/mtmd/clip.cpp
+    ${LLAMACPP_LIB_DIR}/tools/mtmd/mtmd-helper.cpp
+    ${LLAMACPP_LIB_DIR}/llama-grammar.cpp
+    ${LLAMACPP_LIB_DIR}/llama-sampling.cpp
+    ${LLAMACPP_LIB_DIR}/llama-vocab.cpp
+    ${LLAMACPP_LIB_DIR}/llama-adapter.cpp
+    ${LLAMACPP_LIB_DIR}/llama-chat.cpp
+    ${LLAMACPP_LIB_DIR}/llama-context.cpp
+    ${LLAMACPP_LIB_DIR}/llama-arch.cpp
+    ${LLAMACPP_LIB_DIR}/llama-batch.cpp
+    ${LLAMACPP_LIB_DIR}/llama-cparams.cpp
+    ${LLAMACPP_LIB_DIR}/llama-hparams.cpp
+    ${LLAMACPP_LIB_DIR}/llama.cpp
+    ${LLAMACPP_LIB_DIR}/llama-model.cpp
+    ${LLAMACPP_LIB_DIR}/llama-model-loader.cpp
+    ${LLAMACPP_LIB_DIR}/llama-model-saver.cpp
+    ${LLAMACPP_LIB_DIR}/llama-kv-cache.cpp
+    ${LLAMACPP_LIB_DIR}/llama-kv-cache-iswa.cpp
+    ${LLAMACPP_LIB_DIR}/llama-memory-hybrid.cpp
+    ${LLAMACPP_LIB_DIR}/llama-memory-recurrent.cpp
+    ${LLAMACPP_LIB_DIR}/llama-mmap.cpp
+    ${LLAMACPP_LIB_DIR}/llama-vocab.cpp
+    ${LLAMACPP_LIB_DIR}/llama-memory.cpp
+    ${LLAMACPP_LIB_DIR}/llama-io.cpp
+    ${LLAMACPP_LIB_DIR}/llama-graph.cpp
+    ${LLAMACPP_LIB_DIR}/sampling.cpp
+    ${LLAMACPP_LIB_DIR}/unicode-data.cpp
+    ${LLAMACPP_LIB_DIR}/unicode.cpp
+    ${LLAMACPP_LIB_DIR}/common.cpp
+    ${LLAMACPP_LIB_DIR}/chat.cpp
+    ${LLAMACPP_LIB_DIR}/json-schema-to-grammar.cpp
+    ${LLAMACPP_LIB_DIR}/nlohmann/json.hpp
+    ${LLAMACPP_LIB_DIR}/nlohmann/json_fwd.hpp
+    ${LLAMACPP_LIB_DIR}/minja/minja.hpp
+    ${LLAMACPP_LIB_DIR}/minja/chat-template.hpp
+    ${LLAMACPP_LIB_DIR}/anyascii.c
+    ${LLAMACPP_LIB_DIR}/cap-llama.cpp
+    ${LLAMACPP_LIB_DIR}/cap-completion.cpp
+    ${LLAMACPP_LIB_DIR}/cap-tts.cpp
+    ${CMAKE_SOURCE_DIR}/jni-utils.h
+    ${CMAKE_SOURCE_DIR}/jni.cpp
 )
 
-file(GLOB SOURCES_GGML_CPU
-    "${CMAKE_SOURCE_DIR}/../../../cpp/ggml-cpu/*.c"
-    "${CMAKE_SOURCE_DIR}/../../../cpp/ggml-cpu/*.cpp"
-)
+# Find Android libraries
+find_library(LOG_LIB log)
+find_library(ANDROID_LIB android)
 
-file(GLOB SOURCES_TOOLS
-    "${CMAKE_SOURCE_DIR}/../../../cpp/tools/mtmd/*.c"
-    "${CMAKE_SOURCE_DIR}/../../../cpp/tools/mtmd/*.cpp"
-)
+# ARM64 specific build function for real devices
+function(build_library_arm64 target_name)
+    add_library(
+        ${target_name}
+        SHARED
+        ${SOURCE_FILES}
+    )
 
-# Add JNI bridge source file
-set(JNI_SOURCES "${CMAKE_SOURCE_DIR}/jni.cpp")
+    # ARM64 specific compile options for real devices
+    target_compile_options(${target_name} PRIVATE
+        -march=armv8-a
+        -mtune=cortex-a76
+        -O3
+        -DNDEBUG
+        -DLM_GGML_USE_CPU
+        -DLM_GGML_CPU_GENERIC
+        -fno-finite-math-only
+        -funroll-loops
+    )
 
-# Combine all sources - explicitly exclude arch-specific directories
-set(SOURCES ${SOURCES_MAIN} ${SOURCES_GGML_CPU} ${SOURCES_TOOLS} ${JNI_SOURCES})
+    # Link with Android libraries
+    target_link_libraries(${target_name} 
+        ${LOG_LIB}
+        ${ANDROID_LIB}
+    )
+    
+    # Set output name and directory
+    set_target_properties(${target_name} PROPERTIES
+        OUTPUT_NAME "llama-cpp-arm64"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/jniLibs/arm64-v8a"
+    )
+endfunction()
 
-# Remove architecture-specific files to avoid duplicates
-list(FILTER SOURCES EXCLUDE REGEX ".*/arch/.*")
+# Build ARM64 library for real devices
+build_library_arm64(llama-cpp-arm64)
 
-# Create shared library with ABI-specific name
-add_library(llama-cpp-${ANDROID_ABI} SHARED ${SOURCES})
-
-# Link libraries
-find_library(log-lib log)
-target_link_libraries(llama-cpp-${ANDROID_ABI}
-    ${log-lib}
-    android
-)
-
-# Set output directory
-set_target_properties(llama-cpp-${ANDROID_ABI} PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/jniLibs/${ANDROID_ABI}"
-)
+# Print build information
+message(STATUS "Building llama-cpp for Android ARM64 (real devices)")
+message(STATUS "Source directory: ${LLAMACPP_LIB_DIR}")
+message(STATUS "Architecture: ARM64 (arm64-v8a)")
+message(STATUS "Optimizations: ARMv8-A, Cortex-A76 tuning")
+message(STATUS "Output directory: ${CMAKE_CURRENT_SOURCE_DIR}/jniLibs/arm64-v8a")

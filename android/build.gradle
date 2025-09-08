@@ -1,7 +1,6 @@
 ext {
     junitVersion = project.hasProperty('junitVersion') ? rootProject.ext.junitVersion : '4.13.2'
     androidxAppCompatVersion = project.hasProperty('androidxAppCompatVersion') ? rootProject.ext.androidxAppCompatVersion : '1.7.0'
-    androidxCoreVersion = project.hasProperty('androidxCoreVersion') ? rootProject.ext.androidxCoreVersion : '1.15.0'
     androidxJunitVersion = project.hasProperty('androidxJunitVersion') ? rootProject.ext.androidxJunitVersion : '1.2.1'
     androidxEspressoCoreVersion = project.hasProperty('androidxEspressoCoreVersion') ? rootProject.ext.androidxEspressoCoreVersion : '3.6.1'
 }
@@ -20,34 +19,26 @@ apply plugin: 'com.android.library'
 
 android {
     namespace "ai.annadata.plugin.capacitor"
-    compileSdkVersion project.hasProperty('compileSdkVersion') ? rootProject.ext.compileSdkVersion : 34
+    compileSdk project.hasProperty('compileSdkVersion') ? rootProject.ext.compileSdkVersion : 35
     defaultConfig {
-        minSdkVersion project.hasProperty('minSdkVersion') ? rootProject.ext.minSdkVersion : 22
-        targetSdkVersion project.hasProperty('targetSdkVersion') ? rootProject.ext.targetSdkVersion : 34
+        minSdkVersion project.hasProperty('minSdkVersion') ? rootProject.ext.minSdkVersion : 23
+        targetSdkVersion project.hasProperty('targetSdkVersion') ? rootProject.ext.targetSdkVersion : 35
         versionCode 1
         versionName "1.0"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         
-        externalNativeBuild {
-            cmake {
-                cppFlags "-std=c++17"
-                arguments "-DANDROID_STL=c++_shared"
-                // Only build for ARM64 by default for production
-                // Users can override this in their app's build.gradle
-                abiFilters "arm64-v8a"
-            }
-        }
-        
         ndk {
-            // Only build for ARM64 to avoid architecture conflicts
-            abiFilters "arm64-v8a"
+            abiFilters 'arm64-v8a'
         }
     }
     
-    packagingOptions {
-        // Exclude duplicate native libraries if any
-        pickFirst 'lib/arm64-v8a/libllama-cpp-arm64-v8a.so'
-        pickFirst 'lib/arm64-v8a/libc++_shared.so'
+    externalNativeBuild {
+        cmake {
+            path "src/main/CMakeLists.txt"
+            version "3.22.1"
+            // Explicitly set NDK version to avoid Windows dependencies
+            ndkVersion "29.0.13113456"
+        }
     }
     
     buildTypes {
@@ -62,14 +53,22 @@ android {
     }
     
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_11
-        targetCompatibility JavaVersion.VERSION_11
+        sourceCompatibility JavaVersion.VERSION_21
+        targetCompatibility JavaVersion.VERSION_21
     }
     
-    externalNativeBuild {
-        cmake {
-            path "src/main/CMakeLists.txt"
-            version "3.18.1"
+    sourceSets {
+        main {
+            java {
+                srcDirs = ['src/main/java']
+            }
+        }
+    }
+    
+    // Disable clean tasks that might cause issues
+    tasks.whenTaskAdded { task ->
+        if (task.name.contains('Clean') && task.name.contains('Debug')) {
+            task.enabled = false
         }
     }
 }
@@ -83,7 +82,6 @@ dependencies {
     implementation fileTree(dir: 'libs', include: ['*.jar'])
     implementation project(':capacitor-android')
     implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
-    implementation "androidx.core:core:$androidxCoreVersion"
     testImplementation "junit:junit:$junitVersion"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
