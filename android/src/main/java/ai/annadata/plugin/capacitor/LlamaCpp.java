@@ -287,10 +287,10 @@ public class LlamaCpp {
             // Map Android ABI to library name
             switch (abi) {
                 case "arm64-v8a":
-                    libraryName = "llama-cpp-arm64-v8a";
+                    libraryName = "llama-cpp-arm64";
                     break;
                 case "armeabi-v7a":
-                    libraryName = "llama-cpp-armeabi-v7a";
+                    libraryName = "llama-cpp-armeabi";
                     break;
                 case "x86":
                     libraryName = "llama-cpp-x86";
@@ -300,7 +300,7 @@ public class LlamaCpp {
                     break;
                 default:
                     Log.w(TAG, "Unsupported ABI: " + abi + ", falling back to arm64-v8a");
-                    libraryName = "llama-cpp-arm64-v8a";
+                    libraryName = "llama-cpp-arm64";
                     break;
             }
             
