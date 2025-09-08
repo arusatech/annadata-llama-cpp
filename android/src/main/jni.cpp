@@ -1,5 +1,6 @@
 #include "jni-utils.h"
 #include "cap-llama.h"
+#include "cap-completion.h"
 #include <android/log.h>
 #include <cstring>
 #include <memory>
@@ -379,28 +380,188 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_releaseContextNative(
     }
 }
 
-JNIEXPORT jstring JNICALL
+JNIEXPORT jobject JNICALL
 Java_ai_annadata_plugin_capacitor_LlamaCpp_completionNative(
-    JNIEnv* env, jobject thiz, jlong context_id, jstring prompt) {
+    JNIEnv* env, jobject thiz, jlong context_id, jobject params) {
     
     try {
+        LOGI("Starting completion for context: %ld", context_id);
+        
         auto it = contexts.find(context_id);
         if (it == contexts.end()) {
+            LOGE("Context not found: %ld", context_id);
             throw_java_exception(env, "java/lang/IllegalArgumentException", "Invalid context ID");
             return nullptr;
         }
         
-        std::string prompt_str = jstring_to_string(env, prompt);
+        auto& ctx = it->second;
+        if (!ctx || !ctx->ctx) {
+            LOGE("Invalid context or llama context is null");
+            throw_java_exception(env, "java/lang/RuntimeException", "Invalid context");
+            return nullptr;
+        }
         
-        // Get the context
-        capllama::llama_cap_context* context = it->second.get();
+        // Extract parameters from JSObject
+        jclass jsObjectClass = env->GetObjectClass(params);
+        jmethodID getStringMethod = env->GetMethodID(jsObjectClass, "getString", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
+        jmethodID getIntegerMethod = env->GetMethodID(jsObjectClass, "getInteger", "(Ljava/lang/String;Ljava/lang/Integer;)Ljava/lang/Integer;");
+        jmethodID getDoubleMethod = env->GetMethodID(jsObjectClass, "getDouble", "(Ljava/lang/String;Ljava/lang/Double;)Ljava/lang/Double;");
         
-        // For now, return a simple completion
-        // In a full implementation, this would use the actual llama.cpp completion logic
-        std::string result = "Generated response for: " + prompt_str;
+        // Get prompt
+        jstring promptKey = jni_utils::string_to_jstring(env, "prompt");
+        jstring defaultPrompt = jni_utils::string_to_jstring(env, "");
+        jstring promptObj = (jstring)env->CallObjectMethod(params, getStringMethod, promptKey, defaultPrompt);
+        std::string prompt_str = jni_utils::jstring_to_string(env, promptObj);
         
-        LOGI("Completion for context %ld: %s", context_id, prompt_str.c_str());
-        return string_to_jstring(env, result);
+        // Get n_predict
+        jstring nPredictKey = jni_utils::string_to_jstring(env, "n_predict");
+        jobject defaultNPredict = env->NewObject(env->FindClass("java/lang/Integer"), 
+            env->GetMethodID(env->FindClass("java/lang/Integer"), "<init>", "(I)V"), 128);
+        jobject nPredictObj = env->CallObjectMethod(params, getIntegerMethod, nPredictKey, defaultNPredict);
+        jint n_predict = env->CallIntMethod(nPredictObj, env->GetMethodID(env->FindClass("java/lang/Integer"), "intValue", "()I"));
+        
+        // Get temperature
+        jstring temperatureKey = jni_utils::string_to_jstring(env, "temperature");
+        jobject defaultTemp = env->NewObject(env->FindClass("java/lang/Double"), 
+            env->GetMethodID(env->FindClass("java/lang/Double"), "<init>", "(D)V"), 0.8);
+        jobject tempObj = env->CallObjectMethod(params, getDoubleMethod, temperatureKey, defaultTemp);
+        jdouble temperature = env->CallDoubleMethod(tempObj, env->GetMethodID(env->FindClass("java/lang/Double"), "doubleValue", "()D"));
+        
+        LOGI("Completion params - prompt: %s, n_predict: %d, temperature: %.2f", 
+             prompt_str.c_str(), n_predict, temperature);
+        
+        // Tokenize the prompt
+        capllama::llama_cap_tokenize_result tokenize_result = ctx->tokenize(prompt_str, {});
+        std::vector<llama_token> prompt_tokens = tokenize_result.tokens;
+        
+        LOGI("Tokenized prompt into %zu tokens", prompt_tokens.size());
+        
+        // Initialize completion context if not already done
+        if (!ctx->completion) {
+            ctx->completion = new capllama::llama_cap_context_completion(ctx.get());
+            if (!ctx->completion->initSampling()) {
+                LOGE("Failed to initialize sampling");
+                throw_java_exception(env, "java/lang/RuntimeException", "Failed to initialize sampling");
+                return nullptr;
+            }
+        }
+        
+        // Set up sampling parameters
+        // Note: For now, we'll use the completion context's default parameters
+        // TODO: Update sampling parameters with user values
+        
+        // Rewind the completion context
+        ctx->completion->rewind();
+        
+        // Load the prompt
+        ctx->completion->loadPrompt({});
+        
+        // Begin completion
+        ctx->completion->beginCompletion();
+        
+        // Generate tokens
+        std::string generated_text;
+        int tokens_generated = 0;
+        
+        while (tokens_generated < n_predict && !ctx->completion->is_interrupted) {
+            auto token_output = ctx->completion->nextToken();
+            
+            // Check for end-of-sequence (simplified check)
+            if (token_output.tok == 2) { // Most models use 2 as EOS token
+                LOGI("Reached EOS token, stopping generation");
+                break;
+            }
+            
+            // Convert token to text
+            std::string token_text = capllama::tokens_to_output_formatted_string(ctx->ctx, token_output.tok);
+            generated_text += token_text;
+            tokens_generated++;
+            
+            LOGI("Generated token %d: %s", tokens_generated, token_text.c_str());
+        }
+        
+        // End completion
+        ctx->completion->endCompletion();
+        
+        LOGI("Completion finished. Generated %d tokens: %s", tokens_generated, generated_text.c_str());
+        
+        // Create result HashMap
+        jclass hashMapClass = env->FindClass("java/util/HashMap");
+        jmethodID hashMapConstructor = env->GetMethodID(hashMapClass, "<init>", "()V");
+        jmethodID putMethod = env->GetMethodID(hashMapClass, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+        
+        jobject resultMap = env->NewObject(hashMapClass, hashMapConstructor);
+        
+        // Add completion results
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "text"), jni_utils::string_to_jstring(env, generated_text));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "content"), jni_utils::string_to_jstring(env, generated_text));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "reasoning_content"), jni_utils::string_to_jstring(env, ""));
+        
+        // Create empty tool_calls array
+        jclass arrayListClass = env->FindClass("java/util/ArrayList");
+        jmethodID arrayListConstructor = env->GetMethodID(arrayListClass, "<init>", "()V");
+        jobject emptyToolCalls = env->NewObject(arrayListClass, arrayListConstructor);
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "tool_calls"), emptyToolCalls);
+        
+        // Add token counts and status
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "tokens_predicted"), 
+            env->NewObject(env->FindClass("java/lang/Integer"), 
+                env->GetMethodID(env->FindClass("java/lang/Integer"), "<init>", "(I)V"), tokens_generated));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "tokens_evaluated"), 
+            env->NewObject(env->FindClass("java/lang/Integer"), 
+                env->GetMethodID(env->FindClass("java/lang/Integer"), "<init>", "(I)V"), (jint)prompt_tokens.size()));
+        
+        // Add completion status flags
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "truncated"), 
+            env->NewObject(env->FindClass("java/lang/Boolean"), 
+                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), JNI_FALSE));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "stopped_eos"), 
+            env->NewObject(env->FindClass("java/lang/Boolean"), 
+                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), 
+                tokens_generated < n_predict ? JNI_TRUE : JNI_FALSE));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "stopped_limit"), 
+            env->NewObject(env->FindClass("java/lang/Boolean"), 
+                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), 
+                tokens_generated >= n_predict ? JNI_TRUE : JNI_FALSE));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "context_full"), 
+            env->NewObject(env->FindClass("java/lang/Boolean"), 
+                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), JNI_FALSE));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "interrupted"), 
+            env->NewObject(env->FindClass("java/lang/Boolean"), 
+                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), JNI_FALSE));
+        
+        // Add empty strings for stop reasons
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "stopped_word"), jni_utils::string_to_jstring(env, ""));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "stopping_word"), jni_utils::string_to_jstring(env, ""));
+        
+        // Add timing information (basic)
+        jobject timingsMap = env->NewObject(hashMapClass, hashMapConstructor);
+        env->CallObjectMethod(timingsMap, putMethod,
+            jni_utils::string_to_jstring(env, "prompt_n"), 
+            env->NewObject(env->FindClass("java/lang/Integer"), 
+                env->GetMethodID(env->FindClass("java/lang/Integer"), "<init>", "(I)V"), (jint)prompt_tokens.size()));
+        env->CallObjectMethod(timingsMap, putMethod,
+            jni_utils::string_to_jstring(env, "predicted_n"), 
+            env->NewObject(env->FindClass("java/lang/Integer"), 
+                env->GetMethodID(env->FindClass("java/lang/Integer"), "<init>", "(I)V"), tokens_generated));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "timings"), timingsMap);
+        
+        LOGI("Completion result created successfully");
+        return resultMap;
         
     } catch (const std::exception& e) {
         LOGE("Exception in completion: %s", e.what());

@@ -259,7 +259,7 @@ public class LlamaCpp {
     // Native method declarations
     private native long initContextNative(String modelPath, String[] searchPaths, JSObject params);
     private native void releaseContextNative(long nativeContextId);
-    private native String completionNative(long contextId, String prompt);
+    private native Map<String, Object> completionNative(long contextId, JSObject params);
     private native Map<String, Object> modelInfoNative(String modelPath);
     private native void stopCompletionNative(long contextId);
     private native String getFormattedChatNative(long contextId, String messages, String chatTemplate);
@@ -591,48 +591,18 @@ public class LlamaCpp {
         }
 
         try {
-            // Extract parameters from JSObject
-            String prompt = params.getString("prompt", "");
-            int nPredict = params.getInteger("n_predict", 128);
-            float temperature = params.has("temp") ? (float) params.getDouble("temp") : 0.8f;
-            float topP = params.has("top_p") ? (float) params.getDouble("top_p") : 0.95f;
-            int topK = params.getInteger("top_k", 40);
-            float repeatPenalty = params.has("repeat_penalty") ? (float) params.getDouble("repeat_penalty") : 1.1f;
-
-            // Call native completion
-            String result = completionNative(context.getNativeContextId(), prompt);
+            Log.i(TAG, "Starting completion for context: " + contextId);
             
-            // Build completion result - use Lists instead of arrays
-            Map<String, Object> completionResult = new HashMap<>();
-            completionResult.put("text", result);
-            completionResult.put("reasoning_content", "");
-            completionResult.put("tool_calls", new ArrayList<Object>());
-            completionResult.put("content", result);
-            completionResult.put("chat_format", 0);
-            completionResult.put("tokens_predicted", nPredict);
-            completionResult.put("tokens_evaluated", 0);
-            completionResult.put("truncated", false);
-            completionResult.put("stopped_eos", false);
-            completionResult.put("stopped_word", "");
-            completionResult.put("stopped_limit", 0);
-            completionResult.put("stopping_word", "");
-            completionResult.put("context_full", false);
-            completionResult.put("interrupted", false);
-            completionResult.put("tokens_cached", 0);
-
-            Map<String, Object> timings = new HashMap<>();
-            timings.put("prompt_n", 0);
-            timings.put("prompt_ms", 0);
-            timings.put("prompt_per_token_ms", 0);
-            timings.put("prompt_per_second", 0);
-            timings.put("predicted_n", nPredict);
-            timings.put("predicted_ms", 0);
-            timings.put("predicted_per_token_ms", 0);
-            timings.put("predicted_per_second", 0);
-
-            completionResult.put("timings", timings);
-
-            callback.onResult(LlamaResult.success(completionResult));
+            // Call native completion with full params
+            Map<String, Object> result = completionNative(context.getNativeContextId(), params);
+            
+            if (result != null) {
+                Log.i(TAG, "Completion completed successfully");
+                callback.onResult(LlamaResult.success(result));
+            } else {
+                Log.e(TAG, "Completion returned null result");
+                callback.onResult(LlamaResult.failure(new LlamaError("Completion failed")));
+            }
             
         } catch (Exception e) {
             callback.onResult(LlamaResult.failure(new LlamaError("Completion failed: " + e.getMessage())));
