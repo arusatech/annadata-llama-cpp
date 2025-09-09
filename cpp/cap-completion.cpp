@@ -2,6 +2,7 @@
 #include "cap-llama.h"
 #include "cap-tts.h"
 #include "cap-mtmd.hpp"
+#include <algorithm>  // For std::sort in speculative decoding
 
 // Include multimodal support
 #include "tools/mtmd/mtmd.h"
@@ -676,6 +677,183 @@ void llama_cap_context_completion::processMedia(
         context_full,
         ctx_sampling
     );
+}
+
+// Speculative decoding implementation
+completion_token_output llama_cap_context_completion::nextTokenSpeculative() {
+    // Enable speculative mode
+    use_speculative = parent_ctx->isSpectulativeEnabled();
+    
+    if (!use_speculative) {
+        // Fallback to regular token generation
+        return nextToken();
+    }
+
+    completion_token_output result;
+    
+    // If we don't have drafted tokens, draft some
+    if (draft_tokens.empty()) {
+        draft_tokens = draftTokens(parent_ctx->speculative_samples);
+        n_drafted = draft_tokens.size();
+    }
+    
+    // Try to verify and accept draft tokens
+    if (!draft_tokens.empty()) {
+        int accepted = verifyAndAcceptTokens(draft_tokens);
+        n_accepted += accepted;
+        
+        if (accepted > 0) {
+            // Use the first accepted token
+            result.tok = draft_tokens[0];
+            draft_tokens.erase(draft_tokens.begin());
+            
+            // Update context
+            embd.push_back(result.tok);
+            --n_remain;
+            num_tokens_predicted++;
+            
+            has_next_token = parent_ctx->params.n_predict == -1 || n_remain != 0;
+            return result;
+        }
+    }
+    
+    // If no tokens were accepted, fall back to regular sampling
+    draft_tokens.clear();
+    return nextToken();
+}
+
+std::vector<llama_token> llama_cap_context_completion::draftTokens(int n_draft) {
+    std::vector<llama_token> drafted;
+    
+    // Check if draft model is available
+    if (!parent_ctx->draft_ctx || !parent_ctx->draft_model || !parent_ctx->isSpectulativeEnabled()) {
+        return drafted;  // Return empty vector - will fallback to regular decoding
+    }
+    
+    // Copy current context to draft model
+    // Note: KV cache copying may not be available in all llama.cpp versions
+    // For now, we'll skip this optimization and let the draft model generate from scratch
+    // This is still effective for speculative decoding
+    
+    // Generate draft tokens using the smaller model
+    for (int i = 0; i < n_draft; i++) {
+        // Create batch with current context
+        llama_batch batch = llama_batch_init(1, 0, 1);
+        
+        if (!embd.empty()) {
+            llama_batch_add(&batch, embd.back(), n_past + i, {0}, true);
+        }
+        
+        // Decode with draft model
+        if (llama_decode(parent_ctx->draft_ctx, batch) != 0) {
+            llama_batch_free(batch);
+            break;
+        }
+        
+        // Sample from draft model (using faster, simpler sampling)
+        const float temp = 0.8f;  // Fixed temperature for draft
+        auto logits = llama_get_logits_ith(parent_ctx->draft_ctx, -1);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(parent_ctx->draft_model));
+        
+        // Simple sampling for draft model
+        std::vector<llama_token_data> candidates;
+        candidates.reserve(n_vocab);
+        
+        for (int token_id = 0; token_id < n_vocab; token_id++) {
+            candidates.emplace_back(llama_token_data{token_id, logits[token_id], 0.0f});
+        }
+        
+        llama_token_data_array candidates_p = {
+            candidates.data(),
+            candidates.size(),
+            -1,
+            false,
+        };
+        
+        // Simple temperature sampling for draft model
+        for (int token_id = 0; token_id < n_vocab; token_id++) {
+            candidates[token_id].logit /= temp;  // Apply temperature
+        }
+        
+        // Sort by logit (simple greedy sampling for draft)
+        std::sort(candidates.begin(), candidates.end(), 
+                  [](const llama_token_data& a, const llama_token_data& b) {
+                      return a.logit > b.logit;
+                  });
+        
+        llama_token token = candidates[0].id;  // Take top token
+        drafted.push_back(token);
+        
+        // Clean up
+        llama_batch_free(batch);
+        
+        // Stop if we hit EOS
+        const llama_vocab * vocab = llama_model_get_vocab(parent_ctx->draft_model);
+        if (llama_vocab_is_eog(vocab, token)) {
+            break;
+        }
+    }
+    
+    return drafted;
+}
+
+int llama_cap_context_completion::verifyAndAcceptTokens(const std::vector<llama_token> &draft_tokens) {
+    if (draft_tokens.empty() || !parent_ctx->ctx) {
+        return 0;
+    }
+    
+    int accepted = 0;
+    
+    // Verify each draft token against the main model
+    for (size_t i = 0; i < draft_tokens.size(); i++) {
+        // Create batch for verification
+        llama_batch batch = llama_batch_init(1, 0, 1);
+        
+        if (!embd.empty()) {
+            llama_batch_add(&batch, embd.back(), n_past + accepted, {0}, true);
+        }
+        
+        // Decode with main model
+        if (llama_decode(parent_ctx->ctx, batch) != 0) {
+            llama_batch_free(batch);
+            break;
+        }
+        
+        // Get logits from main model
+        auto logits = llama_get_logits_ith(parent_ctx->ctx, -1);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(parent_ctx->model));
+        
+        // Sample from main model
+        std::vector<llama_token_data> candidates;
+        candidates.reserve(n_vocab);
+        
+        for (int token_id = 0; token_id < n_vocab; token_id++) {
+            candidates.emplace_back(llama_token_data{token_id, logits[token_id], 0.0f});
+        }
+        
+        llama_token_data_array candidates_p = {
+            candidates.data(),
+            candidates.size(),
+            -1,
+            false,
+        };
+        
+        // Apply sampling from main model using common_sampler
+        llama_token main_token = common_sampler_sample(ctx_sampling, parent_ctx->ctx, -1);
+        
+        // Accept if tokens match
+        if (main_token == draft_tokens[i]) {
+            accepted++;
+            common_sampler_accept(ctx_sampling, main_token, true);
+        } else {
+            // Reject and stop verification
+            break;
+        }
+        
+        llama_batch_free(batch);
+    }
+    
+    return accepted;
 }
 
 } // namespace capllama

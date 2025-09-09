@@ -639,6 +639,25 @@ public class LlamaCppPlugin extends Plugin {
         });
     }
 
+    @PluginMethod
+    public void convertJsonSchemaToGrammar(PluginCall call) {
+        String schema = call.getString("schema");
+        if (schema == null) {
+            call.reject("Schema parameter is required");
+            return;
+        }
+
+        implementation.convertJsonSchemaToGrammar(schema, result -> {
+            if (result.isSuccess()) {
+                JSObject ret = new JSObject();
+                ret.put("grammar", result.getData());
+                call.resolve(ret);
+            } else {
+                call.reject(result.getError().getMessage());
+            }
+        });
+    }
+
     // MARK: - Utility Methods
 
     /**

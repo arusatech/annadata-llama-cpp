@@ -20,6 +20,19 @@ export interface NativeContextParams {
   n_threads?: number;
 
   /**
+   * Path to draft model for speculative decoding (mobile optimization)
+   */
+  draft_model?: string;
+  /**
+   * Number of tokens to predict speculatively (default: 3 for mobile)
+   */
+  speculative_samples?: number;
+  /**
+   * Enable mobile-optimized speculative decoding
+   */
+  mobile_speculative?: boolean;
+
+  /**
    * Number of layers to store in VRAM (Currently only for iOS)
    */
   n_gpu_layers?: number;
@@ -103,7 +116,8 @@ export interface NativeCompletionParams {
    */
   json_schema?: string;
   /**
-   * Set grammar for grammar-based sampling.  Default: no grammar
+   * Set grammar for grammar-based sampling (GBNF format). Default: no grammar
+   * This will override json_schema if both are provided.
    */
   grammar?: string;
   /**
@@ -291,13 +305,13 @@ export interface NativeCompletionResult {
    */
   reasoning_content: string;
   /**
-   * Tool calls
+   * Tool calls (parsed from response)
    */
   tool_calls: Array<{
     type: 'function';
     function: {
       name: string;
-      arguments: string;
+      arguments: string; // JSON string of arguments
     };
     id?: string;
   }>;
@@ -558,6 +572,10 @@ export interface CompletionParams extends Omit<
   chatTemplate?: string; // deprecated
   chat_template?: string;
   jinja?: boolean;
+  /**
+   * GBNF grammar for structured output. Takes precedence over json_schema.
+   */
+  grammar?: string;
   tools?: object;
   parallel_tool_calls?: object;
   tool_choice?: string;
@@ -763,6 +781,11 @@ export interface LlamaCppPlugin {
     path: string;
     size: number;
   }>>;
+
+  // Grammar utilities
+  convertJsonSchemaToGrammar(options: {
+    schema: string;
+  }): Promise<string>;
 
   // Events
   addListener(eventName: string, listenerFunc: (data: any) => void): Promise<void>;

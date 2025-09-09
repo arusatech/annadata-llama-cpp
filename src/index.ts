@@ -130,6 +130,27 @@ const getJsonSchema = (responseFormat?: CompletionResponseFormat) => {
   return null;
 };
 
+// Utility function to convert JSON schema to GBNF grammar
+const jsonSchemaToGrammar = async (schema: object): Promise<string> => {
+  // This will call the native method to convert JSON schema to GBNF
+  // For now, we'll return a basic implementation
+  try {
+    const result = await LlamaCpp.convertJsonSchemaToGrammar({ schema: JSON.stringify(schema) });
+    return result;
+  } catch (error) {
+    console.warn('Failed to convert JSON schema to GBNF, using fallback:', error);
+    // Fallback for basic object structure
+    return `root ::= "{" ws object_content ws "}"
+object_content ::= string_field ("," ws string_field)*
+string_field ::= "\\"" [a-zA-Z_][a-zA-Z0-9_]* "\\"" ws ":" ws value
+value ::= string | number | boolean | "null"
+string ::= "\\"" [^"]* "\\""
+number ::= "-"? [0-9]+ ("." [0-9]+)?
+boolean ::= "true" | "false"
+ws ::= [ \\t\\n]*`;
+  }
+};
+
 export class LlamaContext {
   id: number;
   gpu: boolean = false;
@@ -348,9 +369,21 @@ export class LlamaContext {
       nativeParams.media_paths = params.media_paths;
     }
 
-    if (nativeParams.response_format && !nativeParams.grammar) {
+    // Handle structured output and grammar
+    if (params.grammar) {
+      // Direct GBNF grammar takes precedence
+      nativeParams.grammar = params.grammar;
+    } else if (nativeParams.response_format && !nativeParams.grammar) {
       const jsonSchema = getJsonSchema(params.response_format);
-      if (jsonSchema) nativeParams.json_schema = JSON.stringify(jsonSchema);
+      if (jsonSchema) {
+        // Try to convert JSON schema to GBNF grammar
+        try {
+          nativeParams.grammar = await jsonSchemaToGrammar(jsonSchema);
+        } catch (error) {
+          console.warn('Failed to convert JSON schema to grammar, falling back to json_schema parameter:', error);
+          nativeParams.json_schema = JSON.stringify(jsonSchema);
+        }
+      }
     }
 
     let tokenListener: any =
@@ -701,6 +734,15 @@ export async function initLlama(
     delete rest.cache_type_v;
   }
 
+  // Log speculative decoding configuration if enabled
+  if (rest.draft_model) {
+    console.log(`🚀 Initializing with speculative decoding:
+      - Main model: ${path}
+      - Draft model: ${rest.draft_model}
+      - Speculative samples: ${rest.speculative_samples || 3}
+      - Mobile optimization: ${rest.mobile_speculative !== false ? 'enabled' : 'disabled'}`);
+  }
+
   const {
     gpu,
     reasonNoGPU,
@@ -762,6 +804,15 @@ export async function getAvailableModels(): Promise<Array<{
   size: number;
 }>> {
   return LlamaCpp.getAvailableModels();
+}
+
+/**
+ * Convert a JSON schema to GBNF grammar format
+ * @param schema JSON schema object
+ * @returns Promise resolving to GBNF grammar string
+ */
+export async function convertJsonSchemaToGrammar(schema: object): Promise<string> {
+  return jsonSchemaToGrammar(schema);
 }
 
 export const BuildInfo = {

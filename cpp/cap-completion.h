@@ -77,6 +77,12 @@ struct llama_cap_context_completion {
 
     // Sampling context
     common_sampler *ctx_sampling = nullptr;
+    
+    // Speculative decoding state
+    std::vector<llama_token> draft_tokens;
+    int n_drafted = 0;
+    int n_accepted = 0;
+    bool use_speculative = false;
 
     // Constructor
     llama_cap_context_completion(llama_cap_context* parent);
@@ -93,9 +99,14 @@ struct llama_cap_context_completion {
     void beginCompletion(int chat_format, common_reasoning_format reasoning_format, bool thinking_forced_open);
     void endCompletion();
     completion_token_output nextToken();
+    completion_token_output nextTokenSpeculative();  // NEW: Speculative version
     size_t findStoppingStrings(const std::string &text, const size_t last_token_size, const stop_type type);
     completion_token_output doCompletion();
     completion_partial_output getPartialOutput(const std::string &token_text);
+    
+    // Speculative decoding methods
+    std::vector<llama_token> draftTokens(int n_draft);
+    int verifyAndAcceptTokens(const std::vector<llama_token> &draft_tokens);
 
     // Embedding methods
     std::vector<float> getEmbedding(common_params &embd_params);

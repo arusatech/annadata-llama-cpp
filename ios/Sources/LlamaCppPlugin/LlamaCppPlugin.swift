@@ -57,6 +57,15 @@ public class LlamaCppPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "decodeAudioTokens", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "releaseVocoder", returnType: CAPPluginReturnPromise),
         
+        // Model download and management
+        CAPPluginMethod(name: "downloadModel", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getDownloadProgress", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "cancelDownload", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getAvailableModels", returnType: CAPPluginReturnPromise),
+        
+        // Grammar utilities
+        CAPPluginMethod(name: "convertJsonSchemaToGrammar", returnType: CAPPluginReturnPromise),
+        
         // Events
         CAPPluginMethod(name: "addListener", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "removeAllListeners", returnType: CAPPluginReturnPromise)
@@ -510,5 +519,73 @@ public class LlamaCppPlugin: CAPPlugin, CAPBridgedPlugin {
         // Note: In Capacitor, event listeners are typically handled differently
         // This is a placeholder for the event system
         call.resolve()
+    }
+    
+    // MARK: - Model download and management
+    
+    @objc func downloadModel(_ call: CAPPluginCall) {
+        let url = call.getString("url") ?? ""
+        let filename = call.getString("filename") ?? ""
+        
+        implementation.downloadModel(url: url, filename: filename) { result in
+            switch result {
+            case .success(let path):
+                call.resolve(["path": path])
+            case .failure(let error):
+                call.reject(error.localizedDescription)
+            }
+        }
+    }
+    
+    @objc func getDownloadProgress(_ call: CAPPluginCall) {
+        let url = call.getString("url") ?? ""
+        
+        implementation.getDownloadProgress(url: url) { result in
+            switch result {
+            case .success(let progress):
+                call.resolve(progress)
+            case .failure(let error):
+                call.reject(error.localizedDescription)
+            }
+        }
+    }
+    
+    @objc func cancelDownload(_ call: CAPPluginCall) {
+        let url = call.getString("url") ?? ""
+        
+        implementation.cancelDownload(url: url) { result in
+            switch result {
+            case .success(let cancelled):
+                call.resolve(["cancelled": cancelled])
+            case .failure(let error):
+                call.reject(error.localizedDescription)
+            }
+        }
+    }
+    
+    @objc func getAvailableModels(_ call: CAPPluginCall) {
+        implementation.getAvailableModels { result in
+            switch result {
+            case .success(let models):
+                call.resolve(["models": models])
+            case .failure(let error):
+                call.reject(error.localizedDescription)
+            }
+        }
+    }
+    
+    // MARK: - Grammar utilities
+    
+    @objc func convertJsonSchemaToGrammar(_ call: CAPPluginCall) {
+        let schema = call.getString("schema") ?? ""
+        
+        implementation.convertJsonSchemaToGrammar(schema: schema) { result in
+            switch result {
+            case .success(let grammar):
+                call.resolve(["grammar": grammar])
+            case .failure(let error):
+                call.reject(error.localizedDescription)
+            }
+        }
     }
 }

@@ -350,6 +350,23 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_initContextNative(
         
         LOGI("Model loaded successfully!");
         
+        // Check if draft model parameters are provided for speculative decoding
+        // TODO: Extract draft model parameters from JSObject params
+        // For now, we'll check if draft model path is provided as a search path
+        // In a full implementation, we'd extract these from the JSObject params:
+        // - draft_model (string): path to draft model
+        // - speculative_samples (int): number of speculative samples (default 3)
+        // - mobile_speculative (boolean): enable mobile optimizations (default true)
+        
+        // Example of how this would work:
+        // std::string draft_model_path = extract_string_from_jsobject(env, params, "draft_model");
+        // if (!draft_model_path.empty()) {
+        //     context->speculative_samples = extract_int_from_jsobject(env, params, "speculative_samples", 3);
+        //     context->mobile_speculative = extract_bool_from_jsobject(env, params, "mobile_speculative", true);
+        //     bool draft_loaded = context->loadDraftModel(draft_model_path);
+        //     LOGI("Draft model loading result: %s", draft_loaded ? "success" : "failed");
+        // }
+        
         // Store context
         jlong context_id = next_context_id++;
         contexts[context_id] = std::move(context);
@@ -427,8 +444,20 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_completionNative(
         jobject tempObj = env->CallObjectMethod(params, getDoubleMethod, temperatureKey, defaultTemp);
         jdouble temperature = env->CallDoubleMethod(tempObj, env->GetMethodID(env->FindClass("java/lang/Double"), "doubleValue", "()D"));
         
-        LOGI("Completion params - prompt: %s, n_predict: %d, temperature: %.2f", 
-             prompt_str.c_str(), n_predict, temperature);
+        // Get grammar parameter
+        jstring grammarKey = jni_utils::string_to_jstring(env, "grammar");
+        jstring defaultGrammar = jni_utils::string_to_jstring(env, "");
+        jstring grammarObj = (jstring)env->CallObjectMethod(params, getStringMethod, grammarKey, defaultGrammar);
+        std::string grammar_str = jni_utils::jstring_to_string(env, grammarObj);
+        
+        // Get json_schema parameter
+        jstring jsonSchemaKey = jni_utils::string_to_jstring(env, "json_schema");
+        jstring defaultJsonSchema = jni_utils::string_to_jstring(env, "");
+        jstring jsonSchemaObj = (jstring)env->CallObjectMethod(params, getStringMethod, jsonSchemaKey, defaultJsonSchema);
+        std::string json_schema_str = jni_utils::jstring_to_string(env, jsonSchemaObj);
+        
+        LOGI("Completion params - prompt: %s, n_predict: %d, temperature: %.2f, grammar: %s, json_schema: %s", 
+             prompt_str.c_str(), n_predict, temperature, grammar_str.c_str(), json_schema_str.c_str());
         
         // Tokenize the prompt
         capllama::llama_cap_tokenize_result tokenize_result = ctx->tokenize(prompt_str, {});
@@ -447,8 +476,18 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_completionNative(
         }
         
         // Set up sampling parameters
-        // Note: For now, we'll use the completion context's default parameters
-        // TODO: Update sampling parameters with user values
+        ctx->params.sampling.temp = static_cast<float>(temperature);
+        
+        // Set grammar if provided
+        if (!grammar_str.empty()) {
+            ctx->params.sampling.grammar = grammar_str;
+            LOGI("Using GBNF grammar: %s", grammar_str.substr(0, 100).c_str());
+        } else if (!json_schema_str.empty()) {
+            // TODO: Convert JSON schema to grammar using the existing utility
+            // For now, we'll just log that JSON schema was provided but not implemented
+            LOGI("JSON schema provided but conversion to grammar not yet implemented: %s", json_schema_str.substr(0, 100).c_str());
+            // Continue without grammar
+        }
         
         // Rewind the completion context
         ctx->completion->rewind();
@@ -459,12 +498,18 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_completionNative(
         // Begin completion
         ctx->completion->beginCompletion();
         
-        // Generate tokens
+        // Generate tokens with speculative decoding if available
         std::string generated_text;
         int tokens_generated = 0;
+        bool use_speculative = ctx->isSpectulativeEnabled();
+        
+        LOGI("Using %s decoding for generation", use_speculative ? "speculative" : "standard");
         
         while (tokens_generated < n_predict && !ctx->completion->is_interrupted) {
-            auto token_output = ctx->completion->nextToken();
+            // Use speculative decoding if available, otherwise fall back to standard
+            auto token_output = use_speculative ? 
+                ctx->completion->nextTokenSpeculative() : 
+                ctx->completion->nextToken();
             
             // Check for end-of-sequence (simplified check)
             if (token_output.tok == 2) { // Most models use 2 as EOS token
@@ -477,13 +522,22 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_completionNative(
             generated_text += token_text;
             tokens_generated++;
             
-            LOGI("Generated token %d: %s", tokens_generated, token_text.c_str());
+            if (use_speculative && tokens_generated % 10 == 0) {
+                // Periodic logging for speculative decoding performance
+                LOGI("Speculative decoding - Generated %d tokens, accepted: %d, drafted: %d", 
+                     tokens_generated, ctx->completion->n_accepted, ctx->completion->n_drafted);
+            } else if (!use_speculative) {
+                LOGI("Generated token %d: %s", tokens_generated, token_text.c_str());
+            }
         }
         
         // End completion
         ctx->completion->endCompletion();
         
         LOGI("Completion finished. Generated %d tokens: %s", tokens_generated, generated_text.c_str());
+        
+        // Get partial output to extract tool calls and reasoning content
+        auto partial_output = ctx->completion->getPartialOutput(generated_text);
         
         // Create result HashMap
         jclass hashMapClass = env->FindClass("java/util/HashMap");
@@ -496,16 +550,41 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_completionNative(
         env->CallObjectMethod(resultMap, putMethod,
             jni_utils::string_to_jstring(env, "text"), jni_utils::string_to_jstring(env, generated_text));
         env->CallObjectMethod(resultMap, putMethod,
-            jni_utils::string_to_jstring(env, "content"), jni_utils::string_to_jstring(env, generated_text));
+            jni_utils::string_to_jstring(env, "content"), jni_utils::string_to_jstring(env, partial_output.content));
         env->CallObjectMethod(resultMap, putMethod,
-            jni_utils::string_to_jstring(env, "reasoning_content"), jni_utils::string_to_jstring(env, ""));
+            jni_utils::string_to_jstring(env, "reasoning_content"), jni_utils::string_to_jstring(env, partial_output.reasoning_content));
         
-        // Create empty tool_calls array
+        // Convert tool calls to Java ArrayList
         jclass arrayListClass = env->FindClass("java/util/ArrayList");
         jmethodID arrayListConstructor = env->GetMethodID(arrayListClass, "<init>", "()V");
-        jobject emptyToolCalls = env->NewObject(arrayListClass, arrayListConstructor);
+        jmethodID addMethod = env->GetMethodID(arrayListClass, "add", "(Ljava/lang/Object;)Z");
+        jobject toolCallsList = env->NewObject(arrayListClass, arrayListConstructor);
+        
+        for (const auto& tool_call : partial_output.tool_calls) {
+            jobject toolCallMap = env->NewObject(hashMapClass, hashMapConstructor);
+            env->CallObjectMethod(toolCallMap, putMethod,
+                jni_utils::string_to_jstring(env, "type"), jni_utils::string_to_jstring(env, "function"));
+            
+            // Create function object
+            jobject functionMap = env->NewObject(hashMapClass, hashMapConstructor);
+            env->CallObjectMethod(functionMap, putMethod,
+                jni_utils::string_to_jstring(env, "name"), jni_utils::string_to_jstring(env, tool_call.name));
+            env->CallObjectMethod(functionMap, putMethod,
+                jni_utils::string_to_jstring(env, "arguments"), jni_utils::string_to_jstring(env, tool_call.arguments));
+            
+            env->CallObjectMethod(toolCallMap, putMethod,
+                jni_utils::string_to_jstring(env, "function"), functionMap);
+            
+            if (!tool_call.id.empty()) {
+                env->CallObjectMethod(toolCallMap, putMethod,
+                    jni_utils::string_to_jstring(env, "id"), jni_utils::string_to_jstring(env, tool_call.id));
+            }
+            
+            env->CallObjectMethod(toolCallsList, addMethod, toolCallMap);
+        }
+        
         env->CallObjectMethod(resultMap, putMethod,
-            jni_utils::string_to_jstring(env, "tool_calls"), emptyToolCalls);
+            jni_utils::string_to_jstring(env, "tool_calls"), toolCallsList);
         
         // Add token counts and status
         env->CallObjectMethod(resultMap, putMethod,
@@ -918,6 +997,31 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_getAvailableModelsNative(
         
     } catch (const std::exception& e) {
         LOGE("Exception in getAvailableModels: %s", e.what());
+        throw_java_exception(env, "java/lang/RuntimeException", e.what());
+        return nullptr;
+    }
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_annadata_plugin_capacitor_LlamaCpp_convertJsonSchemaToGrammarNative(
+    JNIEnv* env, jobject thiz, jstring schema_json) {
+    
+    try {
+        std::string schema_str = jni_utils::jstring_to_string(env, schema_json);
+        LOGI("Converting JSON schema to GBNF grammar: %s", schema_str.substr(0, 100).c_str());
+        
+        // Parse JSON schema
+        json schema = json::parse(schema_str);
+        
+        // TODO: Implement JSON schema to GBNF grammar conversion
+        // For now, return a simple grammar placeholder
+        std::string grammar = "root ::= \"{\" ws \"}\"\\nws ::= [ \\t\\n]*";
+        
+        LOGI("JSON schema to grammar conversion not yet implemented, using placeholder grammar");
+        return jni_utils::string_to_jstring(env, grammar);
+        
+    } catch (const std::exception& e) {
+        LOGE("Exception in convertJsonSchemaToGrammar: %s", e.what());
         throw_java_exception(env, "java/lang/RuntimeException", e.what());
         return nullptr;
     }

@@ -59,12 +59,24 @@ struct llama_cap_context {
     common_chat_templates_ptr templates;
     int n_ctx;
 
+    // Speculative decoding fields
+    llama_model *draft_model = nullptr;
+    llama_context *draft_ctx = nullptr;
+    bool speculative_enabled = false;
+    int speculative_samples = 3;  // Mobile-optimized default
+    bool mobile_speculative = true;
+
     // Completion context
     llama_cap_context_completion *completion = nullptr;
 
     ~llama_cap_context();
 
     bool loadModel(common_params &params_);
+
+    // Speculative decoding methods
+    bool loadDraftModel(const std::string &draft_model_path);
+    void releaseDraftModel();
+    bool isSpectulativeEnabled() const;
 
     // Model methods
     bool validateModelChatTemplate(bool use_jinja, const char *name) const;

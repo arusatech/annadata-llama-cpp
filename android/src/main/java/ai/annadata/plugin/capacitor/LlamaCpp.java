@@ -275,6 +275,9 @@ public class LlamaCpp {
     private native Map<String, Object> getDownloadProgressNative(String url);
     private native boolean cancelDownloadNative(String url);
     private native List<Map<String, Object>> getAvailableModelsNative();
+    
+    // Grammar utilities
+    private native String convertJsonSchemaToGrammarNative(String schemaJson);
 
     static {
         try {
@@ -441,6 +444,16 @@ public class LlamaCpp {
         } catch (Exception e) {
             Log.e(TAG, "Error getting available models: " + e.getMessage());
             callback.onResult(LlamaResult.failure(new LlamaError("Failed to get models: " + e.getMessage())));
+        }
+    }
+
+    public void convertJsonSchemaToGrammar(String schemaJson, LlamaCallback<String> callback) {
+        try {
+            String grammar = convertJsonSchemaToGrammarNative(schemaJson);
+            callback.onResult(LlamaResult.success(grammar));
+        } catch (Exception e) {
+            Log.e(TAG, "Error converting JSON schema to grammar: " + e.getMessage());
+            callback.onResult(LlamaResult.failure(new LlamaError("Failed to convert schema: " + e.getMessage())));
         }
     }
 

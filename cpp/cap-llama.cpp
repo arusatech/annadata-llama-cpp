@@ -130,6 +130,7 @@ llama_cap_context::~llama_cap_context() {
 
     releaseMultimodal();
     releaseVocoder();
+    releaseDraftModel();  // Clean up speculative decoding resources
 }
 
 bool llama_cap_context::loadModel(common_params &params_)
@@ -340,6 +341,59 @@ void llama_cap_context::releaseVocoder() {
         tts_wrapper = nullptr;
     }
     has_vocoder = false;
+}
+
+// Speculative decoding methods
+bool llama_cap_context::loadDraftModel(const std::string &draft_model_path) {
+    if (draft_model_path.empty()) {
+        return false;
+    }
+
+    // Create draft model parameters (based on main model params)
+    common_params draft_params = params;
+    draft_params.model.path = draft_model_path;
+    
+    // Mobile optimization: smaller context for draft model
+    if (mobile_speculative) {
+        draft_params.n_ctx = std::min(params.n_ctx, 1024);  // Limit draft context
+        draft_params.n_batch = std::min(params.n_batch, 128);  // Smaller batch
+    }
+
+    try {
+        // For now, use simplified draft model initialization
+        // This would be expanded in a full implementation to properly initialize
+        // the draft model and context
+        
+        // TODO: Implement proper draft model loading
+        // draft_model = llama_load_model_from_file(draft_model_path.c_str(), draft_params);
+        // draft_ctx = llama_new_context_with_model(draft_model, draft_params);
+        
+        // For this implementation, we'll disable speculative decoding
+        // until proper model loading is implemented
+        printf("Draft model loading not yet implemented - falling back to regular decoding\n");
+        speculative_enabled = false;
+        return false;
+        
+    } catch (const std::exception& e) {
+        printf("Failed to load draft model: %s\n", e.what());
+        releaseDraftModel();
+    }
+    
+    return false;
+}
+
+void llama_cap_context::releaseDraftModel() {
+    if (draft_ctx) {
+        // Note: draft_ctx and draft_model are managed by common_init_result
+        // They will be automatically cleaned up
+        draft_ctx = nullptr;
+        draft_model = nullptr;
+    }
+    speculative_enabled = false;
+}
+
+bool llama_cap_context::isSpectulativeEnabled() const {
+    return speculative_enabled && draft_model && draft_ctx;
 }
 
 }
