@@ -350,23 +350,6 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_initContextNative(
         
         LOGI("Model loaded successfully!");
         
-        // Check if draft model parameters are provided for speculative decoding
-        // TODO: Extract draft model parameters from JSObject params
-        // For now, we'll check if draft model path is provided as a search path
-        // In a full implementation, we'd extract these from the JSObject params:
-        // - draft_model (string): path to draft model
-        // - speculative_samples (int): number of speculative samples (default 3)
-        // - mobile_speculative (boolean): enable mobile optimizations (default true)
-        
-        // Example of how this would work:
-        // std::string draft_model_path = extract_string_from_jsobject(env, params, "draft_model");
-        // if (!draft_model_path.empty()) {
-        //     context->speculative_samples = extract_int_from_jsobject(env, params, "speculative_samples", 3);
-        //     context->mobile_speculative = extract_bool_from_jsobject(env, params, "mobile_speculative", true);
-        //     bool draft_loaded = context->loadDraftModel(draft_model_path);
-        //     LOGI("Draft model loading result: %s", draft_loaded ? "success" : "failed");
-        // }
-        
         // Store context
         jlong context_id = next_context_id++;
         contexts[context_id] = std::move(context);
@@ -418,46 +401,102 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_completionNative(
             return nullptr;
         }
         
-        // Extract parameters from JSObject
+        // Extract parameters from JSObject using compatible API
         jclass jsObjectClass = env->GetObjectClass(params);
-        jmethodID getStringMethod = env->GetMethodID(jsObjectClass, "getString", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
-        jmethodID getIntegerMethod = env->GetMethodID(jsObjectClass, "getInteger", "(Ljava/lang/String;Ljava/lang/Integer;)Ljava/lang/Integer;");
-        jmethodID getDoubleMethod = env->GetMethodID(jsObjectClass, "getDouble", "(Ljava/lang/String;Ljava/lang/Double;)Ljava/lang/Double;");
         
-        // Get prompt
-        jstring promptKey = jni_utils::string_to_jstring(env, "prompt");
-        jstring defaultPrompt = jni_utils::string_to_jstring(env, "");
-        jstring promptObj = (jstring)env->CallObjectMethod(params, getStringMethod, promptKey, defaultPrompt);
-        std::string prompt_str = jni_utils::jstring_to_string(env, promptObj);
+        // Try to get method IDs and handle exceptions
+        jmethodID getStringMethod = nullptr;
+        jmethodID getIntegerMethod = nullptr; 
+        jmethodID getDoubleMethod = nullptr;
         
-        // Get n_predict
-        jstring nPredictKey = jni_utils::string_to_jstring(env, "n_predict");
-        jobject defaultNPredict = env->NewObject(env->FindClass("java/lang/Integer"), 
-            env->GetMethodID(env->FindClass("java/lang/Integer"), "<init>", "(I)V"), 128);
-        jobject nPredictObj = env->CallObjectMethod(params, getIntegerMethod, nPredictKey, defaultNPredict);
-        jint n_predict = env->CallIntMethod(nPredictObj, env->GetMethodID(env->FindClass("java/lang/Integer"), "intValue", "()I"));
+        // Clear any pending exceptions first
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
         
-        // Get temperature
-        jstring temperatureKey = jni_utils::string_to_jstring(env, "temperature");
-        jobject defaultTemp = env->NewObject(env->FindClass("java/lang/Double"), 
-            env->GetMethodID(env->FindClass("java/lang/Double"), "<init>", "(D)V"), 0.8);
-        jobject tempObj = env->CallObjectMethod(params, getDoubleMethod, temperatureKey, defaultTemp);
-        jdouble temperature = env->CallDoubleMethod(tempObj, env->GetMethodID(env->FindClass("java/lang/Double"), "doubleValue", "()D"));
+        try {
+            getStringMethod = env->GetMethodID(jsObjectClass, "getString", "(Ljava/lang/String;)Ljava/lang/String;");
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                getStringMethod = nullptr;
+            }
+            
+            getIntegerMethod = env->GetMethodID(jsObjectClass, "getInteger", "(Ljava/lang/String;)Ljava/lang/Integer;");
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                getIntegerMethod = nullptr;
+            }
+            
+            getDoubleMethod = env->GetMethodID(jsObjectClass, "getDouble", "(Ljava/lang/String;)Ljava/lang/Double;");
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                getDoubleMethod = nullptr;
+            }
+        } catch (...) {
+            LOGE("Exception getting JSObject method IDs");
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            }
+        }
         
-        // Get grammar parameter
-        jstring grammarKey = jni_utils::string_to_jstring(env, "grammar");
-        jstring defaultGrammar = jni_utils::string_to_jstring(env, "");
-        jstring grammarObj = (jstring)env->CallObjectMethod(params, getStringMethod, grammarKey, defaultGrammar);
-        std::string grammar_str = jni_utils::jstring_to_string(env, grammarObj);
+        // Get prompt with safe method calls
+        std::string prompt_str = "Once upon a time";
+        jint n_predict = 50;
+        jdouble temperature = 0.7;
         
-        // Get json_schema parameter
-        jstring jsonSchemaKey = jni_utils::string_to_jstring(env, "json_schema");
-        jstring defaultJsonSchema = jni_utils::string_to_jstring(env, "");
-        jstring jsonSchemaObj = (jstring)env->CallObjectMethod(params, getStringMethod, jsonSchemaKey, defaultJsonSchema);
-        std::string json_schema_str = jni_utils::jstring_to_string(env, jsonSchemaObj);
+        if (getStringMethod) {
+            jstring promptKey = jni_utils::string_to_jstring(env, "prompt");
+            jstring promptObj = (jstring)env->CallObjectMethod(params, getStringMethod, promptKey);
+            if (promptObj && !env->ExceptionCheck()) {
+                prompt_str = jni_utils::jstring_to_string(env, promptObj);
+            } else if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            }
+        }
         
-        LOGI("Completion params - prompt: %s, n_predict: %d, temperature: %.2f, grammar: %s, json_schema: %s", 
-             prompt_str.c_str(), n_predict, temperature, grammar_str.c_str(), json_schema_str.c_str());
+        // Get n_predict with safe method calls
+        if (getIntegerMethod) {
+            jstring nPredictKey = jni_utils::string_to_jstring(env, "n_predict");
+            jobject nPredictObj = env->CallObjectMethod(params, getIntegerMethod, nPredictKey);
+            if (nPredictObj && !env->ExceptionCheck()) {
+                n_predict = env->CallIntMethod(nPredictObj, env->GetMethodID(env->FindClass("java/lang/Integer"), "intValue", "()I"));
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    n_predict = 50; // fallback
+                }
+            } else if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            }
+        }
+        
+        // Get temperature with safe method calls
+        if (getDoubleMethod) {
+            jstring temperatureKey = jni_utils::string_to_jstring(env, "temperature");
+            jobject tempObj = env->CallObjectMethod(params, getDoubleMethod, temperatureKey);
+            if (tempObj && !env->ExceptionCheck()) {
+                temperature = env->CallDoubleMethod(tempObj, env->GetMethodID(env->FindClass("java/lang/Double"), "doubleValue", "()D"));
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    temperature = 0.7; // fallback
+                }
+            } else if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            }
+        }
+        
+        LOGI("Completion params - prompt: %s, n_predict: %d, temperature: %.2f", 
+             prompt_str.c_str(), n_predict, temperature);
+        
+        // Set sampling parameters based on extracted values
+        ctx->params.sampling.temp = temperature;
+        ctx->params.sampling.top_k = 40;  // Default value
+        ctx->params.sampling.top_p = 0.95f; // Default value
+        ctx->params.sampling.penalty_repeat = 1.1f; // Default value (correct field name)
+        ctx->params.n_predict = n_predict;
+        ctx->params.prompt = prompt_str;
+        
+        LOGI("Updated context sampling params - temp: %.2f, top_k: %d, top_p: %.2f", 
+             ctx->params.sampling.temp, ctx->params.sampling.top_k, ctx->params.sampling.top_p);
         
         // Tokenize the prompt
         capllama::llama_cap_tokenize_result tokenize_result = ctx->tokenize(prompt_str, {});
@@ -467,77 +506,196 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_completionNative(
         
         // Initialize completion context if not already done
         if (!ctx->completion) {
-            ctx->completion = new capllama::llama_cap_context_completion(ctx.get());
-            if (!ctx->completion->initSampling()) {
-                LOGE("Failed to initialize sampling");
-                throw_java_exception(env, "java/lang/RuntimeException", "Failed to initialize sampling");
+            LOGI("Initializing completion context for the first time");
+            
+            // Validate parent context before creating completion
+            if (!ctx->ctx || !ctx->model) {
+                LOGE("Parent context is invalid - missing llama context or model");
+                throw_java_exception(env, "java/lang/RuntimeException", "Parent context is not properly initialized");
+                return nullptr;
+            }
+            
+            try {
+                LOGI("Creating llama_cap_context_completion...");
+                LOGI("Parent context pointer: %p", ctx.get());
+                LOGI("Parent context->ctx: %p", ctx->ctx);
+                LOGI("Parent context->model: %p", ctx->model);
+                
+                // Additional safety checks before constructor
+                if (!ctx.get()) {
+                    LOGE("Parent context pointer is null");
+                    throw_java_exception(env, "java/lang/RuntimeException", "Parent context pointer is null");
+                    return nullptr;
+                }
+                
+                ctx->completion = new capllama::llama_cap_context_completion(ctx.get());
+                
+                if (!ctx->completion) {
+                    LOGE("Failed to create completion context - constructor returned null");
+                    throw_java_exception(env, "java/lang/RuntimeException", "Failed to create completion context");
+                    return nullptr;
+                }
+                
+                LOGI("Completion context created successfully at: %p", ctx->completion);
+                
+                LOGI("Initializing sampling for completion context...");
+                LOGI("Parent context params before initSampling - model: %p, params: %p", ctx->model, &(ctx->params));
+                LOGI("Parent context sampling params - temperature: %.2f, top_k: %d, top_p: %.2f", 
+                     ctx->params.sampling.temp, ctx->params.sampling.top_k, ctx->params.sampling.top_p);
+                
+                bool sampling_result = false;
+                try {
+                    sampling_result = ctx->completion->initSampling();
+                    LOGI("initSampling completed, result: %s", sampling_result ? "true" : "false");
+                    LOGI("Sampler pointer after init: %p", ctx->completion->ctx_sampling);
+                } catch (const std::exception& e) {
+                    LOGE("Exception in initSampling: %s", e.what());
+                    delete ctx->completion;
+                    ctx->completion = nullptr;
+                    throw_java_exception(env, "java/lang/RuntimeException", 
+                        ("Failed to initialize sampling: " + std::string(e.what())).c_str());
+                    return nullptr;
+                } catch (...) {
+                    LOGE("Unknown exception in initSampling");
+                    delete ctx->completion;
+                    ctx->completion = nullptr;
+                    throw_java_exception(env, "java/lang/RuntimeException", "Unknown error in sampling initialization");
+                    return nullptr;
+                }
+                
+                if (!sampling_result || !ctx->completion->ctx_sampling) {
+                    LOGE("Failed to initialize sampling - result: %s, sampler: %p", 
+                         sampling_result ? "true" : "false", ctx->completion->ctx_sampling);
+                    delete ctx->completion;
+                    ctx->completion = nullptr;
+                    throw_java_exception(env, "java/lang/RuntimeException", "Failed to initialize sampling context");
+                    return nullptr;
+                }
+                
+                LOGI("Completion context initialized successfully");
+            } catch (const std::exception& e) {
+                LOGE("Exception during completion context creation: %s", e.what());
+                if (ctx->completion) {
+                    delete ctx->completion;
+                    ctx->completion = nullptr;
+                }
+                throw_java_exception(env, "java/lang/RuntimeException", 
+                    ("Failed to create completion context: " + std::string(e.what())).c_str());
+                return nullptr;
+            } catch (...) {
+                LOGE("Unknown exception during completion context creation");
+                if (ctx->completion) {
+                    delete ctx->completion;
+                    ctx->completion = nullptr;
+                }
+                throw_java_exception(env, "java/lang/RuntimeException", "Unknown error during completion context creation");
                 return nullptr;
             }
         }
         
         // Set up sampling parameters
-        ctx->params.sampling.temp = static_cast<float>(temperature);
-        
-        // Set grammar if provided
-        if (!grammar_str.empty()) {
-            ctx->params.sampling.grammar = grammar_str;
-            LOGI("Using GBNF grammar: %s", grammar_str.substr(0, 100).c_str());
-        } else if (!json_schema_str.empty()) {
-            // TODO: Convert JSON schema to grammar using the existing utility
-            // For now, we'll just log that JSON schema was provided but not implemented
-            LOGI("JSON schema provided but conversion to grammar not yet implemented: %s", json_schema_str.substr(0, 100).c_str());
-            // Continue without grammar
-        }
-        
-        // Rewind the completion context
-        ctx->completion->rewind();
-        
-        // Load the prompt
-        ctx->completion->loadPrompt({});
-        
-        // Begin completion
-        ctx->completion->beginCompletion();
-        
-        // Generate tokens with speculative decoding if available
+        // Note: For now, we'll use the completion context's default parameters
+        // TODO: Update sampling parameters with user values
+        // 
+            // Declare variables outside try block so they're accessible later
         std::string generated_text;
         int tokens_generated = 0;
-        bool use_speculative = ctx->isSpectulativeEnabled();
         
-        LOGI("Using %s decoding for generation", use_speculative ? "speculative" : "standard");
-        
-        while (tokens_generated < n_predict && !ctx->completion->is_interrupted) {
-            // Use speculative decoding if available, otherwise fall back to standard
-            auto token_output = use_speculative ? 
-                ctx->completion->nextTokenSpeculative() : 
-                ctx->completion->nextToken();
-            
-            // Check for end-of-sequence (simplified check)
-            if (token_output.tok == 2) { // Most models use 2 as EOS token
-                LOGI("Reached EOS token, stopping generation");
-                break;
+        try {
+            LOGI("Rewinding completion context...");
+            try {
+                ctx->completion->rewind();
+                LOGI("Rewind completed successfully");
+            } catch (const std::exception& e) {
+                LOGE("Exception in rewind: %s", e.what());
+                throw;
             }
             
-            // Convert token to text
-            std::string token_text = capllama::tokens_to_output_formatted_string(ctx->ctx, token_output.tok);
-            generated_text += token_text;
-            tokens_generated++;
-            
-            if (use_speculative && tokens_generated % 10 == 0) {
-                // Periodic logging for speculative decoding performance
-                LOGI("Speculative decoding - Generated %d tokens, accepted: %d, drafted: %d", 
-                     tokens_generated, ctx->completion->n_accepted, ctx->completion->n_drafted);
-            } else if (!use_speculative) {
-                LOGI("Generated token %d: %s", tokens_generated, token_text.c_str());
+            LOGI("Loading prompt into completion context...");
+            try {
+                // Validate sampler is properly initialized before loadPrompt
+                if (!ctx->completion->ctx_sampling) {
+                    LOGE("Sampler context is null - reinitializing");
+                    if (!ctx->completion->initSampling()) {
+                        LOGE("Failed to reinitialize sampling");
+                        throw std::runtime_error("Sampler initialization failed");
+                    }
+                    LOGI("Sampler reinitialized successfully");
+                }
+                
+                ctx->completion->loadPrompt({});
+                LOGI("loadPrompt completed successfully");
+            } catch (const std::exception& e) {
+                LOGE("Exception in loadPrompt: %s", e.what());
+                throw;
             }
+            
+            LOGI("Beginning completion generation...");
+            try {
+                ctx->completion->beginCompletion();
+                LOGI("beginCompletion completed successfully");
+            } catch (const std::exception& e) {
+                LOGE("Exception in beginCompletion: %s", e.what());
+                throw;
+            }
+            
+            LOGI("Starting token generation loop (max tokens: %d)...", n_predict);
+            
+            while (tokens_generated < n_predict && !ctx->completion->is_interrupted) {
+                try {
+                    LOGI("Generating token %d...", tokens_generated + 1);
+                    auto token_output = ctx->completion->nextToken();
+                    
+                    // Check for end-of-sequence (simplified check)
+                    if (token_output.tok == 2) { // Most models use 2 as EOS token
+                        LOGI("Reached EOS token, stopping generation");
+                        break;
+                    }
+                    
+                    // Convert token to text
+                    std::string token_text = capllama::tokens_to_output_formatted_string(ctx->ctx, token_output.tok);
+                    generated_text += token_text;
+                    tokens_generated++;
+                    
+                    LOGI("Generated token %d (ID: %d): %s", tokens_generated, token_output.tok, token_text.c_str());
+                    
+                } catch (const std::exception& e) {
+                    LOGE("Exception during token generation %d: %s", tokens_generated + 1, e.what());
+                    break;
+                } catch (...) {
+                    LOGE("Unknown exception during token generation %d", tokens_generated + 1);
+                    break;
+                }
+            }
+            
+            LOGI("Token generation completed. Generated %d tokens.", tokens_generated);
+            
+            // End completion
+            LOGI("Ending completion...");
+            ctx->completion->endCompletion();
+            
+        } catch (const std::exception& e) {
+            LOGE("Exception during completion process: %s", e.what());
+            try {
+                ctx->completion->endCompletion();
+            } catch (...) {
+                LOGE("Failed to properly end completion after exception");
+            }
+            throw_java_exception(env, "java/lang/RuntimeException", 
+                ("Completion process failed: " + std::string(e.what())).c_str());
+            return nullptr;
+        } catch (...) {
+            LOGE("Unknown exception during completion process");
+            try {
+                ctx->completion->endCompletion();
+            } catch (...) {
+                LOGE("Failed to properly end completion after unknown exception");
+            }
+            throw_java_exception(env, "java/lang/RuntimeException", "Unknown error during completion process");
+            return nullptr;
         }
         
-        // End completion
-        ctx->completion->endCompletion();
-        
         LOGI("Completion finished. Generated %d tokens: %s", tokens_generated, generated_text.c_str());
-        
-        // Get partial output to extract tool calls and reasoning content
-        auto partial_output = ctx->completion->getPartialOutput(generated_text);
         
         // Create result HashMap
         jclass hashMapClass = env->FindClass("java/util/HashMap");
@@ -550,41 +708,16 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_completionNative(
         env->CallObjectMethod(resultMap, putMethod,
             jni_utils::string_to_jstring(env, "text"), jni_utils::string_to_jstring(env, generated_text));
         env->CallObjectMethod(resultMap, putMethod,
-            jni_utils::string_to_jstring(env, "content"), jni_utils::string_to_jstring(env, partial_output.content));
+            jni_utils::string_to_jstring(env, "content"), jni_utils::string_to_jstring(env, generated_text));
         env->CallObjectMethod(resultMap, putMethod,
-            jni_utils::string_to_jstring(env, "reasoning_content"), jni_utils::string_to_jstring(env, partial_output.reasoning_content));
+            jni_utils::string_to_jstring(env, "reasoning_content"), jni_utils::string_to_jstring(env, ""));
         
-        // Convert tool calls to Java ArrayList
+        // Create empty tool_calls array
         jclass arrayListClass = env->FindClass("java/util/ArrayList");
         jmethodID arrayListConstructor = env->GetMethodID(arrayListClass, "<init>", "()V");
-        jmethodID addMethod = env->GetMethodID(arrayListClass, "add", "(Ljava/lang/Object;)Z");
-        jobject toolCallsList = env->NewObject(arrayListClass, arrayListConstructor);
-        
-        for (const auto& tool_call : partial_output.tool_calls) {
-            jobject toolCallMap = env->NewObject(hashMapClass, hashMapConstructor);
-            env->CallObjectMethod(toolCallMap, putMethod,
-                jni_utils::string_to_jstring(env, "type"), jni_utils::string_to_jstring(env, "function"));
-            
-            // Create function object
-            jobject functionMap = env->NewObject(hashMapClass, hashMapConstructor);
-            env->CallObjectMethod(functionMap, putMethod,
-                jni_utils::string_to_jstring(env, "name"), jni_utils::string_to_jstring(env, tool_call.name));
-            env->CallObjectMethod(functionMap, putMethod,
-                jni_utils::string_to_jstring(env, "arguments"), jni_utils::string_to_jstring(env, tool_call.arguments));
-            
-            env->CallObjectMethod(toolCallMap, putMethod,
-                jni_utils::string_to_jstring(env, "function"), functionMap);
-            
-            if (!tool_call.id.empty()) {
-                env->CallObjectMethod(toolCallMap, putMethod,
-                    jni_utils::string_to_jstring(env, "id"), jni_utils::string_to_jstring(env, tool_call.id));
-            }
-            
-            env->CallObjectMethod(toolCallsList, addMethod, toolCallMap);
-        }
-        
+        jobject emptyToolCalls = env->NewObject(arrayListClass, arrayListConstructor);
         env->CallObjectMethod(resultMap, putMethod,
-            jni_utils::string_to_jstring(env, "tool_calls"), toolCallsList);
+            jni_utils::string_to_jstring(env, "tool_calls"), emptyToolCalls);
         
         // Add token counts and status
         env->CallObjectMethod(resultMap, putMethod,
@@ -997,31 +1130,6 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_getAvailableModelsNative(
         
     } catch (const std::exception& e) {
         LOGE("Exception in getAvailableModels: %s", e.what());
-        throw_java_exception(env, "java/lang/RuntimeException", e.what());
-        return nullptr;
-    }
-}
-
-JNIEXPORT jstring JNICALL
-Java_ai_annadata_plugin_capacitor_LlamaCpp_convertJsonSchemaToGrammarNative(
-    JNIEnv* env, jobject thiz, jstring schema_json) {
-    
-    try {
-        std::string schema_str = jni_utils::jstring_to_string(env, schema_json);
-        LOGI("Converting JSON schema to GBNF grammar: %s", schema_str.substr(0, 100).c_str());
-        
-        // Parse JSON schema
-        json schema = json::parse(schema_str);
-        
-        // TODO: Implement JSON schema to GBNF grammar conversion
-        // For now, return a simple grammar placeholder
-        std::string grammar = "root ::= \"{\" ws \"}\"\\nws ::= [ \\t\\n]*";
-        
-        LOGI("JSON schema to grammar conversion not yet implemented, using placeholder grammar");
-        return jni_utils::string_to_jstring(env, grammar);
-        
-    } catch (const std::exception& e) {
-        LOGE("Exception in convertJsonSchemaToGrammar: %s", e.what());
         throw_java_exception(env, "java/lang/RuntimeException", e.what());
         return nullptr;
     }
