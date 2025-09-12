@@ -144,6 +144,67 @@ Generate text completion based on a prompt or messages.
 
 **Parameters:**
 - `params`: Completion parameters
+
+#### `context.chat(options: ChatOptions): Promise<NativeCompletionResult>`
+
+**NEW**: Chat-first method that combines message formatting and completion (like llama-cli -sys).
+
+**Parameters:**
+- `contextId`: Context ID
+- `messages`: Array of chat messages
+- `system`: Optional system prompt (like llama-cli -sys)
+- `chatTemplate`: Optional chat template override
+- `params`: Additional completion parameters
+
+**Example:**
+```typescript
+const result = await llama.chat({
+  contextId: 1,
+  messages: [
+    { role: "user", content: "What is 2+2?" }
+  ],
+  system: "You are a helpful assistant",
+  params: { n_predict: 100 }
+});
+```
+
+#### `context.chatWithSystem(options: ChatWithSystemOptions): Promise<NativeCompletionResult>`
+
+**NEW**: Simple chat with system prompt (equivalent to llama-cli -sys "You are a helpful assistant").
+
+**Parameters:**
+- `contextId`: Context ID
+- `system`: System prompt
+- `message`: User message
+- `params`: Additional completion parameters
+
+**Example:**
+```typescript
+const result = await llama.chatWithSystem({
+  contextId: 1,
+  system: "You are a helpful assistant",
+  message: "What is 2+2?",
+  params: { n_predict: 100 }
+});
+```
+
+#### `context.generateText(options: GenerateTextOptions): Promise<NativeCompletionResult>`
+
+**NEW**: Simple text generation (equivalent to llama-cli -p "prompt").
+
+**Parameters:**
+- `contextId`: Context ID
+- `prompt`: Text prompt
+- `params`: Additional completion parameters
+
+**Example:**
+```typescript
+const result = await llama.generateText({
+  contextId: 1,
+  prompt: "I believe the meaning of life is",
+  params: { n_predict: 128 }
+});
+```
 - `callback`: Optional streaming callback for token-by-token output
 
 **Returns:** Promise resolving to completion result

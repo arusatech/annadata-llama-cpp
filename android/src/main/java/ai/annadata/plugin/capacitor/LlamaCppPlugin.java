@@ -178,6 +178,69 @@ public class LlamaCppPlugin extends Plugin {
         });
     }
 
+    // MARK: - Chat-first methods (like llama-cli -sys)
+
+    @PluginMethod
+    public void chat(PluginCall call) {
+        int contextId = call.getInt("contextId", 0);
+        JSArray messagesArray = call.getArray("messages", new JSArray());
+        String system = call.getString("system");
+        String chatTemplate = call.getString("chatTemplate");
+        JSObject params = call.getObject("params");
+
+        try {
+            // Convert JSArray to JSON string
+            String messagesJson = messagesArray.toString();
+            
+            implementation.chat(contextId, messagesJson, system, chatTemplate, params, result -> {
+                if (result.isSuccess()) {
+                    Map<String, Object> data = result.getData();
+                    JSObject jsResult = convertMapToJSObject(data);
+                    call.resolve(jsResult);
+                } else {
+                    call.reject(result.getError().getMessage());
+                }
+            });
+        } catch (Exception e) {
+            call.reject("Failed to process chat request: " + e.getMessage());
+        }
+    }
+
+    @PluginMethod
+    public void chatWithSystem(PluginCall call) {
+        int contextId = call.getInt("contextId", 0);
+        String system = call.getString("system", "");
+        String message = call.getString("message", "");
+        JSObject params = call.getObject("params");
+
+        implementation.chatWithSystem(contextId, system, message, params, result -> {
+            if (result.isSuccess()) {
+                Map<String, Object> data = result.getData();
+                JSObject jsResult = convertMapToJSObject(data);
+                call.resolve(jsResult);
+            } else {
+                call.reject(result.getError().getMessage());
+            }
+        });
+    }
+
+    @PluginMethod
+    public void generateText(PluginCall call) {
+        int contextId = call.getInt("contextId", 0);
+        String prompt = call.getString("prompt", "");
+        JSObject params = call.getObject("params");
+
+        implementation.generateText(contextId, prompt, params, result -> {
+            if (result.isSuccess()) {
+                Map<String, Object> data = result.getData();
+                JSObject jsResult = convertMapToJSObject(data);
+                call.resolve(jsResult);
+            } else {
+                call.reject(result.getError().getMessage());
+            }
+        });
+    }
+
     // MARK: - Session management
 
     @PluginMethod

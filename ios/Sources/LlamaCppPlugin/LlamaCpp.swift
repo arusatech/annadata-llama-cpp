@@ -354,6 +354,84 @@ struct MinjaCaps {
         completion(.success(()))
     }
     
+    // MARK: - Chat-first methods (like llama-cli -sys)
+    
+    func chat(contextId: Int, messages: [JSObject], system: String?, chatTemplate: String?, params: [String: Any]?, completion: @escaping (LlamaResult<[String: Any]>) -> Void) {
+        guard contexts[contextId] != nil else {
+            completion(.failure(.contextNotFound))
+            return
+        }
+        
+        do {
+            // Convert JSObject messages to JSON string
+            let messagesData = try JSONSerialization.data(withJSONObject: messages)
+            let messagesJson = String(data: messagesData, encoding: .utf8) ?? "[]"
+            
+            // Add system message if provided
+            var allMessages = messages
+            if let system = system, !system.isEmpty {
+                let systemMessage: [String: Any] = [
+                    "role": "system",
+                    "content": system
+                ]
+                allMessages.insert(JSObject(systemMessage), at: 0)
+            }
+            
+            // Convert to JSON string for getFormattedChat
+            let allMessagesData = try JSONSerialization.data(withJSONObject: allMessages.map { $0.dictionary })
+            let allMessagesJson = String(data: allMessagesData, encoding: .utf8) ?? "[]"
+            
+            // First, format the chat
+            getFormattedChat(contextId: contextId, messages: allMessagesJson, chatTemplate: chatTemplate, params: nil) { [weak self] result in
+                switch result {
+                case .success(let formattedResult):
+                    // Extract the formatted prompt
+                    let formattedPrompt = formattedResult["prompt"] as? String ?? ""
+                    
+                    // Create completion parameters
+                    var completionParams = params ?? [:]
+                    completionParams["prompt"] = formattedPrompt
+                    
+                    // Call completion with formatted prompt
+                    self?.completion(contextId: contextId, params: completionParams, completion: completion)
+                    
+                case .failure(let error):
+                    completion(.failure(error))
+                }
+            }
+            
+        } catch {
+            completion(.failure(.contextNotFound)) // Use a more appropriate error
+        }
+    }
+    
+    func chatWithSystem(contextId: Int, system: String, message: String, params: [String: Any]?, completion: @escaping (LlamaResult<[String: Any]>) -> Void) {
+        // Create a simple message array
+        let userMessage: [String: Any] = [
+            "role": "user",
+            "content": message
+        ]
+        
+        let messages = [JSObject(userMessage)]
+        
+        // Call the main chat method
+        chat(contextId: contextId, messages: messages, system: system, chatTemplate: nil, params: params, completion: completion)
+    }
+    
+    func generateText(contextId: Int, prompt: String, params: [String: Any]?, completion: @escaping (LlamaResult<[String: Any]>) -> Void) {
+        guard contexts[contextId] != nil else {
+            completion(.failure(.contextNotFound))
+            return
+        }
+        
+        // Create completion parameters
+        var completionParams = params ?? [:]
+        completionParams["prompt"] = prompt
+        
+        // Call completion directly
+        completion(contextId: contextId, params: completionParams, completion: completion)
+    }
+    
     // MARK: - Session management
     
     func loadSession(contextId: Int, filepath: String, completion: @escaping (LlamaResult<[String: Any]>) -> Void) {

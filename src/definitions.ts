@@ -637,6 +637,30 @@ export interface LlamaCppPlugin {
     params: NativeCompletionParams;
   }): Promise<NativeCompletionResult>;
 
+  // Chat-first methods (like llama-cli -sys)
+  chat(options: {
+    contextId: number;
+    messages: LlamaCppOAICompatibleMessage[];
+    system?: string; // Simple system prompt like llama-cli -sys
+    chatTemplate?: string;
+    params?: Omit<NativeCompletionParams, 'prompt' | 'messages'>;
+  }): Promise<NativeCompletionResult>;
+
+  // Simple chat with system prompt (like llama-cli -sys "You are a helpful assistant")
+  chatWithSystem(options: {
+    contextId: number;
+    system: string;
+    message: string;
+    params?: Omit<NativeCompletionParams, 'prompt' | 'messages'>;
+  }): Promise<NativeCompletionResult>;
+
+  // Simple text generation (like llama-cli -p "prompt")
+  generateText(options: {
+    contextId: number;
+    prompt: string;
+    params?: Omit<NativeCompletionParams, 'prompt' | 'messages'>;
+  }): Promise<NativeCompletionResult>;
+
   stopCompletion(options: { contextId: number }): Promise<void>;
 
   // Session management

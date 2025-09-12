@@ -4,6 +4,7 @@ import android.util.Log;
 import com.getcapacitor.JSObject;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Iterator;
 import java.util.concurrent.CompletableFuture;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -634,6 +635,161 @@ public class LlamaCpp {
             callback.onResult(LlamaResult.success(null));
         } catch (Exception e) {
             callback.onResult(LlamaResult.failure(new LlamaError("Failed to stop completion: " + e.getMessage())));
+        }
+    }
+
+    // MARK: - Chat-first methods (like llama-cli -sys)
+
+    public void chat(int contextId, String messagesJson, String system, String chatTemplate, JSObject params, LlamaCallback<Map<String, Object>> callback) {
+        LlamaContext context = contexts.get(contextId);
+        if (context == null) {
+            callback.onResult(LlamaResult.failure(new LlamaError("Context not found")));
+            return;
+        }
+
+        try {
+            Log.i(TAG, "Starting chat for context: " + contextId);
+            
+            // Parse messages JSON
+            List<Map<String, Object>> messages = parseMessagesJson(messagesJson);
+            
+            // Add system message if provided
+            if (system != null && !system.isEmpty()) {
+                Map<String, Object> systemMsg = new HashMap<>();
+                systemMsg.put("role", "system");
+                systemMsg.put("content", system);
+                messages.add(0, systemMsg); // Add system message at the beginning
+            }
+            
+            // Convert messages to JSON string for getFormattedChat
+            String formattedMessages = convertMessagesToJson(messages);
+            
+            // First, format the chat
+            String formattedPrompt = getFormattedChatNative(context.getNativeContextId(), formattedMessages, chatTemplate != null ? chatTemplate : "");
+            
+            // Then run completion with the formatted prompt
+            JSObject completionParams = new JSObject();
+            completionParams.put("prompt", formattedPrompt);
+            
+            // Copy other parameters from params
+            if (params != null) {
+                Iterator<String> keyIterator = params.keys();
+                while (keyIterator.hasNext()) {
+                    String key = keyIterator.next();
+                    if (!key.equals("prompt") && !key.equals("messages")) {
+                        completionParams.put(key, params.get(key));
+                    }
+                }
+            }
+            
+            // Call native completion
+            Map<String, Object> result = completionNative(context.getNativeContextId(), completionParams);
+            
+            if (result != null) {
+                Log.i(TAG, "Chat completed successfully");
+                callback.onResult(LlamaResult.success(result));
+            } else {
+                Log.e(TAG, "Chat returned null result");
+                callback.onResult(LlamaResult.failure(new LlamaError("Chat failed")));
+            }
+            
+        } catch (Exception e) {
+            Log.e(TAG, "Chat failed: " + e.getMessage());
+            callback.onResult(LlamaResult.failure(new LlamaError("Chat failed: " + e.getMessage())));
+        }
+    }
+
+    public void chatWithSystem(int contextId, String system, String message, JSObject params, LlamaCallback<Map<String, Object>> callback) {
+        try {
+            // Create a simple message array
+            List<Map<String, Object>> messages = new ArrayList<>();
+            Map<String, Object> userMsg = new HashMap<>();
+            userMsg.put("role", "user");
+            userMsg.put("content", message);
+            messages.add(userMsg);
+            
+            // Call the main chat method
+            chat(contextId, convertMessagesToJson(messages), system, null, params, callback);
+        } catch (Exception e) {
+            callback.onResult(LlamaResult.failure(new LlamaError("Chat with system failed: " + e.getMessage())));
+        }
+    }
+
+    public void generateText(int contextId, String prompt, JSObject params, LlamaCallback<Map<String, Object>> callback) {
+        LlamaContext context = contexts.get(contextId);
+        if (context == null) {
+            callback.onResult(LlamaResult.failure(new LlamaError("Context not found")));
+            return;
+        }
+
+        try {
+            Log.i(TAG, "Starting text generation for context: " + contextId);
+            
+            // Create completion parameters
+            JSObject completionParams = new JSObject();
+            completionParams.put("prompt", prompt);
+            
+            // Copy other parameters from params
+            if (params != null) {
+                Iterator<String> keyIterator = params.keys();
+                while (keyIterator.hasNext()) {
+                    String key = keyIterator.next();
+                    if (!key.equals("prompt") && !key.equals("messages")) {
+                        completionParams.put(key, params.get(key));
+                    }
+                }
+            }
+            
+            // Call native completion
+            Map<String, Object> result = completionNative(context.getNativeContextId(), completionParams);
+            
+            if (result != null) {
+                Log.i(TAG, "Text generation completed successfully");
+                callback.onResult(LlamaResult.success(result));
+            } else {
+                Log.e(TAG, "Text generation returned null result");
+                callback.onResult(LlamaResult.failure(new LlamaError("Text generation failed")));
+            }
+            
+        } catch (Exception e) {
+            Log.e(TAG, "Text generation failed: " + e.getMessage());
+            callback.onResult(LlamaResult.failure(new LlamaError("Text generation failed: " + e.getMessage())));
+        }
+    }
+
+    // Helper methods for message handling
+    private List<Map<String, Object>> parseMessagesJson(String messagesJson) {
+        List<Map<String, Object>> messages = new ArrayList<>();
+        try {
+            // Parse JSON string to extract messages
+            org.json.JSONArray jsonArray = new org.json.JSONArray(messagesJson);
+            for (int i = 0; i < jsonArray.length(); i++) {
+                org.json.JSONObject jsonMessage = jsonArray.getJSONObject(i);
+                Map<String, Object> message = new HashMap<>();
+                message.put("role", jsonMessage.getString("role"));
+                message.put("content", jsonMessage.getString("content"));
+                messages.add(message);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error parsing messages JSON: " + e.getMessage());
+            // Return empty list on error
+        }
+        return messages;
+    }
+
+    private String convertMessagesToJson(List<Map<String, Object>> messages) {
+        try {
+            org.json.JSONArray jsonArray = new org.json.JSONArray();
+            for (Map<String, Object> message : messages) {
+                org.json.JSONObject jsonMessage = new org.json.JSONObject();
+                jsonMessage.put("role", message.get("role"));
+                jsonMessage.put("content", message.get("content"));
+                jsonArray.put(jsonMessage);
+            }
+            return jsonArray.toString();
+        } catch (Exception e) {
+            Log.e(TAG, "Error converting messages to JSON: " + e.getMessage());
+            return "[]"; // Return empty array on error
         }
     }
 

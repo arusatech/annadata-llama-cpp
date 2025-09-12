@@ -23,6 +23,11 @@ public class LlamaCppPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "completion", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "stopCompletion", returnType: CAPPluginReturnPromise),
         
+        // Chat-first methods (like llama-cli -sys)
+        CAPPluginMethod(name: "chat", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "chatWithSystem", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "generateText", returnType: CAPPluginReturnPromise),
+        
         // Session management
         CAPPluginMethod(name: "loadSession", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "saveSession", returnType: CAPPluginReturnPromise),
@@ -195,6 +200,56 @@ public class LlamaCppPlugin: CAPPlugin, CAPBridgedPlugin {
             switch result {
             case .success:
                 call.resolve()
+            case .failure(let error):
+                call.reject(error.localizedDescription)
+            }
+        }
+    }
+    
+    // MARK: - Chat-first methods (like llama-cli -sys)
+    
+    @objc func chat(_ call: CAPPluginCall) {
+        let contextId = call.getInt("contextId") ?? 0
+        let messages = call.getArray("messages", JSObject.self) ?? []
+        let system = call.getString("system")
+        let chatTemplate = call.getString("chatTemplate")
+        let params = call.getObject("params")
+        
+        implementation.chat(contextId: contextId, messages: messages, system: system, chatTemplate: chatTemplate, params: params) { result in
+            switch result {
+            case .success(let completionResult):
+                call.resolve(completionResult)
+            case .failure(let error):
+                call.reject(error.localizedDescription)
+            }
+        }
+    }
+    
+    @objc func chatWithSystem(_ call: CAPPluginCall) {
+        let contextId = call.getInt("contextId") ?? 0
+        let system = call.getString("system") ?? ""
+        let message = call.getString("message") ?? ""
+        let params = call.getObject("params")
+        
+        implementation.chatWithSystem(contextId: contextId, system: system, message: message, params: params) { result in
+            switch result {
+            case .success(let completionResult):
+                call.resolve(completionResult)
+            case .failure(let error):
+                call.reject(error.localizedDescription)
+            }
+        }
+    }
+    
+    @objc func generateText(_ call: CAPPluginCall) {
+        let contextId = call.getInt("contextId") ?? 0
+        let prompt = call.getString("prompt") ?? ""
+        let params = call.getObject("params")
+        
+        implementation.generateText(contextId: contextId, prompt: prompt, params: params) { result in
+            switch result {
+            case .success(let completionResult):
+                call.resolve(completionResult)
             case .failure(let error):
                 call.reject(error.localizedDescription)
             }
