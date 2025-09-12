@@ -553,6 +553,421 @@ if (formatted.type === 'jinja') {
 
 ---
 
+---
+
+### 8. chat
+
+**Purpose**: Chat-first method for conversational AI (equivalent to llama-cli with chat mode)
+
+#### TypeScript Interface
+```typescript
+function chat(options: {
+  contextId: number;
+  messages: LlamaCppOAICompatibleMessage[];
+  system?: string;
+  chatTemplate?: string;
+  params?: Omit<NativeCompletionParams, 'prompt' | 'messages'>;
+}): Promise<NativeCompletionResult>
+```
+
+#### Input Parameters
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| contextId | number | Yes | Target context ID |
+| messages | LlamaCppOAICompatibleMessage[] | Yes | Array of chat messages |
+| system | string | No | System prompt (like llama-cli -sys) |
+| chatTemplate | string | No | Override chat template |
+| params | NativeCompletionParams | No | Additional completion parameters |
+
+#### LlamaCppOAICompatibleMessage Structure
+```typescript
+interface LlamaCppOAICompatibleMessage {
+  role: string;                         // "system", "user", "assistant"
+  content?: string | LlamaCppMessagePart[];  // Message content
+}
+```
+
+#### Expected Output
+```typescript
+Promise<NativeCompletionResult> = {
+  // Same structure as completion() method
+  text: string;                     // Raw generated text
+  reasoning_content: string;        // Extracted reasoning content
+  tool_calls: Array<ToolCall>;      // Parsed tool calls
+  content: string;                  // Clean content (minus reasoning/tools)
+  
+  // Generation metadata
+  chat_format: number;              // Chat format used
+  tokens_predicted: number;         // Tokens generated
+  tokens_evaluated: number;         // Tokens processed
+  truncated: boolean;               // Output truncated
+  stopped_eos: boolean;             // Stopped at EOS token
+  
+  // Performance metrics
+  timings: CompletionTimings;       // Detailed timing information
+}
+```
+
+#### Implementation Flow
+1. TypeScript → `LlamaCpp.chat({ contextId, messages, system, chatTemplate, params })`
+2. Platform Bridge → Parse messages array and system prompt
+3. C++ → Add system message to beginning of messages if provided
+4. C++ → Convert messages to JSON format
+5. C++ → Call `getFormattedChat` to format with chat template
+6. C++ → Execute completion with formatted prompt
+7. Response → Complete `NativeCompletionResult` object
+
+#### Example Usage
+```typescript
+const result = await chat({
+  contextId: 1,
+  messages: [
+    { role: "user", content: "What is 2+2?" }
+  ],
+  system: "You are a helpful math tutor",
+  params: {
+    n_predict: 100,
+    temperature: 0.7,
+    top_p: 0.9
+  }
+});
+
+console.log(`Assistant: ${result.content}`);
+console.log(`Tokens generated: ${result.tokens_predicted}`);
+console.log(`Speed: ${result.timings.predicted_per_second.toFixed(1)} tokens/sec`);
+```
+
+---
+
+### 9. chatWithSystem
+
+**Purpose**: Simple chat with system prompt (equivalent to llama-cli -sys "You are a helpful assistant")
+
+#### TypeScript Interface
+```typescript
+function chatWithSystem(options: {
+  contextId: number;
+  system: string;
+  message: string;
+  params?: Omit<NativeCompletionParams, 'prompt' | 'messages'>;
+}): Promise<NativeCompletionResult>
+```
+
+#### Input Parameters
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| contextId | number | Yes | Target context ID |
+| system | string | Yes | System prompt text |
+| message | string | Yes | User message content |
+| params | NativeCompletionParams | No | Additional completion parameters |
+
+#### Expected Output
+```typescript
+Promise<NativeCompletionResult> = {
+  // Same structure as completion() method
+  // See completion method documentation for full structure
+}
+```
+
+#### Implementation Flow
+1. TypeScript → `LlamaCpp.chatWithSystem({ contextId, system, message, params })`
+2. Platform Bridge → Create message array with user message
+3. C++ → Call internal `chat()` method with system prompt and messages
+4. C++ → Format and execute completion
+5. Response → Complete `NativeCompletionResult` object
+
+#### Example Usage
+```typescript
+const result = await chatWithSystem({
+  contextId: 1,
+  system: "You are a helpful assistant that answers concisely",
+  message: "Explain quantum computing in simple terms",
+  params: {
+    n_predict: 150,
+    temperature: 0.8
+  }
+});
+
+console.log(`Response: ${result.content}`);
+```
+
+---
+
+### 10. generateText
+
+**Purpose**: Simple text generation (equivalent to llama-cli -p "prompt")
+
+#### TypeScript Interface
+```typescript
+function generateText(options: {
+  contextId: number;
+  prompt: string;
+  params?: Omit<NativeCompletionParams, 'prompt' | 'messages'>;
+}): Promise<NativeCompletionResult>
+```
+
+#### Input Parameters
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| contextId | number | Yes | Target context ID |
+| prompt | string | Yes | Text prompt for generation |
+| params | NativeCompletionParams | No | Additional completion parameters |
+
+#### Expected Output
+```typescript
+Promise<NativeCompletionResult> = {
+  // Same structure as completion() method
+  // See completion method documentation for full structure
+}
+```
+
+#### Implementation Flow
+1. TypeScript → `LlamaCpp.generateText({ contextId, prompt, params })`
+2. Platform Bridge → Validate context and parameters
+3. C++ → Create completion parameters with prompt
+4. C++ → Call native completion directly without chat formatting
+5. Response → Complete `NativeCompletionResult` object
+
+#### Example Usage
+```typescript
+const result = await generateText({
+  contextId: 1,
+  prompt: "I believe the meaning of life is",
+  params: {
+    n_predict: 128,
+    temperature: 0.9,
+    top_k: 40
+  }
+});
+
+console.log(`Generated text: ${result.text}`);
+console.log(`Performance: ${result.timings.predicted_per_second.toFixed(1)} tokens/sec`);
+```
+
+---
+
+### 11. completion
+
+**Purpose**: Generate text completion with comprehensive sampling and control parameters
+
+#### TypeScript Interface
+```typescript
+function completion(options: {
+  contextId: number;
+  params: NativeCompletionParams;
+}): Promise<NativeCompletionResult>
+```
+
+#### Input Parameters
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| contextId | number | Yes | Target context ID |
+| params | NativeCompletionParams | Yes | Completion generation parameters |
+
+#### NativeCompletionParams Structure
+```typescript
+interface NativeCompletionParams {
+  prompt: string;                   // Input prompt text
+  n_threads?: number;               // Inference threads
+  
+  // Chat template configuration
+  jinja?: boolean;                  // Use Jinja templating
+  json_schema?: string;             // JSON schema for output
+  grammar?: string;                 // GBNF grammar (overrides json_schema)
+  grammar_lazy?: boolean;           // Lazy grammar evaluation
+  grammar_triggers?: Array<{        // Grammar activation triggers
+    type: number;
+    value: string;
+    token: number;
+  }>;
+  
+  // Reasoning and thinking
+  enable_thinking?: boolean;        // Enable reasoning mode
+  thinking_forced_open?: boolean;   // Force thinking to be visible
+  preserved_tokens?: string[];      // Tokens to preserve
+  chat_format?: number;             // Chat format type
+  reasoning_format?: string;        // Reasoning format specification
+  
+  // Multimodal input
+  media_paths?: string[];           // Image/audio file paths
+  
+  // Generation control
+  stop?: string[];                  // Stop sequences
+  n_predict?: number;               // Max tokens (-1 = unlimited)
+  n_probs?: number;                 // Return token probabilities
+  
+  // Sampling parameters
+  top_k?: number;                   // Top-K sampling (default: 40)
+  top_p?: number;                   // Top-P sampling (default: 0.95)
+  min_p?: number;                   // Min-P sampling (default: 0.05)
+  xtc_probability?: number;         // XTC probability (default: 0.0)
+  xtc_threshold?: number;           // XTC threshold (default: 0.1)
+  typical_p?: number;               // Typical sampling (default: 1.0)
+  temperature?: number;             // Sampling temperature (default: 0.8)
+  
+  // Repetition penalties
+  penalty_last_n?: number;          // Penalty window (default: 64)
+  penalty_repeat?: number;          // Repetition penalty (default: 1.0)
+  penalty_freq?: number;            // Frequency penalty (default: 0.0)
+  penalty_present?: number;         // Presence penalty (default: 0.0)
+  
+  // Mirostat sampling
+  mirostat?: number;                // Mirostat mode (0=off, 1=v1, 2=v2)
+  mirostat_tau?: number;            // Target entropy (default: 5.0)
+  mirostat_eta?: number;            // Learning rate (default: 0.1)
+  
+  // DRY (Don't Repeat Yourself) sampling
+  dry_multiplier?: number;          // DRY penalty multiplier (default: 0.0)
+  dry_base?: number;                // DRY base value (default: 1.75)
+  dry_allowed_length?: number;      // DRY allowed length (default: 2)
+  dry_penalty_last_n?: number;      // DRY scan window (default: -1)
+  dry_sequence_breakers?: string[]; // DRY sequence breakers
+  
+  // Advanced sampling
+  top_n_sigma?: number;             // Top-n-sigma sampling (default: -1.0)
+  ignore_eos?: boolean;             // Ignore end-of-sequence
+  logit_bias?: number[][];          // Logit bias adjustments
+  seed?: number;                    // Random seed (-1 = random)
+  
+  // TTS integration
+  guide_tokens?: number[];          // Guide tokens for TTS
+  
+  emit_partial_completion: boolean; // Stream partial results
+}
+```
+
+#### Expected Output
+```typescript
+Promise<NativeCompletionResult> = {
+  // Generated content
+  text: string;                     // Raw generated text
+  reasoning_content: string;        // Extracted reasoning content
+  tool_calls: Array<{               // Parsed tool calls
+    type: 'function';
+    function: {
+      name: string;
+      arguments: string;            // JSON string
+    };
+    id?: string;
+  }>;
+  content: string;                  // Clean content (minus reasoning/tools)
+  
+  // Generation metadata
+  chat_format: number;              // Chat format used
+  tokens_predicted: number;         // Tokens generated
+  tokens_evaluated: number;         // Tokens processed
+  truncated: boolean;               // Output truncated
+  stopped_eos: boolean;             // Stopped at EOS token
+  stopped_word: string;             // Stop word that triggered end
+  stopped_limit: number;            // Token limit reached
+  stopping_word: string;            // Actual stopping sequence
+  context_full: boolean;            // Context window full
+  interrupted: boolean;             // Generation interrupted
+  tokens_cached: number;            // Tokens in KV cache
+  
+  // Performance metrics
+  timings: {
+    prompt_n: number;               // Prompt tokens
+    prompt_ms: number;              // Prompt processing time
+    prompt_per_token_ms: number;    // Prompt per-token time
+    prompt_per_second: number;      // Prompt tokens/second
+    predicted_n: number;            // Generated tokens
+    predicted_ms: number;           // Generation time
+    predicted_per_token_ms: number; // Generation per-token time
+    predicted_per_second: number;   // Generation tokens/second
+  };
+  
+  // Optional features
+  completion_probabilities?: Array<{ // Token probabilities
+    content: string;
+    probs: Array<{
+      tok_str: string;
+      prob: number;
+    }>;
+  }>;
+  audio_tokens?: number[];          // Generated audio tokens
+}
+```
+
+#### Implementation Flow
+1. TypeScript → `LlamaCpp.completion({ contextId, params })`
+2. Platform Bridge → Validate context and marshal parameters
+3. C++ → Initialize `llama_cap_context_completion` instance
+4. C++ → Apply grammar/schema constraints if specified
+5. C++ → Configure sampling parameters
+6. C++ → Run inference loop with speculative decoding if enabled
+7. C++ → Parse reasoning content and tool calls from output
+8. C++ → Calculate performance metrics
+9. Response → Complete `NativeCompletionResult` object
+
+#### Example Usage
+```typescript
+const result = await completion({
+  contextId: 1,
+  params: {
+    prompt: "Write a Python function to calculate fibonacci numbers:",
+    n_predict: 200,
+    temperature: 0.7,
+    top_p: 0.9,
+    stop: ["```\n", "\n\n\n"],
+    grammar: 'root ::= "```python\\n" ([^`]+ | "`" [^`] | "``" [^`])* "\\n```"',
+    emit_partial_completion: true
+  }
+});
+
+console.log(`Generated: ${result.content}`);
+console.log(`Speed: ${result.timings.predicted_per_second.toFixed(1)} tokens/sec`);
+console.log(`Efficiency: ${result.tokens_cached}/${result.tokens_evaluated} cached`);
+```
+
+---
+
+### 12. stopCompletion
+
+**Purpose**: Interrupt an active text generation process
+
+#### TypeScript Interface
+```typescript
+function stopCompletion(options: { contextId: number }): Promise<void>
+```
+
+#### Input Parameters
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| contextId | number | Yes | Context ID with active completion |
+
+#### Expected Output
+- **Success**: `Promise<void>` - Resolves with no data
+- **Error**: Promise rejection with error message
+
+#### Implementation Flow
+1. TypeScript → `LlamaCpp.stopCompletion({ contextId })`
+2. Platform Bridge → Validate contextId exists
+3. C++ → Set interruption flag on completion context
+4. C++ → Wait for inference loop to acknowledge interruption
+5. Response → Success when stopped
+
+#### Example Usage
+```typescript
+// Start long generation
+const generationPromise = completion({
+  contextId: 1,
+  params: { prompt: "Write a novel...", n_predict: 10000 }
+});
+
+// Stop after 5 seconds
+setTimeout(() => {
+  stopCompletion({ contextId: 1 });
+}, 5000);
+
+const result = await generationPromise;
+console.log(`Interrupted: ${result.interrupted}`);
+```
+
+---
+
+## Session Management APIs
+
 ### 8. completion
 
 **Purpose**: Generate text completion with comprehensive sampling and control parameters
