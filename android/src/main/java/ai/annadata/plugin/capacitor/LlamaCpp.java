@@ -271,6 +271,9 @@ public class LlamaCpp {
     private native Map<String, Object> tokenizeNative(long contextId, String text, String[] imagePaths);
     private native String detokenizeNative(long contextId, int[] tokens);
     
+    // Embedding methods
+    private native Map<String, Object> embeddingNative(long contextId, String text, JSObject params);
+    
     // Model download and management methods
     private native String downloadModelNative(String url, String filename);
     private native Map<String, Object> getDownloadProgressNative(String url);
@@ -874,23 +877,31 @@ public class LlamaCpp {
     // MARK: - Embeddings and reranking
 
     public void embedding(int contextId, String text, JSObject params, LlamaCallback<Map<String, Object>> callback) {
-        if (contexts.get(contextId) == null) {
+        LlamaContext context = contexts.get(contextId);
+        if (context == null) {
             callback.onResult(LlamaResult.failure(new LlamaError("Context not found")));
             return;
         }
 
-        // Fixed: Use List instead of array for proper JSON serialization
-        Map<String, Object> embeddingResult = new HashMap<>();
-        List<Double> embeddingList = new ArrayList<>();
-        
-        // Generate mock embedding vector
-        for (int i = 0; i < 384; i++) {
-            embeddingList.add(Math.random() - 0.5);
+        try {
+            Log.i(TAG, "Generating embeddings for text: " + text.substring(0, Math.min(50, text.length())));
+            
+            // Call native embedding method
+            Map<String, Object> result = embeddingNative(context.getNativeContextId(), text, params);
+            
+            if (result != null && result.containsKey("embedding")) {
+                Log.i(TAG, "Embedding generated successfully, size: " + 
+                    (result.get("embedding") instanceof List ? ((List<?>) result.get("embedding")).size() : 0));
+                callback.onResult(LlamaResult.success(result));
+            } else {
+                Log.e(TAG, "Embedding returned null or invalid result");
+                callback.onResult(LlamaResult.failure(new LlamaError("Failed to generate embeddings")));
+            }
+            
+        } catch (Exception e) {
+            Log.e(TAG, "Error generating embeddings: " + e.getMessage());
+            callback.onResult(LlamaResult.failure(new LlamaError("Embedding failed: " + e.getMessage())));
         }
-        
-        embeddingResult.put("embedding", embeddingList);
-
-        callback.onResult(LlamaResult.success(embeddingResult));
     }
 
     public void rerank(int contextId, String query, String[] documents, JSObject params, LlamaCallback<List<Map<String, Object>>> callback) {

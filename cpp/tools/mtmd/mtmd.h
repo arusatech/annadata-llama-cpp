@@ -41,9 +41,17 @@
 // deprecated marker, use mtmd_default_marker() instead
 #define MTMD_DEFAULT_IMAGE_MARKER "<__image__>"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+// NOTE:
+// The original header wrapped the C API in extern \"C\" when included from C++:
+//   #ifdef __cplusplus
+//   extern \"C\" {
+//   #endif
+// This caused linkage mismatches in this plugin because the implementations in
+// mtmd.cpp are compiled as C++ functions (with C++ name mangling), while the
+// callers expected C linkage symbols (no mangling).
+// For this Capacitor plugin codebase we only use the API from C++,
+// so we remove the extern \"C\" block to keep C++ linkage consistent.
+// If you need pure C linkage elsewhere, reintroduce a separate C wrapper.
 
 enum mtmd_input_chunk_type {
     MTMD_INPUT_CHUNK_TYPE_TEXT,
@@ -214,10 +222,6 @@ MTMD_API float * mtmd_get_output_embd(mtmd_context * ctx);
 
 // test function, to be used in test-mtmd-c-api.c
 MTMD_API mtmd_input_chunks * mtmd_test_create_input_chunks(void);
-
-#ifdef __cplusplus
-} // extern "C"
-#endif
 
 //
 // C++ wrappers

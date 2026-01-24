@@ -562,14 +562,14 @@ public class LlamaCppPlugin: CAPPlugin, CAPBridgedPlugin {
     
     // MARK: - Events
     
-    @objc func addListener(_ call: CAPPluginCall) {
+    @objc override public func addListener(_ call: CAPPluginCall) {
         let eventName = call.getString("eventName") ?? ""
         // Note: In Capacitor, event listeners are typically handled differently
         // This is a placeholder for the event system
         call.resolve()
     }
     
-    @objc func removeAllListeners(_ call: CAPPluginCall) {
+    @objc override public func removeAllListeners(_ call: CAPPluginCall) {
         let eventName = call.getString("eventName") ?? ""
         // Note: In Capacitor, event listeners are typically handled differently
         // This is a placeholder for the event system

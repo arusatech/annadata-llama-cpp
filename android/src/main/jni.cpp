@@ -222,7 +222,7 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_initContextNative(
         auto context = std::make_unique<capllama::llama_cap_context>();
         LOGI("Created llama_cap_context");
         
-        // Initialize common parameters
+        // Initialize common parameters with defaults
         common_params cparams;
         cparams.model.path = full_model_path;
         cparams.n_ctx = 2048;
@@ -235,7 +235,7 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_initContextNative(
         cparams.numa = LM_GGML_NUMA_STRATEGY_DISABLED;
         cparams.ctx_shift = false;
         cparams.chat_template = "";
-        cparams.embedding = false;
+        cparams.embedding = false;  // Default to false, will be extracted from params if provided
         cparams.cont_batching = false;
         cparams.n_parallel = 1;
         cparams.antiprompt.clear();
@@ -251,10 +251,165 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_initContextNative(
         cparams.n_chunks = -1;
         cparams.n_sequences = 1;
         cparams.model_alias = "unknown";
+        
+        // Extract parameters from JSObject if provided
+        // This fixes the issue where embedding: true parameter wasn't being accepted
+        if (params != nullptr) {
+            jclass jsObjectClass = env->GetObjectClass(params);
+            if (jsObjectClass != nullptr && !env->ExceptionCheck()) {
+                // Clear any pending exceptions first
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                }
+                
+                // Get method IDs for parameter extraction
+                jmethodID getBooleanMethod = nullptr;
+                jmethodID getIntegerMethod = nullptr;
+                jmethodID getDoubleMethod = nullptr;
+                jmethodID getStringMethod = nullptr;
+                
+                try {
+                    getBooleanMethod = env->GetMethodID(jsObjectClass, "getBoolean", "(Ljava/lang/String;)Ljava/lang/Boolean;");
+                    if (env->ExceptionCheck()) {
+                        env->ExceptionClear();
+                        getBooleanMethod = nullptr;
+                    }
+                    
+                    getIntegerMethod = env->GetMethodID(jsObjectClass, "getInteger", "(Ljava/lang/String;)Ljava/lang/Integer;");
+                    if (env->ExceptionCheck()) {
+                        env->ExceptionClear();
+                        getIntegerMethod = nullptr;
+                    }
+                    
+                    getDoubleMethod = env->GetMethodID(jsObjectClass, "getDouble", "(Ljava/lang/String;)Ljava/lang/Double;");
+                    if (env->ExceptionCheck()) {
+                        env->ExceptionClear();
+                        getDoubleMethod = nullptr;
+                    }
+                    
+                    getStringMethod = env->GetMethodID(jsObjectClass, "getString", "(Ljava/lang/String;)Ljava/lang/String;");
+                    if (env->ExceptionCheck()) {
+                        env->ExceptionClear();
+                        getStringMethod = nullptr;
+                    }
+                } catch (...) {
+                    LOGE("Exception getting JSObject method IDs in initContext");
+                    if (env->ExceptionCheck()) {
+                        env->ExceptionClear();
+                    }
+                }
+                
+                // Extract embedding parameter (CRITICAL FIX)
+                if (getBooleanMethod != nullptr) {
+                    jstring embeddingKey = jni_utils::string_to_jstring(env, "embedding");
+                    jobject embeddingObj = env->CallObjectMethod(params, getBooleanMethod, embeddingKey);
+                    if (embeddingObj != nullptr && !env->ExceptionCheck()) {
+                        jclass booleanClass = env->FindClass("java/lang/Boolean");
+                        jmethodID booleanValueMethod = env->GetMethodID(booleanClass, "booleanValue", "()Z");
+                        if (booleanValueMethod != nullptr && !env->ExceptionCheck()) {
+                            jboolean embeddingValue = env->CallBooleanMethod(embeddingObj, booleanValueMethod);
+                            cparams.embedding = (embeddingValue == JNI_TRUE);
+                            LOGI("Extracted embedding parameter: %s", cparams.embedding ? "true" : "false");
+                        }
+                        env->DeleteLocalRef(embeddingObj);
+                    }
+                    env->DeleteLocalRef(embeddingKey);
+                    if (env->ExceptionCheck()) {
+                        env->ExceptionClear();
+                    }
+                }
+                
+                // Extract other common parameters
+                if (getIntegerMethod != nullptr) {
+                    // Extract n_ctx
+                    jstring nCtxKey = jni_utils::string_to_jstring(env, "n_ctx");
+                    jobject nCtxObj = env->CallObjectMethod(params, getIntegerMethod, nCtxKey);
+                    if (nCtxObj != nullptr && !env->ExceptionCheck()) {
+                        jclass integerClass = env->FindClass("java/lang/Integer");
+                        jmethodID intValueMethod = env->GetMethodID(integerClass, "intValue", "()I");
+                        if (intValueMethod != nullptr && !env->ExceptionCheck()) {
+                            cparams.n_ctx = env->CallIntMethod(nCtxObj, intValueMethod);
+                        }
+                        env->DeleteLocalRef(nCtxObj);
+                    }
+                    env->DeleteLocalRef(nCtxKey);
+                    if (env->ExceptionCheck()) {
+                        env->ExceptionClear();
+                    }
+                    
+                    // Extract n_batch
+                    jstring nBatchKey = jni_utils::string_to_jstring(env, "n_batch");
+                    jobject nBatchObj = env->CallObjectMethod(params, getIntegerMethod, nBatchKey);
+                    if (nBatchObj != nullptr && !env->ExceptionCheck()) {
+                        jclass integerClass = env->FindClass("java/lang/Integer");
+                        jmethodID intValueMethod = env->GetMethodID(integerClass, "intValue", "()I");
+                        if (intValueMethod != nullptr && !env->ExceptionCheck()) {
+                            cparams.n_batch = env->CallIntMethod(nBatchObj, intValueMethod);
+                        }
+                        env->DeleteLocalRef(nBatchObj);
+                    }
+                    env->DeleteLocalRef(nBatchKey);
+                    if (env->ExceptionCheck()) {
+                        env->ExceptionClear();
+                    }
+                    
+                    // Extract n_gpu_layers
+                    jstring nGpuLayersKey = jni_utils::string_to_jstring(env, "n_gpu_layers");
+                    jobject nGpuLayersObj = env->CallObjectMethod(params, getIntegerMethod, nGpuLayersKey);
+                    if (nGpuLayersObj != nullptr && !env->ExceptionCheck()) {
+                        jclass integerClass = env->FindClass("java/lang/Integer");
+                        jmethodID intValueMethod = env->GetMethodID(integerClass, "intValue", "()I");
+                        if (intValueMethod != nullptr && !env->ExceptionCheck()) {
+                            cparams.n_gpu_layers = env->CallIntMethod(nGpuLayersObj, intValueMethod);
+                        }
+                        env->DeleteLocalRef(nGpuLayersObj);
+                    }
+                    env->DeleteLocalRef(nGpuLayersKey);
+                    if (env->ExceptionCheck()) {
+                        env->ExceptionClear();
+                    }
+                }
+                
+                // Extract boolean parameters
+                if (getBooleanMethod != nullptr) {
+                    // Extract use_mmap
+                    jstring useMmapKey = jni_utils::string_to_jstring(env, "use_mmap");
+                    jobject useMmapObj = env->CallObjectMethod(params, getBooleanMethod, useMmapKey);
+                    if (useMmapObj != nullptr && !env->ExceptionCheck()) {
+                        jclass booleanClass = env->FindClass("java/lang/Boolean");
+                        jmethodID booleanValueMethod = env->GetMethodID(booleanClass, "booleanValue", "()Z");
+                        if (booleanValueMethod != nullptr && !env->ExceptionCheck()) {
+                            cparams.use_mmap = (env->CallBooleanMethod(useMmapObj, booleanValueMethod) == JNI_TRUE);
+                        }
+                        env->DeleteLocalRef(useMmapObj);
+                    }
+                    env->DeleteLocalRef(useMmapKey);
+                    if (env->ExceptionCheck()) {
+                        env->ExceptionClear();
+                    }
+                    
+                    // Extract use_mlock
+                    jstring useMlockKey = jni_utils::string_to_jstring(env, "use_mlock");
+                    jobject useMlockObj = env->CallObjectMethod(params, getBooleanMethod, useMlockKey);
+                    if (useMlockObj != nullptr && !env->ExceptionCheck()) {
+                        jclass booleanClass = env->FindClass("java/lang/Boolean");
+                        jmethodID booleanValueMethod = env->GetMethodID(booleanClass, "booleanValue", "()Z");
+                        if (booleanValueMethod != nullptr && !env->ExceptionCheck()) {
+                            cparams.use_mlock = (env->CallBooleanMethod(useMlockObj, booleanValueMethod) == JNI_TRUE);
+                        }
+                        env->DeleteLocalRef(useMlockObj);
+                    }
+                    env->DeleteLocalRef(useMlockKey);
+                    if (env->ExceptionCheck()) {
+                        env->ExceptionClear();
+                    }
+                }
+            }
+        }
 
         LOGI("Initialized common parameters, attempting to load model from: %s", full_model_path.c_str());
-        LOGI("Model parameters: n_ctx=%d, n_batch=%d, n_gpu_layers=%d", 
-             cparams.n_ctx, cparams.n_batch, cparams.n_gpu_layers);
+        LOGI("Model parameters: n_ctx=%d, n_batch=%d, n_gpu_layers=%d, embedding=%s", 
+             cparams.n_ctx, cparams.n_batch, cparams.n_gpu_layers, cparams.embedding ? "true" : "false");
         
         // Try to load the model with error handling and signal protection
         bool load_success = false;
@@ -304,7 +459,7 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_initContextNative(
             ultra_minimal_params.numa = LM_GGML_NUMA_STRATEGY_DISABLED;
             ultra_minimal_params.ctx_shift = false;
             ultra_minimal_params.chat_template = "";
-            ultra_minimal_params.embedding = false;
+            ultra_minimal_params.embedding = cparams.embedding; // Preserve embedding setting even in fallback
             ultra_minimal_params.cont_batching = false;
             ultra_minimal_params.n_parallel = 1;
             ultra_minimal_params.antiprompt.clear();
@@ -1263,6 +1418,227 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_detokenizeNative(
         
     } catch (const std::exception& e) {
         LOGE("Exception in detokenize: %s", e.what());
+        throw_java_exception(env, "java/lang/RuntimeException", e.what());
+        return nullptr;
+    }
+}
+
+// MARK: - Embedding methods
+
+JNIEXPORT jobject JNICALL
+Java_ai_annadata_plugin_capacitor_LlamaCpp_embeddingNative(
+    JNIEnv* env, jobject thiz, jlong contextId, jstring text, jobject params) {
+    
+    try {
+        LOGI("Generating embeddings for context ID: %ld", contextId);
+        
+        std::string text_str = jni_utils::jstring_to_string(env, text);
+        LOGI("Text to embed: %s", text_str.substr(0, std::min(50, (int)text_str.length())).c_str());
+        
+        // Find the context
+        auto it = contexts.find(contextId);
+        if (it == contexts.end()) {
+            LOGE("Context not found: %ld", contextId);
+            throw_java_exception(env, "java/lang/RuntimeException", "Context not found");
+            return nullptr;
+        }
+        
+        auto& ctx = it->second;
+        if (!ctx || !ctx->ctx || !ctx->model) {
+            LOGE("Invalid context, llama context, or model is null");
+            throw_java_exception(env, "java/lang/RuntimeException", "Invalid context or model not loaded");
+            return nullptr;
+        }
+        
+        // Get embedding dimension from model
+        int32_t n_embd = llama_model_n_embd(ctx->model);
+        if (n_embd <= 0) {
+            LOGE("Model does not support embeddings (n_embd = %d)", n_embd);
+            throw_java_exception(env, "java/lang/RuntimeException", "Model does not support embeddings");
+            return nullptr;
+        }
+        
+        LOGI("Model embedding dimension: %d", n_embd);
+        
+        // CRITICAL FIX: Check if model was initialized with embedding support
+        // If embedding was not enabled during init, llama_set_embeddings() may not work properly
+        // and will return [0.0, 0.0...] embeddings. We need to check and warn the user.
+        bool embedding_was_enabled = ctx->params.embedding;
+        if (!embedding_was_enabled) {
+            LOGI("WARNING: Model was not initialized with embedding: true. Attempting to enable dynamically...");
+            LOGI("Note: If embeddings return zeros, the model must be re-initialized with embedding: true");
+        }
+        
+        // Extract parameters from JSObject (optional: embd_normalize, n_batch, n_threads)
+        double embd_normalize = 1.0;
+        int32_t n_batch = 512;
+        int32_t n_threads = ctx->params.cpuparams.n_threads;
+        if (n_threads < 1) {
+            n_threads = llama_n_threads_batch(ctx->ctx);
+        }
+        
+        // Try to extract parameters from JSObject if provided
+        if (params != nullptr) {
+            jclass jsObjectClass = env->GetObjectClass(params);
+            if (jsObjectClass != nullptr && !env->ExceptionCheck()) {
+                // Try to get embd_normalize
+                jmethodID getDoubleMethod = env->GetMethodID(jsObjectClass, "getDouble", "(Ljava/lang/String;)Ljava/lang/Double;");
+                if (getDoubleMethod != nullptr && !env->ExceptionCheck()) {
+                    jstring normalizeKey = jni_utils::string_to_jstring(env, "embd_normalize");
+                    jobject normalizeObj = env->CallObjectMethod(params, getDoubleMethod, normalizeKey);
+                    if (normalizeObj != nullptr && !env->ExceptionCheck()) {
+                        embd_normalize = env->CallDoubleMethod(normalizeObj, 
+                            env->GetMethodID(env->FindClass("java/lang/Double"), "doubleValue", "()D"));
+                        env->DeleteLocalRef(normalizeObj);
+                    }
+                    env->DeleteLocalRef(normalizeKey);
+                    if (env->ExceptionCheck()) {
+                        env->ExceptionClear();
+                    }
+                }
+            }
+        }
+        
+        // Tokenize the input text
+        capllama::llama_cap_tokenize_result tokenize_result = ctx->tokenize(text_str, {});
+        std::vector<llama_token> tokens = tokenize_result.tokens;
+        
+        if (tokens.empty()) {
+            LOGE("Tokenization resulted in empty token list");
+            throw_java_exception(env, "java/lang/RuntimeException", "Failed to tokenize input text");
+            return nullptr;
+        }
+        
+        LOGI("Tokenized into %zu tokens", tokens.size());
+        
+        // Enable embeddings in the context
+        llama_set_embeddings(ctx->ctx, true);
+        
+        // Create a batch for embedding extraction
+        llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
+        
+        // Add tokens to batch with embeddings enabled
+        for (size_t i = 0; i < tokens.size(); i++) {
+            capllama::llama_batch_add(&batch, tokens[i], i, {0}, true); // logits=true to get embeddings
+        }
+        
+        // Decode the batch to get embeddings
+        int decode_result = llama_decode(ctx->ctx, batch);
+        if (decode_result != 0) {
+            LOGE("llama_decode failed with code: %d", decode_result);
+            llama_batch_free(batch);
+            throw_java_exception(env, "java/lang/RuntimeException", "Failed to decode tokens for embeddings");
+            return nullptr;
+        }
+        
+        // Get embeddings from the context
+        // For generative models, we typically want the last token's embedding or mean pooling
+        float* embeddings_ptr = llama_get_embeddings(ctx->ctx);
+        if (embeddings_ptr == nullptr) {
+            LOGE("llama_get_embeddings returned null");
+            llama_batch_free(batch);
+            throw_java_exception(env, "java/lang/RuntimeException", "Failed to extract embeddings");
+            return nullptr;
+        }
+        
+        // For multiple tokens, we'll use mean pooling (average of all token embeddings)
+        // This is a common approach for text embeddings
+        std::vector<float> embedding_vector(n_embd, 0.0f);
+        
+        // Count how many tokens have embeddings (logits != 0)
+        int n_outputs = 0;
+        for (int i = 0; i < batch.n_tokens; i++) {
+            if (batch.logits[i] != 0) {
+                n_outputs++;
+            }
+        }
+        
+        if (n_outputs > 0) {
+            // Mean pooling: sum all token embeddings, then divide by count
+            for (int i = 0; i < n_outputs; i++) {
+                float* token_embd = embeddings_ptr + (i * n_embd);
+                for (int j = 0; j < n_embd; j++) {
+                    embedding_vector[j] += token_embd[j];
+                }
+            }
+            
+            // Divide by number of outputs to get mean
+            for (int j = 0; j < n_embd; j++) {
+                embedding_vector[j] /= n_outputs;
+            }
+        } else {
+            // Fallback: use the last token's embedding if available
+            float* last_embd = llama_get_embeddings_ith(ctx->ctx, -1);
+            if (last_embd != nullptr) {
+                std::memcpy(embedding_vector.data(), last_embd, n_embd * sizeof(float));
+            } else {
+                LOGE("No embeddings available");
+                llama_batch_free(batch);
+                throw_java_exception(env, "java/lang/RuntimeException", "No embeddings available");
+                return nullptr;
+            }
+        }
+        
+        // Apply normalization if specified
+        if (embd_normalize != 1.0 && embd_normalize != 0.0) {
+            float norm = 0.0f;
+            for (int i = 0; i < n_embd; i++) {
+                norm += embedding_vector[i] * embedding_vector[i];
+            }
+            norm = std::sqrt(norm);
+            if (norm > 0.0f) {
+                float scale = static_cast<float>(embd_normalize) / norm;
+                for (int i = 0; i < n_embd; i++) {
+                    embedding_vector[i] *= scale;
+                }
+            }
+        }
+        
+        // Clean up batch
+        llama_batch_free(batch);
+        
+        // Disable embeddings to restore normal operation
+        llama_set_embeddings(ctx->ctx, false);
+        
+        LOGI("Embedding generated successfully, dimension: %d", n_embd);
+        
+        // Create Java HashMap for result
+        jclass hashMapClass = env->FindClass("java/util/HashMap");
+        jmethodID hashMapConstructor = env->GetMethodID(hashMapClass, "<init>", "()V");
+        jmethodID putMethod = env->GetMethodID(hashMapClass, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+        
+        jobject resultMap = env->NewObject(hashMapClass, hashMapConstructor);
+        
+        // Create Java ArrayList for embedding vector
+        jclass arrayListClass = env->FindClass("java/util/ArrayList");
+        jmethodID arrayListConstructor = env->GetMethodID(arrayListClass, "<init>", "()V");
+        jmethodID addMethod = env->GetMethodID(arrayListClass, "add", "(Ljava/lang/Object;)Z");
+        
+        jobject embeddingArray = env->NewObject(arrayListClass, arrayListConstructor);
+        
+        // Add embedding values to ArrayList as Doubles
+        jclass doubleClass = env->FindClass("java/lang/Double");
+        jmethodID doubleConstructor = env->GetMethodID(doubleClass, "<init>", "(D)V");
+        
+        for (int i = 0; i < n_embd; i++) {
+            jobject jValue = env->NewObject(doubleClass, doubleConstructor, static_cast<jdouble>(embedding_vector[i]));
+            env->CallBooleanMethod(embeddingArray, addMethod, jValue);
+            env->DeleteLocalRef(jValue);
+        }
+        
+        // Put embedding array and dimension into result map
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "embedding"), embeddingArray);
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "n_embd"), 
+            env->NewObject(env->FindClass("java/lang/Integer"), 
+                env->GetMethodID(env->FindClass("java/lang/Integer"), "<init>", "(I)V"), n_embd));
+        
+        LOGI("Embedding result created successfully");
+        return resultMap;
+        
+    } catch (const std::exception& e) {
+        LOGE("Exception in embedding: %s", e.what());
         throw_java_exception(env, "java/lang/RuntimeException", e.what());
         return nullptr;
     }

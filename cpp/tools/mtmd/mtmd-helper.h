@@ -9,9 +9,17 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+// NOTE:
+// The original header wrapped these declarations in extern "C" when included
+// from C++:
+//   #ifdef __cplusplus
+//   extern "C" { ... }
+//   #endif
+// However, the implementations in mtmd-helper.cpp are compiled as C++ functions
+// (no extern "C"), so using C linkage here causes the linker to look for plain
+// C symbols like `_mtmd_helper_eval_chunk_single` which do not exist.
+// For this plugin we only use these helpers from C++, so we keep C++ linkage
+// and remove the extern \"C\" block to make declarations and definitions match.
 
 //
 // libmtmd helper functions
@@ -79,10 +87,6 @@ MTMD_API int32_t mtmd_helper_decode_image_chunk(mtmd_context * ctx,
                                                 llama_seq_id seq_id,
                                                 int32_t n_batch,
                                                 llama_pos * new_n_past);
-
-#ifdef __cplusplus
-} // extern "C"
-#endif
 
 //
 // C++ wrappers

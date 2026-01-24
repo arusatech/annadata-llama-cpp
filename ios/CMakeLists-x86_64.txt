@@ -95,7 +95,16 @@ add_library(llama-cpp SHARED
     ${SOURCE_DIR}/unicode.cpp
     ${SOURCE_DIR}/common.cpp
     ${SOURCE_DIR}/chat.cpp
+    # Additional sources required for JSON parsing, chat parser, and mtmd tools
+    ${SOURCE_DIR}/chat-parser.cpp
+    ${SOURCE_DIR}/regex-partial.cpp
+    ${SOURCE_DIR}/json-partial.cpp
     ${SOURCE_DIR}/json-schema-to-grammar.cpp
+    ${SOURCE_DIR}/anyascii.c
+    ${SOURCE_DIR}/tools/mtmd/mtmd.cpp
+    ${SOURCE_DIR}/tools/mtmd/mtmd-helper.cpp
+    ${SOURCE_DIR}/tools/mtmd/mtmd-audio.cpp
+    ${SOURCE_DIR}/tools/mtmd/clip.cpp
     ${SOURCE_DIR}/minja/minja.hpp
     ${SOURCE_DIR}/minja/chat-template.hpp
     ${SOURCE_DIR}/nlohmann/json.hpp
@@ -139,12 +148,15 @@ target_compile_options(llama-cpp PRIVATE
 )
 
 # Set link options
+# NOTE:
+# Use -Wl,-framework,<Name> so that the compiler driver passes the correct
+# framework flags through to the linker as a single option.
 target_link_options(llama-cpp PRIVATE
-    -framework Accelerate
-    -framework Metal
-    -framework MetalKit
-    -framework Foundation
-    -framework CoreGraphics
+    "-Wl,-framework,Accelerate"
+    "-Wl,-framework,Metal"
+    "-Wl,-framework,MetalKit"
+    "-Wl,-framework,Foundation"
+    "-Wl,-framework,CoreGraphics"
 )
 
 # Set public headers

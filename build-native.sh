@@ -48,6 +48,37 @@ check_android_sdk() {
     return 0
 }
 
+# Detect NDK path: ndk/<version>/build/cmake/android.toolchain.cmake
+# Uses latest versioned NDK under $ANDROID_SDK/ndk/ (e.g. ndk/29.0.13113456).
+detect_ndk() {
+    local sdk="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+    local ndk_root="$sdk/ndk"
+    if [ ! -d "$ndk_root" ]; then
+        echo ""
+        return 1
+    fi
+    local latest=""
+    local latest_ver=0
+    for v in "$ndk_root"/*; do
+        [ -d "$v" ] || continue
+        local base=$(basename "$v")
+        if [[ "$base" =~ ^[0-9] ]]; then
+            local ver=$(echo "$base" | sed 's/[^0-9]//g' | head -c 10)
+            ver=${ver:-0}
+            if [ "$ver" -gt "$latest_ver" ] 2>/dev/null; then
+                latest_ver=$ver
+                latest=$v
+            fi
+        fi
+    done
+    if [ -n "$latest" ] && [ -f "$latest/build/cmake/android.toolchain.cmake" ]; then
+        echo "$latest"
+        return 0
+    fi
+    echo ""
+    return 1
+}
+
 # Build iOS library
 build_ios() {
     print_status "Building iOS library..."
@@ -56,70 +87,35 @@ build_ios() {
         return 1
     fi
     
-    # Create build directory
+    # Always start from a clean iOS build directory to avoid stale Xcode settings
+    rm -rf ios/build
     mkdir -p ios/build
     cd ios/build
     
     # Configure with CMake
+    # IMPORTANT: build iOS framework as **ARM64-only**.
+    # Including x86_64 here makes CMake/Xcode try to link an x86_64 slice,
+    # but we only compile ARM-specific kernels (arch/arm), which leads to
+    # undefined symbols like lm_ggml_gemm_* for x86_64.
     cmake .. \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+        -DCMAKE_OSX_ARCHITECTURES="arm64" \
         -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
-        -DCMAKE_XCODE_ATTRIBUTE_ENABLE_BITCODE=NO \
-        -DCMAKE_XCODE_ATTRIBUTE_ONLY_ACTIVE_ARCH=NO
+        -DCMAKE_XCODE_ATTRIBUTE_ENABLE_BITCODE=NO
     
     # Build
     cmake --build . --config Release
     
-    # Create framework
-    mkdir -p LlamaCpp.framework/Versions/A/Headers
-    mkdir -p LlamaCpp.framework/Versions/A/Resources
+    # CMake builds the framework directly (FRAMEWORK TRUE in CMakeLists.txt)
+    # Verify the framework was created
+    if [ -d "llama-cpp.framework" ]; then
+        print_success "iOS framework built successfully at: $(pwd)/llama-cpp.framework"
+    else
+        print_error "iOS framework not found after build"
+        cd ../..
+        return 1
+    fi
     
-    # Copy library
-    cp libllama-cpp.dylib LlamaCpp.framework/Versions/A/LlamaCpp
-    
-    # Create symbolic links
-    cd LlamaCpp.framework/Versions
-    ln -sf A Current
-    cd ..
-    ln -sf Versions/Current/LlamaCpp LlamaCpp
-    ln -sf Versions/Current/Headers Headers
-    ln -sf Versions/Current/Resources Resources
-    
-    # Copy headers
-    cp ../../cpp/cap-llama.h Versions/A/Headers/
-    cp ../../cpp/cap-completion.h Versions/A/Headers/
-    cp ../../cpp/cap-tts.h Versions/A/Headers/
-    cp ../../cpp/llama.h Versions/A/Headers/
-    cp ../../cpp/ggml.h Versions/A/Headers/
-    
-    # Create Info.plist
-    cat > Versions/A/Resources/Info.plist << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleDevelopmentRegion</key>
-    <string>en</string>
-    <key>CFBundleExecutable</key>
-    <string>LlamaCpp</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.arusatech.llama-cpp</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>CFBundleName</key>
-    <string>LlamaCpp</string>
-    <key>CFBundlePackageType</key>
-    <string>FMWK</string>
-    <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
-    <key>CFBundleVersion</key>
-    <string>1</string>
-</dict>
-</plist>
-EOF
-    
-    print_success "iOS library built successfully"
     cd ../..
 }
 
@@ -131,41 +127,50 @@ build_android() {
         return 1
     fi
     
-    # Set Android SDK path
-    ANDROID_SDK=${ANDROID_HOME:-$ANDROID_SDK_ROOT}
-    ANDROID_NDK="$ANDROID_SDK/ndk"
+    ANDROID_NDK=$(detect_ndk)
+    if [ -z "$ANDROID_NDK" ]; then
+        print_error "Android NDK not found. Install NDK via Android Studio (SDK Manager → NDK)."
+        print_error "Expected: \$ANDROID_HOME/ndk/<version>/build/cmake/android.toolchain.cmake"
+        return 1
+    fi
+    print_status "Using NDK: $ANDROID_NDK"
     
-    if [ ! -d "$ANDROID_NDK" ]; then
-        print_error "Android NDK not found at $ANDROID_NDK"
-        print_error "Please install Android NDK via Android Studio or download manually"
+    TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake"
+    if [ ! -f "$TOOLCHAIN_FILE" ]; then
+        print_error "Toolchain file not found: $TOOLCHAIN_FILE"
         return 1
     fi
     
-    # Create build directory
+    rm -rf android/build
     mkdir -p android/build
     cd android/build
     
-    # Build for each architecture
-    for arch in arm64-v8a armeabi-v7a x86 x86_64; do
+    # Build only ARM architectures (CMakeLists.txt is ARM-specific)
+    # x86/x86_64 would require separate CMakeLists with x86-specific optimizations
+    for arch in arm64-v8a armeabi-v7a; do
         print_status "Building for $arch..."
+        rm -rf CMakeCache.txt CMakeFiles Makefile cmake_install.cmake 2>/dev/null || true
+        find . -maxdepth 1 -name '*.so' -delete 2>/dev/null || true
         
-        # Configure with CMake
         cmake ../src/main \
             -DCMAKE_BUILD_TYPE=Release \
             -DANDROID_ABI=$arch \
             -DANDROID_PLATFORM=android-21 \
-            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
             -DANDROID_STL=c++_shared
         
-        # Build
         cmake --build . --config Release
         
-        # Create output directory
         mkdir -p ../src/main/jniLibs/$arch
-        
-        # Copy library
-        cp libllama-cpp-$arch.so ../src/main/jniLibs/$arch/
-        
+        # The library is always named llama-cpp-arm64 regardless of ABI
+        # (CMakeLists.txt hardcodes OUTPUT_NAME)
+        if [ "$arch" = "arm64-v8a" ]; then
+            [ -f "libllama-cpp-arm64.so" ] && cp "libllama-cpp-arm64.so" "../src/main/jniLibs/$arch/" || true
+        elif [ "$arch" = "armeabi-v7a" ]; then
+            # For armeabi-v7a, the build still produces llama-cpp-arm64.so
+            # but we need to copy it to the correct directory
+            [ -f "libllama-cpp-arm64.so" ] && cp "libllama-cpp-arm64.so" "../src/main/jniLibs/$arch/" || true
+        fi
         print_success "Built for $arch"
     done
     
