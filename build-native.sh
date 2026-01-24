@@ -110,6 +110,19 @@ build_ios() {
     # Verify the framework was created
     if [ -d "llama-cpp.framework" ]; then
         print_success "iOS framework built successfully at: $(pwd)/llama-cpp.framework"
+        
+        # Strip debug symbols to reduce app store size (~0.5–1 MB)
+        BINARY="llama-cpp.framework/Versions/A/llama-cpp"
+        if [ -f "$BINARY" ]; then
+            if xcrun strip -x -S "$BINARY" 2>/dev/null; then
+                print_status "Stripped debug symbols from iOS framework"
+            fi
+        fi
+        
+        # Copy framework to package location for npm publishing
+        mkdir -p ../Frameworks
+        cp -R llama-cpp.framework ../Frameworks/
+        print_success "iOS framework copied to ios/Frameworks/ for npm package"
     else
         print_error "iOS framework not found after build"
         cd ../..
@@ -145,34 +158,40 @@ build_android() {
     mkdir -p android/build
     cd android/build
     
-    # Build only ARM architectures (CMakeLists.txt is ARM-specific)
-    # x86/x86_64 would require separate CMakeLists with x86-specific optimizations
-    for arch in arm64-v8a armeabi-v7a; do
-        print_status "Building for $arch..."
-        rm -rf CMakeCache.txt CMakeFiles Makefile cmake_install.cmake 2>/dev/null || true
-        find . -maxdepth 1 -name '*.so' -delete 2>/dev/null || true
-        
-        cmake ../src/main \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DANDROID_ABI=$arch \
-            -DANDROID_PLATFORM=android-21 \
-            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
-            -DANDROID_STL=c++_shared
-        
-        cmake --build . --config Release
-        
-        mkdir -p ../src/main/jniLibs/$arch
-        # The library is always named llama-cpp-arm64 regardless of ABI
-        # (CMakeLists.txt hardcodes OUTPUT_NAME)
-        if [ "$arch" = "arm64-v8a" ]; then
-            [ -f "libllama-cpp-arm64.so" ] && cp "libllama-cpp-arm64.so" "../src/main/jniLibs/$arch/" || true
-        elif [ "$arch" = "armeabi-v7a" ]; then
-            # For armeabi-v7a, the build still produces llama-cpp-arm64.so
-            # but we need to copy it to the correct directory
-            [ -f "libllama-cpp-arm64.so" ] && cp "libllama-cpp-arm64.so" "../src/main/jniLibs/$arch/" || true
+    # Build only arm64-v8a to minimize app store size.
+    # build.gradle uses abiFilters 'arm64-v8a'; armeabi-v7a is not included in the app.
+    # Skipping armeabi-v7a saves ~25–48 MB in package and keeps app size minimal.
+    arch="arm64-v8a"
+    print_status "Building for $arch (only ABI shipped in app)..."
+    rm -rf CMakeCache.txt CMakeFiles Makefile cmake_install.cmake 2>/dev/null || true
+    find . -maxdepth 1 -name '*.so' -delete 2>/dev/null || true
+    
+    cmake ../src/main \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DANDROID_ABI=$arch \
+        -DANDROID_PLATFORM=android-21 \
+        -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
+        -DANDROID_STL=c++_shared
+    
+    cmake --build . --config Release
+    
+    mkdir -p ../src/main/jniLibs/$arch
+    if [ -f "libllama-cpp-arm64.so" ]; then
+        PREBUILT="$ANDROID_NDK/toolchains/llvm/prebuilt"
+        if [ -d "$PREBUILT/darwin-x86_64" ]; then
+            STRIP_TOOL="$PREBUILT/darwin-x86_64/bin/llvm-strip"
+        elif [ -d "$PREBUILT/darwin-aarch64" ]; then
+            STRIP_TOOL="$PREBUILT/darwin-aarch64/bin/llvm-strip"
+        else
+            STRIP_TOOL=$(find "$ANDROID_NDK/toolchains" -name "llvm-strip" -type f 2>/dev/null | head -1)
         fi
-        print_success "Built for $arch"
-    done
+        if [ -f "$STRIP_TOOL" ]; then
+            "$STRIP_TOOL" --strip-debug libllama-cpp-arm64.so
+            print_status "Stripped debug symbols from library"
+        fi
+        cp "libllama-cpp-arm64.so" "../src/main/jniLibs/$arch/"
+    fi
+    print_success "Built for $arch"
     
     print_success "Android library built successfully"
     cd ../..

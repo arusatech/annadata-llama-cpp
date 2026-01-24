@@ -16,7 +16,8 @@
     "strict": true,
     "target": "es2017",
     "importHelpers": true,
-    "downlevelIteration": true
+    "downlevelIteration": true,
+    "skipLibCheck": true
   },
   "files": ["src/index.ts"]
 }

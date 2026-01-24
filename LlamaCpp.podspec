@@ -14,4 +14,7 @@ Pod::Spec.new do |s|
   s.ios.deployment_target = '14.0'
   s.dependency 'Capacitor'
   s.swift_version = '5.1'
+  
+  # Include the native llama-cpp framework
+  s.vendored_frameworks = 'ios/Frameworks/llama-cpp.framework'
 end

@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.1.1] - 2025-01-24
+
+### Changed
+- **App store size**: Build only **arm64-v8a** for Android (drop armeabi-v7a); strip iOS framework and Android `.so` debug symbols. See `APP_STORE_SIZE.md`.
+- **Package**: Exclude `ios/Tests` from published `files`; `build-native.sh` builds Android arm64-only and strips binaries.
+
+### Added
+- **APP_STORE_SIZE.md**: Guide on what affects app size, what can be removed, and store-size optimizations.
+
+## [0.1.0] - 2025-01-23
+
+### Added
+- **Complete iOS support**: Full native iOS build and packaging
+  - ARM64 framework (`llama-cpp.framework`) with Metal acceleration
+  - Automated copy to `ios/Frameworks/` for npm package
+  - CocoaPods `vendored_frameworks` in `LlamaCpp.podspec`
+- **Unified build**: `build-native.sh` builds both iOS and Android; single workflow for publishing
+
+### Changed
+- **Android**: NDK detection uses versioned path (`ndk/<version>/`); build limited to arm64-v8a and armeabi-v7a (x86/x86_64 require separate CMake setup)
+- **Android JNI**: `n_threads` via `cpuparams`, `llama_batch_add` as `capllama::llama_batch_add`; embedding fixes
+- **NEON**: Guarded `vcvtnq_s32_f32` fallback for Clang/NDK to avoid redefinition with `arm_neon.h`
+
+### Technical
+- `package.json`: version 0.1.0; `ios/Frameworks` in `files`; keywords `ios`, `android`
+- `PUBLISH_GUIDE.md`: Steps for building and publishing iOS + Android npm package
+
 ## [0.0.13] - 2025-08-30
 
 ### Fixed

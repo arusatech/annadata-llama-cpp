@@ -1,7 +1,7 @@
 {
   "name": "llama-cpp-capacitor",
-  "version": "0.0.20",
-  "description": "A native Capacitor plugin that embeds llama.cpp directly into mobile apps, enabling offline AI inference with chat-first API design. Supports both simple text generation and advanced chat conversations with system prompts, multimodal processing, TTS, LoRA adapters, and more.",
+  "version": "0.1.1",
+  "description": "A native Capacitor plugin that embeds llama.cpp directly into mobile apps, enabling offline AI inference with chat-first API design. Complete iOS and Android support: text generation, chat, multimodal, TTS, LoRA, embeddings, and more.",
   "main": "dist/plugin.cjs.js",
   "type": "module",
   "module": "dist/esm/index.js",
@@ -13,7 +13,7 @@
     "cpp/",
     "dist/",
     "ios/Sources",
-    "ios/Tests",
+    "ios/Frameworks",
     "Package.swift",
     "LlamaCpp.podspec",
     "types/"
@@ -32,6 +32,8 @@
     "capacitor",
     "plugin",
     "native",
+    "ios",
+    "android",
     "llama",
     "llama.cpp",
     "ai",
@@ -59,7 +61,7 @@
     "eslint": "eslint . --ext ts",
     "prettier": "prettier \"**/*.{css,html,ts,js,java}\" --plugin=prettier-plugin-java",
     "swiftlint": "node-swiftlint",
-    "docgen": "docgen --api LlamaCppPlugin --output-readme README.md --output-json dist/docs.json",
+    "docgen": "npx docgen --api LlamaCppPlugin --output-readme README.md --output-json dist/docs.json",
     "build": "npm run clean && npm run docgen && tsc && rollup -c rollup.config.mjs",
     "build:native": "./build-native.sh",
     "build:ios": "cd ios && cmake -B build -S . && cmake --build build --config Release",
@@ -71,7 +73,7 @@
     "test:unit": "jest --testPathIgnorePatterns=test/integration",
     "test:coverage": "jest --coverage",
     "clean": "rimraf ./dist",
-    "clean:native": "rimraf ios/build android/build android/src/main/jniLibs",
+    "clean:native": "rimraf ios/build ios/Frameworks android/build android/src/main/jniLibs",
     "clean:test": "rimraf test/output test/coverage",
     "watch": "tsc --watch",
     "prepublishOnly": "npm run build"
@@ -90,7 +92,7 @@
     "rimraf": "^6.0.1",
     "rollup": "^4.30.1",
     "swiftlint": "^2.0.0",
-    "typescript": "~4.1.5"
+    "typescript": "^5.0.0"
   },
   "peerDependencies": {
     "@capacitor/core": ">=7.0.0"
