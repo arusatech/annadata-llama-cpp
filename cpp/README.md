@@ -1,4 +1,15 @@
 # Note
 
-- Only `rn-tts.h`, `rn-tts.cpp`, `rn-mtmd.hpp`, `rn-mtmd.cpp`, `rn-llama.h` and `rn-llama.cpp` are the specific files for this folder, others are sync from [llama.cpp](https://github.com/ggerganov/llama.cpp).
-- We can update the native source by using the [bootstrap](../scripts/bootstrap.sh) script.
+- The **project-specific** files in this folder (never overwritten by bootstrap) are:
+  - `cap-llama.cpp` / `cap-llama.h` – Capacitor bridge (context, model load)
+  - `cap-completion.cpp` / `cap-completion.h` – completion
+  - `cap-tts.cpp` / `cap-tts.h` – TTS
+  - `cap-embedding.cpp` / `cap-embedding.h` – embeddings
+  - `cap-mtmd.hpp` – multimodal/vision
+  - `tools/mtmd/` – multimodal/vision tooling
+- All other sources are synced from [llama.cpp](https://github.com/ggerganov/llama.cpp).
+- **Update native source** (e.g. for a newer llama.cpp or vision support): run from repo root:
+  ```bash
+  ./scripts/bootstrap.sh [branch-or-tag-or-commit]
+  ```
+  See [scripts/bootstrap.sh](../scripts/bootstrap.sh) and [docs/IOS_IMPLEMENTATION_GUIDE.md](../docs/IOS_IMPLEMENTATION_GUIDE.md).

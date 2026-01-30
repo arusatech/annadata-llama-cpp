@@ -1,59 +1,30 @@
-# Development files
-.git/
+# npm pack uses "files" in package.json as the whitelist; this file
+# excludes only from that list. Do not add paths that must be published.
+
+# Dependencies and env
+node_modules
+.env
+.npmrc
+
+# Development / IDE
+.git
 .gitignore
-.github/
-.vscode/
-.idea/
-
-# Build artifacts
-node_modules/
-dist/
-build/
+.github
+.vscode
+.idea
 *.log
+*.md.bak
 
-# Test files
+# Tests and scripts (not needed at runtime)
 test/
-coverage/
-*.test.js
-*.test.ts
-*.spec.js
-*.spec.ts
-
-# Documentation (keep README and LICENSE)
-docs/
-*.md
-!README.md
-!LICENSE
-!CHANGELOG.md
-!CONTRIBUTING.md
-
-# Development scripts
 scripts/
-build-native.sh
-
-# Reference code
-ref_code/
-
-# IDE files
-.DS_Store
-Thumbs.db
-
-# Temporary files
-*.tmp
-*.temp
-.cache/
-
-# Example files
-example.ts
-example/
-
-# Integration testing
-INTEGRATION_TESTING_SUMMARY.md
-TESTING.md
-IMPLEMENTATION_SUMMARY.md
-
-# Development configs
-.prettierignore
-.eslintignore
+*.test.ts
 jest.config.js
-jest.integration.config.js
+tsconfig.json
+rollup.config.mjs
+
+# Docs (optional: remove if you want to ship docs/)
+# docs/
+
+# Build artifacts that are regenerated
+# dist/ is in "files" and is built by prepublishOnly — keep it

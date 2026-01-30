@@ -71,17 +71,48 @@ npm whoami
 
 Should show your npm username (e.g., `annadata`).
 
+## Build and pack (what gets published)
+
+Before publishing, ensure all necessary artifacts are built and included:
+
+1. **JavaScript/TypeScript** (always): `npm run build` runs automatically before publish (`prepublishOnly`). It:
+   - Cleans `dist/`
+   - Runs docgen → `dist/docs.json` + README
+   - Compiles TypeScript → `dist/esm/*.js` (and `.d.ts`)
+   - Bundles with Rollup → `dist/plugin.js`, `dist/plugin.cjs.js` + sourcemaps
+
+2. **Native libraries** (optional but recommended for full package): Run `npm run build:all` to also build:
+   - iOS: `ios/Frameworks/llama-cpp.framework`
+   - Android: `android/src/main/jniLibs/<abi>/libllama-cpp-*.so`  
+   Requires macOS (Xcode) for iOS and Android SDK/NDK for Android. If you skip this, consumers can build native themselves using `npm run build:native` after install.
+
+3. **Verify what will be packed**: Run `npm run pack` (JS only) or `npm run pack:full` (JS + native) to see the file list without publishing.
+
+**Included in the package** (`package.json` "files"):
+- `dist/` (plugin bundles, ESM, docs.json)
+- `types/` (TypeScript declarations)
+- `android/src/main/`, `android/build.gradle`
+- `ios/Sources`, `ios/Frameworks`, `ios/CMakeLists*.txt`
+- `cpp/`, `build-native.sh`, `Package.swift`, `LlamaCpp.podspec`
+
 ## Publish Command
 
 Once 2FA is enabled or token is configured:
 
 ```bash
-cd /Users/annadata/Project_A/annadata-production/ref-code/llama-cpp
+cd /path/to/llama-cpp
 
-# Ensure build is complete
+# 1. Build JS (runs again automatically on publish)
 npm run build
 
-# Publish
+# 2. (Optional) Build native libs so they are included in the tarball
+npm run build:all
+
+# 3. Verify what will be packed
+npm run pack
+# or with native: npm run pack:full
+
+# 4. Publish
 npm publish
 ```
 

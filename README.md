@@ -121,6 +121,21 @@ cd android
 - **iOS**: `ios/build/LlamaCpp.framework/`
 - **Android**: `android/src/main/jniLibs/{arch}/libllama-cpp-{arch}.so`
 
+### **Updating the native source (e.g. for vision model support)**
+
+The native `cpp/` layer is based on [llama.cpp](https://github.com/ggerganov/llama.cpp). To pull in a newer upstream version (e.g. for vision model support) **without overwriting** the Capacitor adapter code, use the **bootstrap script** (included in this repo):
+
+```bash
+./scripts/bootstrap.sh [branch-or-tag-or-commit]
+# Example: ./scripts/bootstrap.sh master
+```
+
+This syncs upstream into `cpp/` and keeps project-specific files (`cap-*.cpp/h`, `tools/mtmd/`, etc.) intact. After running it, reconcile any API changes in the adapter code, then rebuild with `npm run build:native` or `./build-native.sh`. See [cpp/README.md](cpp/README.md) and [docs/IOS_IMPLEMENTATION_GUIDE.md](docs/IOS_IMPLEMENTATION_GUIDE.md).
+
+### **iOS implementation (step-by-step)**
+
+For a **step-by-step guide** on how methods are implemented on the iOS side (Swift bridge → native framework, adding/updating C symbols, and updating the native layer for vision), see **[docs/IOS_IMPLEMENTATION_GUIDE.md](docs/IOS_IMPLEMENTATION_GUIDE.md)**.
+
 ### iOS Setup
 
 1. Install the plugin:
@@ -695,6 +710,17 @@ const logListener = addNativeLogListener((level, text) => {
   console.log(`[${level}] ${text}`);
 });
 ```
+
+## 📦 Publishing
+
+To publish the package to npm:
+
+1. **Build** (runs automatically on `npm publish` via `prepublishOnly`): `npm run build` — produces `dist/` (plugin bundles, ESM, docs).
+2. **Optional — include native libs in the tarball**: `npm run build:all` (requires macOS/NDK) — builds iOS framework and Android `.so` into `ios/Frameworks` and `android/src/main/jniLibs`.
+3. **Verify pack**: `npm run pack` (JS only) or `npm run pack:full` (JS + native) — lists files that would be published.
+4. **Publish**: `npm publish`.
+
+See [NPM_PUBLISH_GUIDE.md](NPM_PUBLISH_GUIDE.md) for 2FA/token setup and troubleshooting.
 
 ## 🤝 Contributing
 
