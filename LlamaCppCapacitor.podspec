@@ -17,4 +17,7 @@ Pod::Spec.new do |s|
   
   # Include the native llama-cpp framework
   s.vendored_frameworks = 'ios/Frameworks/llama-cpp.framework'
+  s.pod_target_xcconfig = {
+    'FRAMEWORK_SEARCH_PATHS' => '$(inherited) "$(PODS_TARGET_SRCROOT)/ios/Frameworks"'
+  }
 end

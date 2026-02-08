@@ -93,36 +93,53 @@ build_ios() {
     cd ios/build
     
     # Configure with CMake
+    # IMPORTANT: CMAKE_OSX_SYSROOT=iphoneos ensures we build for iOS, not macOS.
+    # Without it, the framework would be built for macOS and fail to link in an iOS app.
     # IMPORTANT: build iOS framework as **ARM64-only**.
     # Including x86_64 here makes CMake/Xcode try to link an x86_64 slice,
     # but we only compile ARM-specific kernels (arch/arm), which leads to
     # undefined symbols like lm_ggml_gemm_* for x86_64.
     cmake .. \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_OSX_SYSROOT=iphoneos \
         -DCMAKE_OSX_ARCHITECTURES="arm64" \
         -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
         -DCMAKE_XCODE_ATTRIBUTE_ENABLE_BITCODE=NO
     
-    # Build
-    cmake --build . --config Release
+    # Build (parallel: -j uses available CPU cores)
+    JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+    cmake --build . --config Release -- -j"$JOBS"
     
     # CMake builds the framework directly (FRAMEWORK TRUE in CMakeLists.txt)
     # Verify the framework was created
     if [ -d "llama-cpp.framework" ]; then
         print_success "iOS framework built successfully at: $(pwd)/llama-cpp.framework"
         
-        # Strip debug symbols to reduce app store size (~0.5–1 MB)
-        BINARY="llama-cpp.framework/Versions/A/llama-cpp"
-        if [ -f "$BINARY" ]; then
+        # Binary location: CMake may produce flat (llama-cpp) or Versions/A/ layout
+        BINARY=""
+        if [ -f "llama-cpp.framework/llama-cpp" ]; then
+            BINARY="llama-cpp.framework/llama-cpp"
+        elif [ -f "llama-cpp.framework/Versions/A/llama-cpp" ]; then
+            BINARY="llama-cpp.framework/Versions/A/llama-cpp"
+        fi
+        if [ -n "$BINARY" ]; then
             if xcrun strip -x -S "$BINARY" 2>/dev/null; then
                 print_status "Stripped debug symbols from iOS framework"
             fi
         fi
         
-        # Copy framework to package location for npm publishing
-        mkdir -p ../Frameworks
-        cp -R llama-cpp.framework ../Frameworks/
-        print_success "iOS framework copied to ios/Frameworks/ for npm package"
+        # Build flat framework (single binary, no duplication) for npm publishing
+        if [ -z "$BINARY" ] || [ ! -f "$BINARY" ]; then
+            print_error "iOS framework binary not found"
+            cd ../..
+            return 1
+        fi
+        rm -rf ../Frameworks/llama-cpp.framework
+        mkdir -p ../Frameworks/llama-cpp.framework/Resources
+        cp "$BINARY" ../Frameworks/llama-cpp.framework/llama-cpp
+        [ -f llama-cpp.framework/Info.plist ] && cp llama-cpp.framework/Info.plist ../Frameworks/llama-cpp.framework/
+        [ -f llama-cpp.framework/Versions/A/Resources/Info.plist ] && cp llama-cpp.framework/Versions/A/Resources/Info.plist ../Frameworks/llama-cpp.framework/Resources/
+        print_success "iOS framework copied to ios/Frameworks/ for npm package (flat, no duplication)"
     else
         print_error "iOS framework not found after build"
         cd ../..
@@ -173,7 +190,8 @@ build_android() {
         -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
         -DANDROID_STL=c++_shared
     
-    cmake --build . --config Release
+    JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+    cmake --build . --config Release -- -j"$JOBS"
     
     mkdir -p ../src/main/jniLibs/$arch
     if [ -f "libllama-cpp-arm64.so" ]; then
@@ -201,6 +219,10 @@ build_android() {
 main() {
     print_status "Starting llama-cpp Capacitor plugin build..."
     
+    # Always start clean - remove previous build outputs
+    rm -rf ios/build ios/Frameworks android/build
+    print_status "Cleaned build directories"
+    
     # Check dependencies
     if ! command -v cmake &> /dev/null; then
         print_error "CMake is required but not installed"
@@ -225,5 +247,5 @@ main() {
     print_success "Build completed successfully!"
 }
 
-# Run main function
-main "$@"
+# Run main function (ignore any args npm may pass)
+main

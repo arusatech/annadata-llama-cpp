@@ -150,6 +150,8 @@ struct MinjaCaps {
 // MARK: - Main Implementation
 @objc public class LlamaCpp: NSObject {
     private var contexts: [Int: LlamaContext] = [:]
+    private var nativeContexts: [Int64: UnsafeMutableRawPointer] = [:]
+    private var contextIdToNative: [Int: Int64] = [:]
     private var contextCounter: Int = 0
     private var contextLimit: Int = 10
     private var nativeLogEnabled: Bool = false
@@ -262,18 +264,16 @@ struct MinjaCaps {
         
         let nativeContextId = initFunc(modelPath, paramsJson.cString(using: .utf8)!)
         if nativeContextId > 0 {
-            // Store the native context pointer (the ID is used as the pointer value)
-            // Note: In a real implementation, the native function would return the actual pointer
-            // For now, we use the contextId as the pointer identifier
-            contexts[Int64(contextId)] = UnsafeMutableRawPointer(bitPattern: Int(nativeContextId))
+            // Store the LlamaContext for Swift bookkeeping
+            contexts[contextId] = context
+            // Store the native context pointer and mapping for C layer
+            let nativePtr = UnsafeMutableRawPointer(bitPattern: Int(nativeContextId))
+            nativeContexts[nativeContextId] = nativePtr
+            contextIdToNative[contextId] = nativeContextId
             
             // Register with embedding system if available
-            // The C layer needs the actual llama_cap_context pointer, which should come from the native init
-            // For now, we'll register with the contextId - the C layer will need to look it up
-            if let registerFunc = registerEmbeddingContextFunc {
-                // Note: The actual context pointer should come from the native initContext function
-                // This is a placeholder - the real implementation needs to get the actual pointer
-                registerFunc(Int64(contextId), contexts[Int64(contextId)]!)
+            if let registerFunc = registerEmbeddingContextFunc, let ptr = nativePtr {
+                registerFunc(nativeContextId, ptr)
             }
         } else {
             completion(.failure(.operationFailed("Failed to initialize native context")))
@@ -322,34 +322,40 @@ struct MinjaCaps {
     }
     
     func releaseContext(contextId: Int, completion: @escaping (LlamaResult<Void>) -> Void) {
-        guard let contextPtr = contexts[contextId] else {
+        guard contexts[contextId] != nil else {
             completion(.failure(.contextNotFound))
             return
         }
         
+        let nativeId = contextIdToNative[contextId] ?? Int64(contextId)
+        
         // Unregister from embedding system if available
         if let unregisterFunc = unregisterEmbeddingContextFunc {
-            unregisterFunc(Int64(contextId))
+            unregisterFunc(nativeId)
         }
         
         // Call native release function
         if let releaseFunc = releaseContextFunc {
-            releaseFunc(Int64(contextId))
+            releaseFunc(nativeId)
         }
         
         contexts.removeValue(forKey: contextId)
+        nativeContexts.removeValue(forKey: nativeId)
+        contextIdToNative.removeValue(forKey: contextId)
         completion(.success(()))
     }
     
     func releaseAllContexts(completion: @escaping (LlamaResult<Void>) -> Void) {
         // Unregister all contexts from embedding system
         if let unregisterFunc = unregisterEmbeddingContextFunc {
-            for contextId in contexts.keys {
-                unregisterFunc(Int64(contextId))
+            for (_, nativeId) in contextIdToNative {
+                unregisterFunc(nativeId)
             }
         }
         
         contexts.removeAll()
+        nativeContexts.removeAll()
+        contextIdToNative.removeAll()
         completion(.success(()))
     }
     

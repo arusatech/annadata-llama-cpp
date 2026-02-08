@@ -1,6 +1,6 @@
 {
   "name": "llama-cpp-capacitor",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "A native Capacitor plugin that embeds llama.cpp directly into mobile apps, enabling offline AI inference with chat-first API design. Complete iOS and Android support: text generation, chat, multimodal, TTS, LoRA, embeddings, and more.",
   "main": "dist/plugin.cjs.js",
   "type": "module",
@@ -72,6 +72,7 @@
     "build:all": "npm run build && npm run build:native",
     "build:ios": "cd ios && cmake -B build -S . && cmake --build build --config Release",
     "build:android": "cd android && gradlew.bat assembleRelease",
+    "prepack": "npm run build:native",
     "pack": "npm run build && npm pack --dry-run",
     "pack:full": "npm run build:all && npm pack --dry-run",
     "test": "jest",
@@ -84,7 +85,7 @@
     "clean:native": "rimraf ios/build ios/Frameworks android/build android/src/main/jniLibs",
     "clean:test": "rimraf test/output test/coverage",
     "watch": "tsc --watch",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build && npm run build:native"
   },
   "devDependencies": {
     "@capacitor/android": "^7.0.0",

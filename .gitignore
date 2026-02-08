@@ -103,9 +103,10 @@ android/Makefile
 android/build.ninja
 android/.ninja_log
 
-# iOS build artifacts
+# iOS build artifacts (Frameworks/ is created by build-native.sh only - never commit)
 ios/build/
 ios/DerivedData/
+ios/Frameworks/
 ios/*.framework/
 ios/*.dylib
 ios/*.a
