@@ -1,6 +1,6 @@
 {
   "name": "llama-cpp-capacitor",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "A native Capacitor plugin that embeds llama.cpp directly into mobile apps, enabling offline AI inference with chat-first API design. Complete iOS and Android support: text generation, chat, multimodal, TTS, LoRA, embeddings, and more.",
   "main": "dist/plugin.cjs.js",
   "type": "module",
@@ -23,7 +23,7 @@
     "LlamaCppCapacitor.podspec",
     "types/"
   ],
-  "author": "Yakub Mohammad",
+  "author": "Mr. Yakub Mohammad <yakub@annadata.ai> (yakub@arusatech.com, yakub@arusallc.com)",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -88,10 +88,10 @@
     "prepublishOnly": "npm run build && npm run build:native"
   },
   "devDependencies": {
-    "@capacitor/android": "^7.0.0",
-    "@capacitor/core": "^7.4.3",
+    "@capacitor/android": "^8.0.0",
+    "@capacitor/core": "^8.0.0",
     "@capacitor/docgen": "^0.3.0",
-    "@capacitor/ios": "^7.0.0",
+    "@capacitor/ios": "^8.0.0",
     "@ionic/eslint-config": "^0.4.0",
     "@ionic/prettier-config": "^4.0.0",
     "@ionic/swiftlint-config": "^2.0.0",
@@ -104,7 +104,7 @@
     "typescript": "^5.0.0"
   },
   "peerDependencies": {
-    "@capacitor/core": ">=7.0.0"
+    "@capacitor/core": ">=8.0.0"
   },
   "prettier": "@ionic/prettier-config",
   "swiftlint": "@ionic/swiftlint-config",
