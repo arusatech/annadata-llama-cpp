@@ -42,6 +42,9 @@ private typealias NativeModelInfo = @convention(c) (UnsafePointer<CChar>?, Unsaf
 private typealias NativeTokenize = @convention(c) (Int64, UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
 private typealias NativeDetokenize = @convention(c) (Int64, UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
 private typealias NativeGrammar = @convention(c) (UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
+private typealias NativeCapServerStart = @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?, Int32, UnsafePointer<CChar>?) -> Int32
+private typealias NativeCapServerStop = @convention(c) () -> Void
+private typealias NativeCapServerIsRunning = @convention(c) () -> Int32
 
 private var initContextFunc: NativeInitContext?
 private var releaseContextFunc: NativeReleaseContext?
@@ -57,6 +60,9 @@ private var modelInfoFunc: NativeModelInfo?
 private var tokenizeFunc: NativeTokenize?
 private var detokenizeFunc: NativeDetokenize?
 private var grammarFunc: NativeGrammar?
+private var capServerStartFunc: NativeCapServerStart?
+private var capServerStopFunc: NativeCapServerStop?
+private var capServerIsRunningFunc: NativeCapServerIsRunning?
 
 private func loadFunctionPointers() {
     guard let library = llamaLibrary else { return }
@@ -78,6 +84,9 @@ private func loadFunctionPointers() {
     tokenizeFunc = sym("llama_tokenize", NativeTokenize.self)
     detokenizeFunc = sym("llama_detokenize", NativeDetokenize.self)
     grammarFunc = sym("llama_convert_json_schema_to_grammar", NativeGrammar.self)
+    capServerStartFunc = sym("cap_llama_server_start", NativeCapServerStart.self)
+    capServerStopFunc = sym("cap_llama_server_stop", NativeCapServerStop.self)
+    capServerIsRunningFunc = sym("cap_llama_server_is_running", NativeCapServerIsRunning.self)
 }
 
 private func jsonObject(fromCString p: UnsafePointer<CChar>?) -> [String: Any]? {
@@ -1018,6 +1027,57 @@ struct MinjaCaps {
         }
         
         completion(.success(models))
+    }
+
+    // MARK: - Native in-process HTTP server (127.0.0.1 — use App Transport Security allowances for localhost in the host app)
+
+    func startNativeLlamaServer(modelPath: String, host: String?, port: Int, params: [String: Any], completion: @escaping (LlamaResult<[String: Any]>) -> Void) {
+        if capServerStartFunc == nil { loadFunctionPointers() }
+        guard let start = capServerStartFunc else {
+            completion(.failure(.operationFailed("cap_llama_server_start not available")))
+            return
+        }
+        var paramsJson = "{}"
+        do {
+            let data = try JSONSerialization.data(withJSONObject: params)
+            paramsJson = String(data: data, encoding: .utf8) ?? "{}"
+        } catch {
+            completion(.failure(.operationFailed("params JSON: \(error.localizedDescription)")))
+            return
+        }
+        let h = (host != nil && !host!.isEmpty) ? host! : "127.0.0.1"
+        let rc = modelPath.withCString { mp in
+            h.withCString { hp in
+                paramsJson.withCString { pj in
+                    start(mp, hp, Int32(port), pj)
+                }
+            }
+        }
+        if rc != 0 {
+            completion(.success(["running": true]))
+        } else {
+            completion(.failure(.operationFailed("startNativeLlamaServer failed")))
+        }
+    }
+
+    func stopNativeLlamaServer(completion: @escaping (LlamaResult<Void>) -> Void) {
+        if capServerStopFunc == nil { loadFunctionPointers() }
+        guard let stop = capServerStopFunc else {
+            completion(.failure(.operationFailed("cap_llama_server_stop not available")))
+            return
+        }
+        stop()
+        completion(.success(()))
+    }
+
+    func isNativeLlamaServerRunning(completion: @escaping (LlamaResult<[String: Any]>) -> Void) {
+        if capServerIsRunningFunc == nil { loadFunctionPointers() }
+        guard let fn = capServerIsRunningFunc else {
+            completion(.failure(.operationFailed("cap_llama_server_is_running not available")))
+            return
+        }
+        let running = fn() != 0
+        completion(.success(["running": running]))
     }
     
     // MARK: - Grammar utilities

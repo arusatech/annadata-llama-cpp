@@ -1,6 +1,7 @@
 #include "jni-utils.h"
 #include "cap-llama.h"
 #include "cap-completion.h"
+#include "cap-native-server.h"
 #include <android/log.h>
 #include <cstring>
 #include <memory>
@@ -1642,6 +1643,39 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_embeddingNative(
         throw_java_exception(env, "java/lang/RuntimeException", e.what());
         return nullptr;
     }
+}
+
+JNIEXPORT jboolean JNICALL
+Java_ai_annadata_plugin_capacitor_LlamaCpp_startLlamaServerNative(JNIEnv *env, jobject thiz, jstring modelPath,
+                                                                  jstring host, jint port, jstring paramsJson) {
+    (void)thiz;
+    try {
+        std::string m = jstring_to_string(env, modelPath);
+        std::string h = (host != nullptr) ? jstring_to_string(env, host) : std::string("127.0.0.1");
+        std::string pj;
+        if (paramsJson != nullptr) {
+            pj = jstring_to_string(env, paramsJson);
+        }
+        const int ok = cap_llama_server_start(m.c_str(), h.c_str(), static_cast<int>(port),
+                                                pj.empty() ? nullptr : pj.c_str());
+        return ok ? JNI_TRUE : JNI_FALSE;
+    } catch (...) {
+        return JNI_FALSE;
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_ai_annadata_plugin_capacitor_LlamaCpp_stopLlamaServerNative(JNIEnv *env, jobject thiz) {
+    (void)env;
+    (void)thiz;
+    cap_llama_server_stop();
+}
+
+JNIEXPORT jboolean JNICALL
+Java_ai_annadata_plugin_capacitor_LlamaCpp_isLlamaServerRunningNative(JNIEnv *env, jobject thiz) {
+    (void)env;
+    (void)thiz;
+    return cap_llama_server_is_running() ? JNI_TRUE : JNI_FALSE;
 }
 
 } // extern "C"

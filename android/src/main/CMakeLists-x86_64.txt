@@ -9,6 +9,7 @@ include_directories(
     ${LLAMACPP_LIB_DIR}
     ${LLAMACPP_LIB_DIR}/ggml-cpu
     ${LLAMACPP_LIB_DIR}/tools/mtmd
+    ${LLAMACPP_LIB_DIR}/vendor/cpp-httplib
 )
 
 set(
@@ -79,11 +80,16 @@ set(
     ${LLAMACPP_LIB_DIR}/cap-llama.cpp
     ${LLAMACPP_LIB_DIR}/cap-completion.cpp
     ${LLAMACPP_LIB_DIR}/cap-tts.cpp
+    ${LLAMACPP_LIB_DIR}/cap-ios-bridge.cpp
+    ${LLAMACPP_LIB_DIR}/cap-embedding.cpp
+    ${LLAMACPP_LIB_DIR}/cap-native-server.cpp
+    ${LLAMACPP_LIB_DIR}/vendor/cpp-httplib/httplib.cpp
     ${CMAKE_SOURCE_DIR}/jni-utils.h
     ${CMAKE_SOURCE_DIR}/jni.cpp
 )
 
 find_library(LOG_LIB log)
+find_package(Threads REQUIRED)
 
 # X86_64 specific build function for emulator
 function(build_library_x86_64 target_name)
@@ -115,7 +121,7 @@ function(build_library_x86_64 target_name)
         -DLM_GGML_USE_F16C
     )
 
-    target_link_libraries(${target_name} ${LOG_LIB})
+    target_link_libraries(${target_name} ${LOG_LIB} Threads::Threads)
     
     # Set output name
     set_target_properties(${target_name} PROPERTIES

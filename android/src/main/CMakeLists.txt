@@ -9,6 +9,7 @@ include_directories(
     ${LLAMACPP_LIB_DIR}
     ${LLAMACPP_LIB_DIR}/ggml-cpu
     ${LLAMACPP_LIB_DIR}/tools/mtmd
+    ${LLAMACPP_LIB_DIR}/vendor/cpp-httplib
 )
 
 set(
@@ -79,6 +80,10 @@ set(
     ${LLAMACPP_LIB_DIR}/cap-llama.cpp
     ${LLAMACPP_LIB_DIR}/cap-completion.cpp
     ${LLAMACPP_LIB_DIR}/cap-tts.cpp
+    ${LLAMACPP_LIB_DIR}/cap-ios-bridge.cpp
+    ${LLAMACPP_LIB_DIR}/cap-embedding.cpp
+    ${LLAMACPP_LIB_DIR}/cap-native-server.cpp
+    ${LLAMACPP_LIB_DIR}/vendor/cpp-httplib/httplib.cpp
     ${CMAKE_SOURCE_DIR}/jni-utils.h
     ${CMAKE_SOURCE_DIR}/jni.cpp
 )
@@ -86,6 +91,7 @@ set(
 # Find Android libraries
 find_library(LOG_LIB log)
 find_library(ANDROID_LIB android)
+find_package(Threads REQUIRED)
 
 # ARM64 specific build function for real devices
 function(build_library_arm64 target_name)
@@ -111,6 +117,7 @@ function(build_library_arm64 target_name)
     target_link_libraries(${target_name} 
         ${LOG_LIB}
         ${ANDROID_LIB}
+        Threads::Threads
     )
     
     # Set output name and directory

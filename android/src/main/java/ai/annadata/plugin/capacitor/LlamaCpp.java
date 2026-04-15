@@ -283,6 +283,11 @@ public class LlamaCpp {
     // Grammar utilities
     private native String convertJsonSchemaToGrammarNative(String schemaJson);
 
+    /** In-process localhost HTTP server (native); see cap-native-server.cpp */
+    private native boolean startLlamaServerNative(String modelPath, String host, int port, String paramsJson);
+    private native void stopLlamaServerNative();
+    private native boolean isLlamaServerRunningNative();
+
     static {
         try {
 
@@ -448,6 +453,43 @@ public class LlamaCpp {
         } catch (Exception e) {
             Log.e(TAG, "Error getting available models: " + e.getMessage());
             callback.onResult(LlamaResult.failure(new LlamaError("Failed to get models: " + e.getMessage())));
+        }
+    }
+
+    public void startNativeLlamaServer(String modelPath, String host, int port, JSObject params, LlamaCallback<JSObject> callback) {
+        try {
+            String pj = (params != null) ? params.toString() : "{}";
+            String h = (host != null && !host.isEmpty()) ? host : "127.0.0.1";
+            boolean ok = startLlamaServerNative(modelPath, h, port, pj);
+            JSObject r = new JSObject();
+            r.put("running", ok);
+            if (ok) {
+                callback.onResult(LlamaResult.success(r));
+            } else {
+                callback.onResult(LlamaResult.failure(new LlamaError("startNativeLlamaServer failed")));
+            }
+        } catch (Exception e) {
+            callback.onResult(LlamaResult.failure(new LlamaError(e.getMessage())));
+        }
+    }
+
+    public void stopNativeLlamaServer(LlamaCallback<Void> callback) {
+        try {
+            stopLlamaServerNative();
+            callback.onResult(LlamaResult.success(null));
+        } catch (Exception e) {
+            callback.onResult(LlamaResult.failure(new LlamaError(e.getMessage())));
+        }
+    }
+
+    public void isNativeLlamaServerRunning(LlamaCallback<JSObject> callback) {
+        try {
+            boolean running = isLlamaServerRunningNative();
+            JSObject r = new JSObject();
+            r.put("running", running);
+            callback.onResult(LlamaResult.success(r));
+        } catch (Exception e) {
+            callback.onResult(LlamaResult.failure(new LlamaError(e.getMessage())));
         }
     }
 

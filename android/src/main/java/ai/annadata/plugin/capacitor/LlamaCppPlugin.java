@@ -721,6 +721,47 @@ public class LlamaCppPlugin extends Plugin {
         });
     }
 
+    @PluginMethod
+    public void startNativeLlamaServer(PluginCall call) {
+        String modelPath = call.getString("modelPath", "");
+        if (modelPath.isEmpty()) {
+            call.reject("modelPath is required");
+            return;
+        }
+        String host = call.getString("host", "127.0.0.1");
+        int port = call.getInt("port", 8080);
+        JSObject params = call.getObject("params", new JSObject());
+        implementation.startNativeLlamaServer(modelPath, host, port, params, result -> {
+            if (result.isSuccess()) {
+                call.resolve((JSObject) result.getData());
+            } else {
+                call.reject(result.getError().getMessage());
+            }
+        });
+    }
+
+    @PluginMethod
+    public void stopNativeLlamaServer(PluginCall call) {
+        implementation.stopNativeLlamaServer(result -> {
+            if (result.isSuccess()) {
+                call.resolve();
+            } else {
+                call.reject(result.getError().getMessage());
+            }
+        });
+    }
+
+    @PluginMethod
+    public void isNativeLlamaServerRunning(PluginCall call) {
+        implementation.isNativeLlamaServerRunning(result -> {
+            if (result.isSuccess()) {
+                call.resolve((JSObject) result.getData());
+            } else {
+                call.reject(result.getError().getMessage());
+            }
+        });
+    }
+
     // MARK: - Utility Methods
 
     /**

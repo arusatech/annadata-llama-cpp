@@ -811,6 +811,22 @@ export interface LlamaCppPlugin {
     schema: string;
   }): Promise<string>;
 
+  /**
+   * Start an in-process HTTP server in native code (not the WebView). Binds to loopback by default.
+   * Uses the same GGUF stack as initContext; exposes GET /health, GET /v1/models, POST /v1/chat/completions (OpenAI-shaped).
+   * This is a lightweight cpp-httplib server — not the full upstream llama.cpp `llama-server` executable.
+   */
+  startNativeLlamaServer(options: {
+    modelPath: string;
+    host?: string;
+    port?: number;
+    params?: NativeContextParams;
+  }): Promise<{ running: boolean }>;
+
+  stopNativeLlamaServer(): Promise<void>;
+
+  isNativeLlamaServerRunning(): Promise<{ running: boolean }>;
+
   // Events
   addListener(eventName: string, listenerFunc: (data: any) => void): Promise<void>;
   removeAllListeners(eventName: string): Promise<void>;

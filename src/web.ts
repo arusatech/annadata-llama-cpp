@@ -134,6 +134,18 @@ export class LlamaCppWeb implements LlamaCppPlugin {
     console.warn('LlamaCpp: releaseVocoder is not supported on web platform');
   }
 
+  async startNativeLlamaServer(): Promise<{ running: boolean }> {
+    throw new Error('LlamaCpp: startNativeLlamaServer is only available on iOS/Android native');
+  }
+
+  async stopNativeLlamaServer(): Promise<void> {
+    console.warn('LlamaCpp: stopNativeLlamaServer is not supported on web platform');
+  }
+
+  async isNativeLlamaServerRunning(): Promise<{ running: boolean }> {
+    return { running: false };
+  }
+
   // Events
   async addListener(): Promise<void> {
     console.warn('LlamaCpp: addListener is not supported on web platform');

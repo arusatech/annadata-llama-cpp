@@ -70,6 +70,11 @@ public class LlamaCppPlugin: CAPPlugin, CAPBridgedPlugin {
         
         // Grammar utilities
         CAPPluginMethod(name: "convertJsonSchemaToGrammar", returnType: CAPPluginReturnPromise),
+
+        // Native in-process HTTP server (loopback)
+        CAPPluginMethod(name: "startNativeLlamaServer", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "stopNativeLlamaServer", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "isNativeLlamaServerRunning", returnType: CAPPluginReturnPromise),
         
         // Events
         CAPPluginMethod(name: "addListener", returnType: CAPPluginReturnPromise),
@@ -623,6 +628,49 @@ public class LlamaCppPlugin: CAPPlugin, CAPBridgedPlugin {
             switch result {
             case .success(let models):
                 call.resolve(["models": models])
+            case .failure(let error):
+                call.reject(error.localizedDescription)
+            }
+        }
+    }
+
+    // MARK: - Native in-process HTTP server
+
+    @objc func startNativeLlamaServer(_ call: CAPPluginCall) {
+        let modelPath = call.getString("modelPath") ?? ""
+        if modelPath.isEmpty {
+            call.reject("modelPath is required")
+            return
+        }
+        let host = call.getString("host") ?? "127.0.0.1"
+        let port = call.getInt("port") ?? 8080
+        let params = call.getObject("params") as? [String: Any] ?? [:]
+        implementation.startNativeLlamaServer(modelPath: modelPath, host: host, port: port, params: params) { result in
+            switch result {
+            case .success(let data):
+                call.resolve(data)
+            case .failure(let error):
+                call.reject(error.localizedDescription)
+            }
+        }
+    }
+
+    @objc func stopNativeLlamaServer(_ call: CAPPluginCall) {
+        implementation.stopNativeLlamaServer { result in
+            switch result {
+            case .success:
+                call.resolve()
+            case .failure(let error):
+                call.reject(error.localizedDescription)
+            }
+        }
+    }
+
+    @objc func isNativeLlamaServerRunning(_ call: CAPPluginCall) {
+        implementation.isNativeLlamaServerRunning { result in
+            switch result {
+            case .success(let data):
+                call.resolve(data)
             case .failure(let error):
                 call.reject(error.localizedDescription)
             }

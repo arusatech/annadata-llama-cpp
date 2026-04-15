@@ -101,6 +101,8 @@ add_library(llama-cpp SHARED
     ${SOURCE_DIR}/cap-tts.cpp
     ${SOURCE_DIR}/cap-embedding.cpp
     ${SOURCE_DIR}/cap-ios-bridge.cpp
+    ${SOURCE_DIR}/cap-native-server.cpp
+    ${SOURCE_DIR}/vendor/cpp-httplib/httplib.cpp
     ${SOURCE_FILES_ARCH}
 )
 
@@ -122,6 +124,7 @@ target_include_directories(llama-cpp PRIVATE
     ${SOURCE_DIR}
     ${SOURCE_DIR}/ggml-cpu
     ${SOURCE_DIR}/tools/mtmd
+    ${SOURCE_DIR}/vendor/cpp-httplib
 )
 
 # ARM64: rely on Clang's default tuning; no x86‑specific -march flags here
