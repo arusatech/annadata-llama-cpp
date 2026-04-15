@@ -81,8 +81,8 @@ private func loadFunctionPointers() {
     registerEmbeddingContextFunc = sym("llama_embedding_register_context", NativeRegisterEmb.self)
     unregisterEmbeddingContextFunc = sym("llama_embedding_unregister_context", NativeUnregisterEmb.self)
     modelInfoFunc = sym("llama_model_info", NativeModelInfo.self)
-    tokenizeFunc = sym("llama_tokenize", NativeTokenize.self)
-    detokenizeFunc = sym("llama_detokenize", NativeDetokenize.self)
+    tokenizeFunc = sym("llama_cap_tokenize", NativeTokenize.self)
+    detokenizeFunc = sym("llama_cap_detokenize", NativeDetokenize.self)
     grammarFunc = sym("llama_convert_json_schema_to_grammar", NativeGrammar.self)
     capServerStartFunc = sym("cap_llama_server_start", NativeCapServerStart.self)
     capServerStopFunc = sym("cap_llama_server_stop", NativeCapServerStop.self)
@@ -653,7 +653,7 @@ struct MinjaCaps {
         }
         if tokenizeFunc == nil { loadFunctionPointers() }
         guard let fn = tokenizeFunc else {
-            completion(.failure(.operationFailed("llama_tokenize not found")))
+            completion(.failure(.operationFailed("llama_cap_tokenize not found")))
             return
         }
         var pathsJson = "[]"
@@ -685,7 +685,7 @@ struct MinjaCaps {
         }
         if detokenizeFunc == nil { loadFunctionPointers() }
         guard let fn = detokenizeFunc else {
-            completion(.failure(.operationFailed("llama_detokenize not found")))
+            completion(.failure(.operationFailed("llama_cap_detokenize not found")))
             return
         }
         guard let d = try? JSONSerialization.data(withJSONObject: tokens), let tokensJson = String(data: d, encoding: .utf8) else {

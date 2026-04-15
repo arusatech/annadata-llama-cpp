@@ -24,8 +24,8 @@ const char * llama_completion(int64_t context_id, const char * params_json);
 const char * llama_get_formatted_chat(int64_t context_id, const char * messages_json, const char * chat_template,
                                       const char * params_json);
 const char * llama_get_context_model_json(int64_t context_id);
-const char * llama_tokenize(int64_t context_id, const char * text, const char * image_paths_json);
-const char * llama_detokenize(int64_t context_id, const char * tokens_json);
+const char * llama_cap_tokenize(int64_t context_id, const char * text, const char * image_paths_json);
+const char * llama_cap_detokenize(int64_t context_id, const char * tokens_json);
 }
 
 namespace {
@@ -218,7 +218,7 @@ std::vector<std::string> token_level_chunks_for_stream(int64_t ctx_id, const std
         return {};
     }
 
-    const char * tokenized = llama_tokenize(ctx_id, text.c_str(), "[]");
+    const char * tokenized = llama_cap_tokenize(ctx_id, text.c_str(), "[]");
     if (!tokenized) {
         return chunk_text_for_stream(text);
     }
@@ -235,7 +235,7 @@ std::vector<std::string> token_level_chunks_for_stream(int64_t ctx_id, const std
             }
             json one = json::array({tok.get<int>()});
             const std::string one_json = one.dump();
-            const char * piece = llama_detokenize(ctx_id, one_json.c_str());
+            const char * piece = llama_cap_detokenize(ctx_id, one_json.c_str());
             if (!piece) {
                 continue;
             }

@@ -488,7 +488,7 @@ const char * llama_model_info(const char * model_path, const char * skip_json) {
     }
 }
 
-const char * llama_tokenize(int64_t context_id, const char * text, const char * image_paths_json) {
+const char * llama_cap_tokenize(int64_t context_id, const char * text, const char * image_paths_json) {
     try {
         std::vector<std::string> media_paths;
         if (image_paths_json && std::strlen(image_paths_json) > 0) {
@@ -542,7 +542,7 @@ const char * llama_tokenize(int64_t context_id, const char * text, const char * 
     }
 }
 
-const char * llama_detokenize(int64_t context_id, const char * tokens_json) {
+const char * llama_cap_detokenize(int64_t context_id, const char * tokens_json) {
     try {
         std::lock_guard<std::mutex> lock(g_mutex);
         auto * ctx = get_ctx(context_id);
