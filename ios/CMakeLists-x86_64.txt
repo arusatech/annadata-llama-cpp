@@ -112,6 +112,8 @@ add_library(llama-cpp SHARED
     ${SOURCE_DIR}/cap-llama.cpp
     ${SOURCE_DIR}/cap-completion.cpp
     ${SOURCE_DIR}/cap-tts.cpp
+    ${SOURCE_DIR}/cap-embedding.cpp
+    ${SOURCE_DIR}/cap-ios-bridge.cpp
     ${SOURCE_FILES_ARCH}
 )
 

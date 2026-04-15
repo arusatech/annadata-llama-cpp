@@ -98,7 +98,7 @@ extern "C" float* llama_embedding(int64_t contextId, const char* text, const cha
         
         // Add tokens to batch with embeddings enabled
         for (size_t i = 0; i < tokens.size(); i++) {
-            llama_batch_add(&batch, tokens[i], i, {0}, true); // logits=true to get embeddings
+            capllama::llama_batch_add(&batch, tokens[i], i, {0}, true); // logits=true to get embeddings
         }
         
         // Decode the batch to get embeddings

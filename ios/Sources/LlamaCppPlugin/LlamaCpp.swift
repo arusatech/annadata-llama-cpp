@@ -2,49 +2,90 @@ import Foundation
 import Capacitor
 
 // MARK: - Native Library Integration
-private var contexts: [Int64: UnsafeMutableRawPointer] = [:]
-private var nextContextId: Int64 = 1
 
-// Load the native library (use enum to avoid lazy-on-global Swift error)
 private enum LibraryLoader {
+    /// dlopen must target the framework Mach-O (`llama-cpp.framework/llama-cpp`), not the `.framework` directory.
     static var llamaLibrary: UnsafeMutableRawPointer? = {
-        guard let libraryPath = Bundle.main.path(forResource: "llama-cpp", ofType: "framework") else {
-            print("Error: llama-cpp framework not found")
-            return nil
+        let fm = FileManager.default
+        var candidates: [String] = []
+        if let fw = Bundle.main.path(forResource: "llama-cpp", ofType: "framework") {
+            candidates.append((fw as NSString).appendingPathComponent("llama-cpp"))
         }
-        guard let handle = dlopen(libraryPath, RTLD_NOW) else {
-            print("Error: Failed to load llama-cpp library: \(String(cString: dlerror()))")
-            return nil
+        if let exec = Bundle.main.executablePath {
+            let frameworks = (exec as NSString).deletingLastPathComponent + "/Frameworks/llama-cpp.framework/llama-cpp"
+            candidates.append(frameworks)
         }
-        return handle
+        for path in candidates where fm.fileExists(atPath: path) {
+            guard let handle = dlopen(path, RTLD_NOW) else {
+                print("[LlamaCpp] dlopen failed for \(path): \(String(cString: dlerror()))")
+                continue
+            }
+            return handle
+        }
+        print("[LlamaCpp] llama-cpp framework binary not found; tried: \(candidates)")
+        return nil
     }()
 }
+
 private var llamaLibrary: UnsafeMutableRawPointer? { LibraryLoader.llamaLibrary }
 
-// Function pointers for native calls
-private var initContextFunc: ((String, UnsafePointer<Int8>) -> Int64)?
-private var releaseContextFunc: ((Int64) -> Void)?
-private var completionFunc: ((Int64, String, UnsafePointer<Int8>) -> String?)?
-private var stopCompletionFunc: ((Int64) -> Void)?
-private var getFormattedChatFunc: ((Int64, String, String) -> String?)?
-private var toggleNativeLogFunc: ((Bool) -> Bool)?
-private var embeddingFunc: ((Int64, String, UnsafePointer<Int8>) -> UnsafePointer<Float>?)?
-private var registerEmbeddingContextFunc: ((Int64, UnsafeMutableRawPointer) -> Void)?
-private var unregisterEmbeddingContextFunc: ((Int64) -> Void)?
+private typealias NativeInitContext = @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Int64
+private typealias NativeReleaseContext = @convention(c) (Int64) -> Void
+private typealias NativeCompletion = @convention(c) (Int64, UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
+private typealias NativeGetContextModelJson = @convention(c) (Int64) -> UnsafePointer<CChar>?
+private typealias NativeGetFormattedChat = @convention(c) (Int64, UnsafePointer<CChar>?, UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
+private typealias NativeToggleLog = @convention(c) (Bool) -> Bool
+private typealias NativeEmbedding = @convention(c) (Int64, UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UnsafePointer<Float>?
+private typealias NativeRegisterEmb = @convention(c) (Int64, UnsafeMutableRawPointer?) -> Void
+private typealias NativeUnregisterEmb = @convention(c) (Int64) -> Void
+private typealias NativeModelInfo = @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
+private typealias NativeTokenize = @convention(c) (Int64, UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
+private typealias NativeDetokenize = @convention(c) (Int64, UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
+private typealias NativeGrammar = @convention(c) (UnsafePointer<CChar>?) -> UnsafePointer<CChar>?
+
+private var initContextFunc: NativeInitContext?
+private var releaseContextFunc: NativeReleaseContext?
+private var completionFunc: NativeCompletion?
+private var getContextModelJsonFunc: NativeGetContextModelJson?
+private var stopCompletionFunc: NativeReleaseContext?
+private var getFormattedChatFunc: NativeGetFormattedChat?
+private var toggleNativeLogFunc: NativeToggleLog?
+private var embeddingFunc: NativeEmbedding?
+private var registerEmbeddingContextFunc: NativeRegisterEmb?
+private var unregisterEmbeddingContextFunc: NativeUnregisterEmb?
+private var modelInfoFunc: NativeModelInfo?
+private var tokenizeFunc: NativeTokenize?
+private var detokenizeFunc: NativeDetokenize?
+private var grammarFunc: NativeGrammar?
 
 private func loadFunctionPointers() {
     guard let library = llamaLibrary else { return }
-    
-    // Load function pointers from the native library
-    initContextFunc = unsafeBitCast(dlsym(library, "llama_init_context"), to: ((String, UnsafePointer<Int8>) -> Int64).self)
-    releaseContextFunc = unsafeBitCast(dlsym(library, "llama_release_context"), to: ((Int64) -> Void).self)
-    completionFunc = unsafeBitCast(dlsym(library, "llama_completion"), to: ((Int64, String, UnsafePointer<Int8>) -> String?).self)
-    stopCompletionFunc = unsafeBitCast(dlsym(library, "llama_stop_completion"), to: ((Int64) -> Void).self)
-    getFormattedChatFunc = unsafeBitCast(dlsym(library, "llama_get_formatted_chat"), to: ((Int64, String, String) -> String?).self)
-    toggleNativeLogFunc = unsafeBitCast(dlsym(library, "llama_toggle_native_log"), to: ((Bool) -> Bool).self)
-    embeddingFunc = unsafeBitCast(dlsym(library, "llama_embedding"), to: ((Int64, String, UnsafePointer<Int8>) -> UnsafePointer<Float>?).self)
-    registerEmbeddingContextFunc = unsafeBitCast(dlsym(library, "llama_embedding_register_context"), to: ((Int64, UnsafeMutableRawPointer) -> Void).self)
-    unregisterEmbeddingContextFunc = unsafeBitCast(dlsym(library, "llama_embedding_unregister_context"), to: ((Int64) -> Void).self)
+    func sym<T>(_ name: String, _ type: T.Type) -> T? {
+        guard let p = dlsym(library, name) else { return nil }
+        return unsafeBitCast(p, to: T.self)
+    }
+    initContextFunc = sym("llama_init_context", NativeInitContext.self)
+    releaseContextFunc = sym("llama_release_context", NativeReleaseContext.self)
+    completionFunc = sym("llama_completion", NativeCompletion.self)
+    getContextModelJsonFunc = sym("llama_get_context_model_json", NativeGetContextModelJson.self)
+    stopCompletionFunc = sym("llama_stop_completion", NativeReleaseContext.self)
+    getFormattedChatFunc = sym("llama_get_formatted_chat", NativeGetFormattedChat.self)
+    toggleNativeLogFunc = sym("llama_toggle_native_log", NativeToggleLog.self)
+    embeddingFunc = sym("llama_embedding", NativeEmbedding.self)
+    registerEmbeddingContextFunc = sym("llama_embedding_register_context", NativeRegisterEmb.self)
+    unregisterEmbeddingContextFunc = sym("llama_embedding_unregister_context", NativeUnregisterEmb.self)
+    modelInfoFunc = sym("llama_model_info", NativeModelInfo.self)
+    tokenizeFunc = sym("llama_tokenize", NativeTokenize.self)
+    detokenizeFunc = sym("llama_detokenize", NativeDetokenize.self)
+    grammarFunc = sym("llama_convert_json_schema_to_grammar", NativeGrammar.self)
+}
+
+private func jsonObject(fromCString p: UnsafePointer<CChar>?) -> [String: Any]? {
+    guard let p = p else { return nil }
+    let s = String(cString: p)
+    guard let d = s.data(using: .utf8),
+          let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return nil }
+    return obj
 }
 
 // MARK: - Result Types
@@ -87,12 +128,12 @@ class LlamaContext {
 
 class LlamaModel {
     let path: String
-    let desc: String
-    let size: Int
-    let nEmbd: Int
-    let nParams: Int
-    let chatTemplates: ChatTemplates
-    let metadata: [String: Any]
+    var desc: String
+    var size: Int
+    var nEmbd: Int
+    var nParams: Int
+    var chatTemplates: ChatTemplates
+    var metadata: [String: Any]
     
     init(path: String, desc: String, size: Int, nEmbd: Int, nParams: Int, chatTemplates: ChatTemplates, metadata: [String: Any]) {
         self.path = path
@@ -160,6 +201,10 @@ struct MinjaCaps {
     
     func toggleNativeLog(enabled: Bool, completion: @escaping (LlamaResult<Void>) -> Void) {
         nativeLogEnabled = enabled
+        if initContextFunc == nil { loadFunctionPointers() }
+        if let fn = toggleNativeLogFunc {
+            _ = fn(enabled)
+        }
         if enabled {
             print("[LlamaCpp] Native logging enabled")
         } else {
@@ -175,16 +220,27 @@ struct MinjaCaps {
     }
     
     func modelInfo(path: String, skip: [String], completion: @escaping (LlamaResult<[String: Any]>) -> Void) {
-        // This would typically load model info from the GGUF file
-        // For now, return a basic structure
-        let modelInfo: [String: Any] = [
-            "path": path,
-            "desc": "Sample model",
-            "size": 0,
-            "nEmbd": 0,
-            "nParams": 0
-        ]
-        completion(.success(modelInfo))
+        if modelInfoFunc == nil { loadFunctionPointers() }
+        guard let fn = modelInfoFunc else {
+            completion(.failure(.operationFailed("llama_model_info not found")))
+            return
+        }
+        var skipJson = "[]"
+        if !skip.isEmpty, let d = try? JSONSerialization.data(withJSONObject: skip), let s = String(data: d, encoding: .utf8) {
+            skipJson = s
+        }
+        let result: LlamaResult<[String: Any]> = path.withCString { pathPtr in
+            skipJson.withCString { skipPtr in
+                guard let c = fn(pathPtr, skipPtr), let dict = jsonObject(fromCString: c) else {
+                    return .failure(.operationFailed("model info failed"))
+                }
+                if let err = dict["error"] as? String {
+                    return .failure(.operationFailed(err))
+                }
+                return .success(dict)
+            }
+        }
+        completion(result)
     }
     
     func initContext(contextId: Int, params: [String: Any], completion: @escaping (LlamaResult<[String: Any]>) -> Void) {
@@ -203,45 +259,36 @@ struct MinjaCaps {
         // Create context
         let context = LlamaContext(id: contextId)
         
-        // Create model info (this would typically load from GGUF file)
-        let chatTemplates = ChatTemplates(
+        let defaultCaps = MinjaCaps(
+            tools: true,
+            toolCalls: true,
+            toolResponses: true,
+            systemRole: true,
+            parallelToolCalls: true,
+            toolCallId: true
+        )
+        let defaultTemplates = ChatTemplates(
             llamaChat: true,
             minja: MinjaTemplates(
                 default: true,
-                defaultCaps: MinjaCaps(
-                    tools: true,
-                    toolCalls: true,
-                    toolResponses: true,
-                    systemRole: true,
-                    parallelToolCalls: true,
-                    toolCallId: true
-                ),
+                defaultCaps: defaultCaps,
                 toolUse: true,
-                toolUseCaps: MinjaCaps(
-                    tools: true,
-                    toolCalls: true,
-                    toolResponses: true,
-                    systemRole: true,
-                    parallelToolCalls: true,
-                    toolCallId: true
-                )
+                toolUseCaps: defaultCaps
             )
         )
         
-        let model = LlamaModel(
+        var model = LlamaModel(
             path: modelPath,
-            desc: "Sample model",
+            desc: "model",
             size: 0,
             nEmbd: 0,
             nParams: 0,
-            chatTemplates: chatTemplates,
+            chatTemplates: defaultTemplates,
             metadata: [:]
         )
         
         context.model = model
         
-        // Call native initContext to create the actual C++ context
-        // Convert params to JSON string
         var paramsJson = "{}"
         do {
             let paramsData = try JSONSerialization.data(withJSONObject: params)
@@ -251,33 +298,66 @@ struct MinjaCaps {
             return
         }
         
-        // Ensure function pointers are loaded
         if initContextFunc == nil {
             loadFunctionPointers()
         }
         
-        // Call native function to initialize context
         guard let initFunc = initContextFunc else {
             completion(.failure(.operationFailed("Native initContext function not available")))
             return
         }
         
-        let nativeContextId = initFunc(modelPath, paramsJson.cString(using: .utf8)!)
-        if nativeContextId > 0 {
-            // Store the LlamaContext for Swift bookkeeping
-            contexts[contextId] = context
-            // Store the native context pointer and mapping for C layer
-            let nativePtr = UnsafeMutableRawPointer(bitPattern: Int(nativeContextId))
-            nativeContexts[nativeContextId] = nativePtr
-            contextIdToNative[contextId] = nativeContextId
-            
-            // Register with embedding system if available
-            if let registerFunc = registerEmbeddingContextFunc, let ptr = nativePtr {
-                registerFunc(nativeContextId, ptr)
+        let nativeContextId: Int64 = modelPath.withCString { modelPtr in
+            paramsJson.withCString { paramsPtr in
+                initFunc(modelPtr, paramsPtr)
             }
-        } else {
+        }
+        
+        guard nativeContextId > 0 else {
             completion(.failure(.operationFailed("Failed to initialize native context")))
             return
+        }
+        
+        contexts[contextId] = context
+        nativeContexts[nativeContextId] = UnsafeMutableRawPointer(bitPattern: Int(truncatingIfNeeded: nativeContextId))
+        contextIdToNative[contextId] = nativeContextId
+        
+        if let jsonFn = getContextModelJsonFunc, let c = jsonFn(nativeContextId), let m = jsonObject(fromCString: c) {
+            model.desc = (m["desc"] as? String) ?? model.desc
+            if let n = m["size"] as? NSNumber { model.size = n.intValue }
+            if let n = m["nEmbd"] as? NSNumber { model.nEmbd = n.intValue }
+            if let n = m["nParams"] as? NSNumber { model.nParams = n.intValue }
+            if let meta = m["metadata"] as? [String: Any] { model.metadata = meta }
+            if let ct = m["chatTemplates"] as? [String: Any] {
+                let llamaChat = (ct["llamaChat"] as? NSNumber)?.boolValue ?? true
+                if let minja = ct["minja"] as? [String: Any] {
+                    func caps(_ d: [String: Any]?) -> MinjaCaps {
+                        guard let d = d else {
+                            return defaultCaps
+                        }
+                        return MinjaCaps(
+                            tools: (d["tools"] as? NSNumber)?.boolValue ?? true,
+                            toolCalls: (d["toolCalls"] as? NSNumber)?.boolValue ?? true,
+                            toolResponses: (d["toolResponses"] as? NSNumber)?.boolValue ?? true,
+                            systemRole: (d["systemRole"] as? NSNumber)?.boolValue ?? true,
+                            parallelToolCalls: (d["parallelToolCalls"] as? NSNumber)?.boolValue ?? true,
+                            toolCallId: (d["toolCallId"] as? NSNumber)?.boolValue ?? true
+                        )
+                    }
+                    let defCaps = caps(minja["defaultCaps"] as? [String: Any])
+                    let tuCaps = caps(minja["toolUseCaps"] as? [String: Any])
+                    model.chatTemplates = ChatTemplates(
+                        llamaChat: llamaChat,
+                        minja: MinjaTemplates(
+                            default: (minja["default"] as? NSNumber)?.boolValue ?? true,
+                            defaultCaps: defCaps,
+                            toolUse: (minja["toolUse"] as? NSNumber)?.boolValue ?? true,
+                            toolUseCaps: tuCaps
+                        )
+                    )
+                }
+            }
+            context.model = model
         }
         
         // Return context info
@@ -346,13 +426,14 @@ struct MinjaCaps {
     }
     
     func releaseAllContexts(completion: @escaping (LlamaResult<Void>) -> Void) {
-        // Unregister all contexts from embedding system
-        if let unregisterFunc = unregisterEmbeddingContextFunc {
-            for (_, nativeId) in contextIdToNative {
+        if releaseContextFunc == nil { loadFunctionPointers() }
+        let pairs = Array(contextIdToNative)
+        for (_, nativeId) in pairs {
+            if let unregisterFunc = unregisterEmbeddingContextFunc {
                 unregisterFunc(nativeId)
             }
+            releaseContextFunc?(nativeId)
         }
-        
         contexts.removeAll()
         nativeContexts.removeAll()
         contextIdToNative.removeAll()
@@ -362,60 +443,72 @@ struct MinjaCaps {
     // MARK: - Chat and completion
     
     func getFormattedChat(contextId: Int, messages: String, chatTemplate: String?, params: [String: Any]?, completion: @escaping (LlamaResult<[String: Any]>) -> Void) {
-        guard let context = contexts[contextId] else {
+        guard contexts[contextId] != nil else {
             completion(.failure(.contextNotFound))
             return
         }
-        
-        // This would typically format the chat using the model's chat templates
-        // For now, return a basic formatted chat
-        let formattedChat: [String: Any] = [
-            "type": "llama-chat",
-            "prompt": messages,
-            "has_media": false,
-            "media_paths": []
-        ]
-        
-        completion(.success(formattedChat))
+        guard let nativeId = contextIdToNative[contextId] else {
+            completion(.failure(.contextNotFound))
+            return
+        }
+        if getFormattedChatFunc == nil { loadFunctionPointers() }
+        guard let fn = getFormattedChatFunc else {
+            completion(.failure(.operationFailed("llama_get_formatted_chat not found")))
+            return
+        }
+        var paramsJson = "{}"
+        if let p = params, let d = try? JSONSerialization.data(withJSONObject: p), let s = String(data: d, encoding: .utf8) {
+            paramsJson = s
+        }
+        let template = chatTemplate ?? ""
+        let result: LlamaResult<[String: Any]> = messages.withCString { msgPtr in
+            template.withCString { tplPtr in
+                paramsJson.withCString { parPtr in
+                    guard let c = fn(nativeId, msgPtr, tplPtr, parPtr), let dict = jsonObject(fromCString: c) else {
+                        return .failure(.operationFailed("formatted chat failed"))
+                    }
+                    if let err = dict["error"] as? String {
+                        return .failure(.operationFailed(err))
+                    }
+                    return .success(dict)
+                }
+            }
+        }
+        completion(result)
     }
     
     func completion(contextId: Int, params: [String: Any], completion: @escaping (LlamaResult<[String: Any]>) -> Void) {
-        guard let context = contexts[contextId] else {
+        guard contexts[contextId] != nil else {
             completion(.failure(.contextNotFound))
             return
         }
-        
-        // This would typically perform the completion using llama.cpp
-        // For now, return a basic completion result
-        let completionResult: [String: Any] = [
-            "text": "Sample completion text",
-            "reasoning_content": "",
-            "tool_calls": [],
-            "content": "Sample completion text",
-            "chat_format": 0,
-            "tokens_predicted": 0,
-            "tokens_evaluated": 0,
-            "truncated": false,
-            "stopped_eos": false,
-            "stopped_word": "",
-            "stopped_limit": 0,
-            "stopping_word": "",
-            "context_full": false,
-            "interrupted": false,
-            "tokens_cached": 0,
-            "timings": [
-                "prompt_n": 0,
-                "prompt_ms": 0,
-                "prompt_per_token_ms": 0,
-                "prompt_per_second": 0,
-                "predicted_n": 0,
-                "predicted_ms": 0,
-                "predicted_per_token_ms": 0,
-                "predicted_per_second": 0
-            ]
-        ]
-        
-        completion(.success(completionResult))
+        guard let nativeId = contextIdToNative[contextId] else {
+            completion(.failure(.contextNotFound))
+            return
+        }
+        if completionFunc == nil { loadFunctionPointers() }
+        guard let fn = completionFunc else {
+            completion(.failure(.operationFailed("llama_completion not found")))
+            return
+        }
+        var paramsJson = "{}"
+        do {
+            let paramsData = try JSONSerialization.data(withJSONObject: params)
+            paramsJson = String(data: paramsData, encoding: .utf8) ?? "{}"
+        } catch {
+            completion(.failure(.operationFailed("Failed to serialize params: \(error.localizedDescription)")))
+            return
+        }
+        let result: LlamaResult<[String: Any]> = paramsJson.withCString { ptr in
+            guard let c = fn(nativeId, ptr), let dict = jsonObject(fromCString: c) else {
+                return .failure(.operationFailed("completion returned empty"))
+            }
+            if let err = dict["error"] as? String {
+                return .failure(.operationFailed(err))
+            }
+            return .success(dict)
+        }
+        completion(result)
     }
     
     func stopCompletion(contextId: Int, completion: @escaping (LlamaResult<Void>) -> Void) {
@@ -423,8 +516,12 @@ struct MinjaCaps {
             completion(.failure(.contextNotFound))
             return
         }
-        
-        // This would typically stop any ongoing completion
+        guard let nativeId = contextIdToNative[contextId] else {
+            completion(.failure(.contextNotFound))
+            return
+        }
+        if stopCompletionFunc == nil { loadFunctionPointers() }
+        stopCompletionFunc?(nativeId)
         completion(.success(()))
     }
     
@@ -541,17 +638,31 @@ struct MinjaCaps {
             completion(.failure(.contextNotFound))
             return
         }
-        
-        // This would typically tokenize the text using the model's tokenizer
-        let tokenizeResult: [String: Any] = [
-            "tokens": [],
-            "has_images": false,
-            "bitmap_hashes": [],
-            "chunk_pos": [],
-            "chunk_pos_images": []
-        ]
-        
-        completion(.success(tokenizeResult))
+        guard let nativeId = contextIdToNative[contextId] else {
+            completion(.failure(.contextNotFound))
+            return
+        }
+        if tokenizeFunc == nil { loadFunctionPointers() }
+        guard let fn = tokenizeFunc else {
+            completion(.failure(.operationFailed("llama_tokenize not found")))
+            return
+        }
+        var pathsJson = "[]"
+        if !imagePaths.isEmpty, let d = try? JSONSerialization.data(withJSONObject: imagePaths), let s = String(data: d, encoding: .utf8) {
+            pathsJson = s
+        }
+        let result: LlamaResult<[String: Any]> = text.withCString { txtPtr in
+            pathsJson.withCString { pj in
+                guard let c = fn(nativeId, txtPtr, pj), let dict = jsonObject(fromCString: c) else {
+                    return .failure(.operationFailed("tokenize failed"))
+                }
+                if let err = dict["error"] as? String {
+                    return .failure(.operationFailed(err))
+                }
+                return .success(dict)
+            }
+        }
+        completion(result)
     }
     
     func detokenize(contextId: Int, tokens: [Int], completion: @escaping (LlamaResult<String>) -> Void) {
@@ -559,9 +670,26 @@ struct MinjaCaps {
             completion(.failure(.contextNotFound))
             return
         }
-        
-        // This would typically detokenize using the model's tokenizer
-        completion(.success(""))
+        guard let nativeId = contextIdToNative[contextId] else {
+            completion(.failure(.contextNotFound))
+            return
+        }
+        if detokenizeFunc == nil { loadFunctionPointers() }
+        guard let fn = detokenizeFunc else {
+            completion(.failure(.operationFailed("llama_detokenize not found")))
+            return
+        }
+        guard let d = try? JSONSerialization.data(withJSONObject: tokens), let tokensJson = String(data: d, encoding: .utf8) else {
+            completion(.failure(.invalidParameters))
+            return
+        }
+        let s: LlamaResult<String> = tokensJson.withCString { ptr in
+            guard let c = fn(nativeId, ptr) else {
+                return .success("")
+            }
+            return .success(String(cString: c))
+        }
+        completion(s)
     }
     
     // MARK: - Embeddings and reranking
@@ -592,7 +720,11 @@ struct MinjaCaps {
             return
         }
         
-        // Convert params to JSON string for native call
+        guard let nativeId = contextIdToNative[contextId] else {
+            completion(.failure(.contextNotFound))
+            return
+        }
+        
         var paramsJson = "{}"
         if !params.isEmpty {
             do {
@@ -603,33 +735,21 @@ struct MinjaCaps {
             }
         }
         
-        // Call native embedding function
-        let paramsCString = paramsJson.cString(using: .utf8)
-        guard let baseAddress = paramsCString else {
-            completion(.failure(.operationFailed("Failed to convert params to C string")))
-            return
+        let embOutcome: LlamaResult<[String: Any]> = text.withCString { txtPtr in
+            paramsJson.withCString { parPtr in
+                guard let embeddingPtr = embeddingFunction(nativeId, txtPtr, parPtr) else {
+                    return .failure(.operationFailed("Native embedding returned null."))
+                }
+                let embeddingArray = Array(UnsafeBufferPointer(start: embeddingPtr, count: nEmbd))
+                let embeddingDoubles = embeddingArray.map { Double($0) }
+                let embeddingResult: [String: Any] = [
+                    "embedding": embeddingDoubles,
+                    "n_embd": nEmbd
+                ]
+                return .success(embeddingResult)
+            }
         }
-        
-        // Get embedding vector from native layer
-        // Note: The native function signature should be: 
-        // UnsafePointer<Float>? llama_embedding(Int64 contextId, String text, UnsafePointer<Int8> params)
-        // The returned pointer should point to an array of nEmbd floats
-        if let embeddingPtr = embeddingFunction(Int64(contextId), text, baseAddress) {
-            // Convert C array to Swift array
-            let embeddingArray = Array(UnsafeBufferPointer(start: embeddingPtr, count: nEmbd))
-            
-            // Convert Float array to Double array for JSON compatibility
-            let embeddingDoubles = embeddingArray.map { Double($0) }
-            
-            let embeddingResult: [String: Any] = [
-                "embedding": embeddingDoubles,
-                "n_embd": nEmbd
-            ]
-            
-            completion(.success(embeddingResult))
-        } else {
-            completion(.failure(.operationFailed("Native embedding function returned null. Check native C++ implementation.")))
-        }
+        completion(embOutcome)
     }
     
     func rerank(contextId: Int, query: String, documents: [String], params: [String: Any]?, completion: @escaping (LlamaResult<[[String: Any]]>) -> Void) {
@@ -903,8 +1023,18 @@ struct MinjaCaps {
     // MARK: - Grammar utilities
     
     func convertJsonSchemaToGrammar(schema: String, completion: @escaping (LlamaResult<String>) -> Void) {
-        // For now, return the schema as-is
-        // In a real implementation, this would convert JSON schema to GBNF grammar
-        completion(.success(schema))
+        if grammarFunc == nil { loadFunctionPointers() }
+        guard let fn = grammarFunc else {
+            completion(.success(schema))
+            return
+        }
+        let s: LlamaResult<String> = schema.withCString { ptr in
+            guard let c = fn(ptr) else {
+                return .success("")
+            }
+            let g = String(cString: c)
+            return g.isEmpty ? .success(schema) : .success(g)
+        }
+        completion(s)
     }
 }
