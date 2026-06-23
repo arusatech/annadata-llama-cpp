@@ -1,0 +1,30 @@
+[package]
+name = "llama_engine"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Rust+Wasm runtime scaffold for llama-cpp-capacitor web/PWA fallback"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+

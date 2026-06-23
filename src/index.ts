@@ -822,3 +822,14 @@ export const BuildInfo = {
 
 // Re-export the plugin for direct access
 export { LlamaCpp };
+
+// Isomorphic provider exports (Phase 0/1 scaffold)
+export * from './isomorphic/provider.interface';
+export * from './isomorphic/errors';
+export * from './isomorphic/provider.factory';
+export * from './isomorphic/provider.native';
+export * from './isomorphic/provider.web';
+export * from './isomorphic/model.admission';
+export * from './isomorphic/model.scheduler';
+export * from './storage/manifest';
+export * from './storage/opfs.store';

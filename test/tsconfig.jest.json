@@ -1,0 +1,15 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "lib": ["dom", "webworker", "es2017"],
+    "module": "esnext",
+    "types": ["node", "jest"],
+    "noUnusedLocals": false,
+    "noUnusedParameters": false
+  },
+  "include": [
+    "../src/workers/**/*.ts",
+    "./pwa/**/*.ts"
+  ]
+}
+
