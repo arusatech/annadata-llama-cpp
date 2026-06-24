@@ -18,12 +18,17 @@ fn main() {
     let cpp_dir = workspace_cpp_dir(&crate_dir);
     let target = env::var("TARGET").unwrap_or_default();
 
-    // Embed llama.cpp C/C++ sources for wasm builds.
+    // Embed llama.cpp C/C++ sources for wasm builds (required for shipped PWA artifacts).
     let embed_cpp = env::var("LLAMA_WASM_EMBED_CPP")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or_else(|_| target.contains("emscripten"));
+        .unwrap_or_else(|_| target.contains("wasm32"));
 
     if !embed_cpp {
+        if target.contains("wasm32") {
+            panic!(
+                "llama_engine wasm builds require LLAMA_WASM_EMBED_CPP=1 (use npm run build:wasm)"
+            );
+        }
         return;
     }
     println!("cargo:rustc-cfg=llama_embed_cpp");
