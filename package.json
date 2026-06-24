@@ -90,7 +90,7 @@
     "build:native": "./build-native.sh",
     "build:all": "npm run build && npm run build:native",
     "build:pwa": "npm run build:wasm && npm run build:wasm:assets",
-    "build:pwa:embed": "npm run build:wasm:embed && npm run build:wasm:assets",
+    "build:pwa:embed": "npm run build:wasm:embed && npm run build:wasm && npm run build:wasm:assets",
     "build:package": "npm run build && npm run build:native && npm run build:pwa:embed",
     "verify:pack:artifacts": "node ./scripts/verify-pack-artifacts.mjs",
     "build:ios": "cd ios && cmake -B build -S . && cmake --build build --config Release",
