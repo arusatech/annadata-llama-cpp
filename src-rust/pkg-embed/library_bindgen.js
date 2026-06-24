@@ -165,11 +165,13 @@ addToLibrary({
         /* @ts-self-types="./llama_engine.d.ts" */
 
         /**
+         * Generate embeddings for text
          * @param {string} model_id
          * @param {string} req_json
          * @returns {string}
          */
         /**
+         * Generate embeddings for text
          * @param {string} model_id
          * @param {string} req_json
          * @returns {string}
@@ -207,11 +209,13 @@ addToLibrary({
         Module.embed = embed;
 
         /**
+         * Generate text from a prompt
          * @param {string} model_id
          * @param {string} req_json
          * @returns {string}
          */
         /**
+         * Generate text from a prompt
          * @param {string} model_id
          * @param {string} req_json
          * @returns {string}
@@ -249,9 +253,11 @@ addToLibrary({
         Module.generate = generate;
 
         /**
+         * Get health status of the engine
          * @returns {string}
          */
         /**
+         * Get health status of the engine
          * @returns {string}
          */
         function health() {
@@ -282,6 +288,12 @@ addToLibrary({
 
         Module.health = health;
 
+        /**
+         * Initialize the Wasm engine. Must be called before any other operations.
+         */
+        /**
+         * Initialize the Wasm engine. Must be called before any other operations.
+         */
         function init() {
             try {
                 const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
@@ -300,11 +312,13 @@ addToLibrary({
         Module.init = init;
 
         /**
+         * Load a model from a file path. The model must be in GGUF format.
          * @param {string} model_id
          * @param {Uint8Array} bytes
          * @param {string} opts_json
          */
         /**
+         * Load a model from a file path. The model must be in GGUF format.
          * @param {string} model_id
          * @param {Uint8Array} bytes
          * @param {string} opts_json
@@ -333,9 +347,11 @@ addToLibrary({
         Module.load_model = load_model;
 
         /**
+         * Get memory usage snapshot
          * @returns {string}
          */
         /**
+         * Get memory usage snapshot
          * @returns {string}
          */
         function memory_snapshot() {
@@ -367,9 +383,11 @@ addToLibrary({
         Module.memory_snapshot = memory_snapshot;
 
         /**
+         * Unload a model and free its resources
          * @param {string} model_id
          */
         /**
+         * Unload a model and free its resources
          * @param {string} model_id
          */
         function unload_model(model_id) {

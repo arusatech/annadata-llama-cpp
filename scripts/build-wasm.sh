@@ -76,10 +76,31 @@ if [[ "${LLAMA_WASM_EMBED_CPP:-0}" == "1" ]]; then
   echo "  - EMSDK_CACHE=$EMSDK_CACHE"
   echo "  - LLAMA_WASM_SYSROOT=$LLAMA_WASM_SYSROOT"
 
-  if ! command -v wasm-bindgen >/dev/null 2>&1; then
-    echo "Error: wasm-bindgen CLI not found. Install with: cargo install wasm-bindgen-cli"
-    exit 1
-  fi
+  ensure_wasm_bindgen_cli() {
+    local lockfile="$RUST_DIR/Cargo.lock"
+    local required_version installed_version
+
+    required_version="$(awk '
+      /^name = "wasm-bindgen"$/ { found=1; next }
+      found && /^version = / { gsub(/"/, "", $3); print $3; exit }
+    ' "$lockfile")"
+    if [[ -z "$required_version" ]]; then
+      echo "Error: could not determine wasm-bindgen version from $lockfile"
+      exit 1
+    fi
+
+    installed_version=""
+    if command -v wasm-bindgen >/dev/null 2>&1; then
+      installed_version="$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')"
+    fi
+
+    if [[ "$installed_version" != "$required_version" ]]; then
+      echo "Installing wasm-bindgen-cli $required_version (found: ${installed_version:-none})..."
+      cargo install -f wasm-bindgen-cli --version "$required_version"
+    fi
+  }
+
+  ensure_wasm_bindgen_cli
 
   rustup target add wasm32-unknown-emscripten >/dev/null 2>&1 || true
   cd "$RUST_DIR"
