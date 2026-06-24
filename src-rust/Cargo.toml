@@ -3,7 +3,7 @@ name = "llama_engine"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Rust+Wasm runtime scaffold for llama-cpp-capacitor web/PWA fallback"
+description = "Rust+Wasm runtime for llama-cpp-capacitor web/PWA with embedded llama.cpp"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -24,7 +24,4 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
-
-[package.metadata.wasm-pack.profile.release]
-wasm-opt = false
 

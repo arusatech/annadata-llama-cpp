@@ -18,15 +18,12 @@ fn main() {
     let cpp_dir = workspace_cpp_dir(&crate_dir);
     let target = env::var("TARGET").unwrap_or_default();
 
-    // Opt-in C/C++ embedding for wasm builds:
-    // LLAMA_WASM_EMBED_CPP=1 wasm-pack build ...
-    // This compiles selected local llama.cpp translation units into a static archive.
+    // Embed llama.cpp C/C++ sources for wasm builds.
     let embed_cpp = env::var("LLAMA_WASM_EMBED_CPP")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .unwrap_or_else(|_| target.contains("emscripten"));
 
     if !embed_cpp {
-        println!("cargo:warning=LLAMA_WASM_EMBED_CPP not enabled; building Rust wasm runtime without embedded llama.cpp C/C++ sources");
         return;
     }
     println!("cargo:rustc-cfg=llama_embed_cpp");

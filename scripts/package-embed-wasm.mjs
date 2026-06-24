@@ -6,13 +6,13 @@ import { join, resolve } from 'node:path';
 
 const root = resolve(process.cwd());
 const engineName = 'llama_engine';
-const embedPkgDir = resolve(root, 'src-rust', 'pkg-embed');
-const gluePath = resolve(embedPkgDir, 'library_bindgen.js');
-const wasmBgPath = resolve(embedPkgDir, `${engineName}_bg.wasm`);
-const wasmPath = resolve(embedPkgDir, `${engineName}.wasm`);
-const jsPath = resolve(embedPkgDir, `${engineName}.js`);
-const dtsPath = resolve(embedPkgDir, `${engineName}.d.ts`);
-const packageJsonPath = resolve(embedPkgDir, 'package.json');
+const wasmPkgDir = resolve(root, 'src-rust', 'pkg');
+const gluePath = resolve(wasmPkgDir, 'library_bindgen.js');
+const wasmBgPath = resolve(wasmPkgDir, `${engineName}_bg.wasm`);
+const wasmPath = resolve(wasmPkgDir, `${engineName}.wasm`);
+const jsPath = resolve(wasmPkgDir, `${engineName}.js`);
+const dtsPath = resolve(wasmPkgDir, `${engineName}.d.ts`);
+const packageJsonPath = resolve(wasmPkgDir, 'package.json');
 
 const fail = (message) => {
   console.error(message);
@@ -77,14 +77,29 @@ const packageJson = {
 
 await writeFile(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`);
 
+await requireFile(jsPath, 'embedded wasm JS wrapper');
+await requireFile(wasmPath, 'embedded wasm binary');
+await requireFile(dtsPath, 'embedded TypeScript definitions');
+await requireFile(packageJsonPath, 'embedded package manifest');
+
+const wasmBytes = await readFile(wasmPath);
+if (wasmBytes.byteLength === 0) {
+  fail(`Embedded wasm binary is empty at ${wasmPath}`);
+}
+
+const jsBytes = await readFile(jsPath, 'utf8');
+if (!jsBytes.includes(`${engineName}.wasm`)) {
+  fail(`Embedded JS wrapper does not reference ${engineName}.wasm`);
+}
+
 await rm(bindgenOutDir, { recursive: true, force: true });
 await rm(gluePath, { force: true });
 await rm(wasmBgPath, { force: true });
-await rm(resolve(embedPkgDir, `${engineName}_bg.wasm.d.ts`), { force: true });
-await rm(resolve(embedPkgDir, `${engineName}_emscripten.mjs`), { force: true });
-await rm(resolve(embedPkgDir, `${engineName}_emscripten.wasm`), { force: true });
+await rm(resolve(wasmPkgDir, `${engineName}_bg.wasm.d.ts`), { force: true });
+await rm(resolve(wasmPkgDir, `${engineName}_emscripten.mjs`), { force: true });
+await rm(resolve(wasmPkgDir, `${engineName}_emscripten.wasm`), { force: true });
 
-console.log('Embedded wasm package ready:');
+console.log('Wasm package ready:');
 console.log(`  - ${jsPath}`);
 console.log(`  - ${wasmPath}`);
 console.log(`  - ${dtsPath}`);

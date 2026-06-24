@@ -2,10 +2,7 @@ import { mkdir, rm, copyFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 const root = resolve(process.cwd());
-const useEmbed =
-  process.env.LLAMA_WASM_EMBED_CPP === '1' ||
-  process.env.LLAMA_WASM_EMBED_CPP === 'true';
-const wasmPkgDir = resolve(root, 'src-rust', useEmbed ? 'pkg-embed' : 'pkg');
+const wasmPkgDir = resolve(root, 'src-rust', 'pkg');
 const targetDir = resolve(root, 'dist', 'wasm');
 const files = [
   'llama_engine.js',
