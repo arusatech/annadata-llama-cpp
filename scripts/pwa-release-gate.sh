@@ -12,11 +12,11 @@ npx tsc -p tsconfig.json --noEmit
 echo "[2/5] PWA smoke contract tests"
 npm run test:pwa:smoke
 
-echo "[3/5] Standard wasm build (unknown-unknown)"
-npm run build:wasm
-
-echo "[4/5] Embedded wasm build (emscripten)"
+echo "[3/5] Embedded wasm compile check (emscripten; not shipped to dist/wasm)"
 npm run build:wasm:embed
+
+echo "[4/5] Standard wasm build (wasm-pack web — ships to dist/wasm)"
+npm run build:wasm
 
 echo "[5/5] Copy runtime wasm assets"
 npm run build:wasm:assets

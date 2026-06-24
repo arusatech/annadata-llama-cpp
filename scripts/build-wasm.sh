@@ -32,9 +32,27 @@ if [[ "${LLAMA_WASM_EMBED_CPP:-0}" == "1" ]]; then
   fi
 
   EMSDK_CACHE="$(em-config CACHE)"
+  if [[ ! -d "$EMSDK_CACHE" ]]; then
+    # Some Homebrew Emscripten installs report a cache path under Cellar that is not writable/present.
+    # Fallback to user-local cache and force tools to use it.
+    export EM_CACHE="${HOME}/.emscripten_cache"
+    mkdir -p "$EM_CACHE"
+    EMSDK_CACHE="$EM_CACHE"
+  fi
+
   LLAMA_WASM_SYSROOT="${EMSDK_CACHE}/sysroot"
   if [[ ! -d "$LLAMA_WASM_SYSROOT/include" ]]; then
+    if command -v embuilder >/dev/null 2>&1; then
+      echo "Emscripten sysroot missing at $LLAMA_WASM_SYSROOT; populating cache via embuilder..."
+      embuilder build sysroot >/dev/null
+    else
+      # Fallback: trigger emcc once; it may initialize cache/sysroot in some setups.
+      emcc -v >/dev/null 2>&1 || true
+    fi
+  fi
+  if [[ ! -d "$LLAMA_WASM_SYSROOT/include" ]]; then
     echo "Error: Emscripten sysroot not found at $LLAMA_WASM_SYSROOT"
+    echo "Try: export EM_CACHE=\"\$HOME/.emscripten_cache\" && embuilder build sysroot"
     exit 1
   fi
 
@@ -55,6 +73,7 @@ if [[ "${LLAMA_WASM_EMBED_CPP:-0}" == "1" ]]; then
   echo "  - CC_wasm32_unknown_emscripten=$CC_wasm32_unknown_emscripten"
   echo "  - CXX_wasm32_unknown_emscripten=$CXX_wasm32_unknown_emscripten"
   echo "  - CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_LINKER=$CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_LINKER"
+  echo "  - EMSDK_CACHE=$EMSDK_CACHE"
   echo "  - LLAMA_WASM_SYSROOT=$LLAMA_WASM_SYSROOT"
 
   if ! command -v wasm-bindgen >/dev/null 2>&1; then
@@ -66,11 +85,19 @@ if [[ "${LLAMA_WASM_EMBED_CPP:-0}" == "1" ]]; then
   cd "$RUST_DIR"
   echo "Building embedded wasm package via wasm32-unknown-emscripten + wasm-bindgen..."
   CARGO_TARGET_DIR="$TARGET_DIR" cargo build --release --target wasm32-unknown-emscripten
+  EMBED_OUT_DIR="$OUT_DIR-embed"
+  rm -rf "$EMBED_OUT_DIR"
+  mkdir -p "$EMBED_OUT_DIR"
   wasm-bindgen \
     --target web \
-    --out-dir "$OUT_DIR" \
+    --out-dir "$EMBED_OUT_DIR" \
     --out-name "$ENGINE_NAME" \
     "$TARGET_DIR/wasm32-unknown-emscripten/release/${ENGINE_NAME}.wasm"
+  echo "Embedded wasm compile check complete (browser ESM packaging not shipped yet):"
+  echo "  - $EMBED_OUT_DIR/library_bindgen.js"
+  echo "  - $EMBED_OUT_DIR/${ENGINE_NAME}_bg.wasm"
+  echo "PWA runtime assets must come from the standard wasm-pack build (npm run build:wasm)."
+  exit 0
 else
   if ! command -v wasm-pack >/dev/null 2>&1; then
     echo "Error: wasm-pack not found. Install it first: https://rustwasm.github.io/wasm-pack/installer/"

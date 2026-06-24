@@ -29,6 +29,10 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+bytes_to_mb() {
+    awk -v bytes="$1" 'BEGIN { printf "%.2f", bytes / 1048576 }'
+}
+
 # Check if we're on macOS for iOS builds
 check_macos() {
     if [[ "$OSTYPE" != "darwin"* ]]; then
@@ -193,21 +197,46 @@ build_android() {
     JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
     cmake --build . --config Release -- -j"$JOBS"
     
-    mkdir -p ../src/main/jniLibs/$arch
-    if [ -f "libllama-cpp-arm64.so" ]; then
+    FINAL_SO="../src/main/jniLibs/$arch/libllama-cpp-arm64.so"
+    if [ -f "$FINAL_SO" ]; then
         PREBUILT="$ANDROID_NDK/toolchains/llvm/prebuilt"
+        TOOL_BIN=""
         if [ -d "$PREBUILT/darwin-x86_64" ]; then
-            STRIP_TOOL="$PREBUILT/darwin-x86_64/bin/llvm-strip"
+            TOOL_BIN="$PREBUILT/darwin-x86_64/bin"
         elif [ -d "$PREBUILT/darwin-aarch64" ]; then
-            STRIP_TOOL="$PREBUILT/darwin-aarch64/bin/llvm-strip"
+            TOOL_BIN="$PREBUILT/darwin-aarch64/bin"
+        fi
+        if [ -n "$TOOL_BIN" ]; then
+            STRIP_TOOL="$TOOL_BIN/llvm-strip"
+            OBJCOPY_TOOL="$TOOL_BIN/llvm-objcopy"
         else
             STRIP_TOOL=$(find "$ANDROID_NDK/toolchains" -name "llvm-strip" -type f 2>/dev/null | head -1)
+            OBJCOPY_TOOL=$(find "$ANDROID_NDK/toolchains" -name "llvm-objcopy" -type f 2>/dev/null | head -1)
         fi
+
+        BEFORE_SIZE=$(wc -c < "$FINAL_SO")
+        SYMBOLS_DIR="../symbols/$arch"
+        SYMBOL_FILE="$SYMBOLS_DIR/libllama-cpp-arm64.so.debug"
+        mkdir -p "$SYMBOLS_DIR"
+
+        if [ -f "$OBJCOPY_TOOL" ]; then
+            "$OBJCOPY_TOOL" --only-keep-debug "$FINAL_SO" "$SYMBOL_FILE"
+            print_status "Saved Android debug symbols to: $SYMBOL_FILE"
+        else
+            cp "$FINAL_SO" "$SYMBOL_FILE"
+            print_warning "llvm-objcopy not found; copied unstripped library as debug symbol file"
+        fi
+
         if [ -f "$STRIP_TOOL" ]; then
-            "$STRIP_TOOL" --strip-debug libllama-cpp-arm64.so
-            print_status "Stripped debug symbols from library"
+            "$STRIP_TOOL" --strip-unneeded "$FINAL_SO"
+            if [ -f "$OBJCOPY_TOOL" ]; then
+                "$OBJCOPY_TOOL" --add-gnu-debuglink="$SYMBOL_FILE" "$FINAL_SO" || true
+            fi
+            AFTER_SIZE=$(wc -c < "$FINAL_SO")
+            print_status "Stripped Android release library (--strip-unneeded): $(bytes_to_mb "$BEFORE_SIZE") MB -> $(bytes_to_mb "$AFTER_SIZE") MB"
         fi
-        cp "libllama-cpp-arm64.so" "../src/main/jniLibs/$arch/"
+    else
+        print_warning "Expected Android library not found at $FINAL_SO"
     fi
     print_success "Built for $arch"
     

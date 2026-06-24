@@ -43,6 +43,29 @@ This release introduces a production-ready PWA foundation for `llama-cpp-capacit
 - If embedding `llama.cpp` for web runtime, use the `build:wasm:embed` path.
 - Model selection remains user-driven; no default internal model is auto-loaded.
 
+### Downstream import migration
+
+Replace app-local shim imports (for example `llamaCppWebImports.ts`) with package-root imports:
+
+```ts
+// Before (app-local shim)
+import { WebProvider, createProvider } from './llamaCppWebImports';
+import { ensureModelInOpfs, getManifestEntry } from './llamaCppWebImports';
+```
+
+```ts
+// After (published package exports)
+import { WebProvider, createProvider } from 'llama-cpp-capacitor';
+import { ensureModelInOpfs, getManifestEntry } from 'llama-cpp-capacitor';
+```
+
+Wasm runtime assets are available via package subpath exports when needed:
+
+```ts
+import wasmWrapperUrl from 'llama-cpp-capacitor/wasm/llama_engine.js';
+import wasmBinaryUrl from 'llama-cpp-capacitor/wasm/llama_engine.wasm';
+```
+
 ## Compatibility notes
 
 - Native (iOS/Android) and web paths share contract behavior but differ in runtime internals.

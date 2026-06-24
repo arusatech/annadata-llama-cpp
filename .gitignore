@@ -90,6 +90,7 @@ android/.cxx/
 android/src/main/jniLibs/
 android/src/main/obj/
 android/src/main/libs/
+android/symbols/
 android/app/build/
 android/app/src/main/jniLibs/
 android/app/src/main/obj/
@@ -138,3 +139,6 @@ test/results/
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+
+# Local package artifacts
+llama-cpp-capacitor-0.2.0-rc.0.tgz

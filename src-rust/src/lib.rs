@@ -3,6 +3,7 @@ mod engine;
 mod ffi;
 mod memory;
 mod model;
+#[allow(dead_code)]
 mod stream;
 
 use engine::EngineState;
