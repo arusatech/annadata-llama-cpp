@@ -141,8 +141,10 @@ ehthumbs.db
 Desktop.ini
 
 # Local package artifacts
-llama-cpp-capacitor-0.2.0-rc.0.tgz
+llama-cpp-capacitor-*.tgz
+*.tgz
 
-# Legacy / local wasm build outputs (shipped artifacts live in dist/wasm and src-rust/pkg)
+# Rust / wasm build outputs (rebuilt by npm run build:wasm and build:package)
+src-rust/target/
+src-rust/pkg/
 src-rust/pkg-embed/
-src-rust/target/wasm32-unknown-unknown/
