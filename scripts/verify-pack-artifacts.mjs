@@ -1,8 +1,9 @@
-import { access } from 'node:fs/promises';
+import { access, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { resolve } from 'node:path';
 
 const root = resolve(process.cwd());
+const MIN_EMBEDDED_WASM_BYTES = 1_000_000;
 
 const requiredArtifacts = [
   {
@@ -20,10 +21,12 @@ const requiredArtifacts = [
   {
     path: 'dist/wasm/llama_engine.wasm',
     reason: 'PWA wasm binary',
+    minBytes: MIN_EMBEDDED_WASM_BYTES,
   },
 ];
 
 const missing = [];
+const invalid = [];
 
 for (const artifact of requiredArtifacts) {
   const absolutePath = resolve(root, artifact.path);
@@ -31,6 +34,17 @@ for (const artifact of requiredArtifacts) {
     await access(absolutePath, constants.R_OK);
   } catch {
     missing.push(artifact);
+    continue;
+  }
+
+  if (artifact.minBytes != null) {
+    const { size } = await stat(absolutePath);
+    if (size < artifact.minBytes) {
+      invalid.push({
+        ...artifact,
+        size,
+      });
+    }
   }
 }
 
@@ -44,5 +58,16 @@ if (missing.length > 0) {
   process.exit(1);
 }
 
-console.log('Packaging guard passed: native + PWA artifacts are present.');
+if (invalid.length > 0) {
+  console.error('Packaging guard failed: wasm binary looks like a scaffold build.');
+  for (const artifact of invalid) {
+    console.error(
+      `- ${artifact.path} is ${artifact.size} bytes (expected at least ${artifact.minBytes} for embedded llama.cpp)`,
+    );
+  }
+  console.error('');
+  console.error('Run `npm run build:pwa` to rebuild embedded wasm assets.');
+  process.exit(1);
+}
 
+console.log('Packaging guard passed: native + PWA artifacts are present.');

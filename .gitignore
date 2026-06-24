@@ -142,3 +142,7 @@ Desktop.ini
 
 # Local package artifacts
 llama-cpp-capacitor-0.2.0-rc.0.tgz
+
+# Legacy / local wasm build outputs (shipped artifacts live in dist/wasm and src-rust/pkg)
+src-rust/pkg-embed/
+src-rust/target/wasm32-unknown-unknown/
