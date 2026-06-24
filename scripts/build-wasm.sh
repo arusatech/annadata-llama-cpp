@@ -114,10 +114,8 @@ if [[ "${LLAMA_WASM_EMBED_CPP:-0}" == "1" ]]; then
     --out-dir "$EMBED_OUT_DIR" \
     --out-name "$ENGINE_NAME" \
     "$TARGET_DIR/wasm32-unknown-emscripten/release/${ENGINE_NAME}.wasm"
-  echo "Embedded wasm compile check complete (browser ESM packaging not shipped yet):"
-  echo "  - $EMBED_OUT_DIR/library_bindgen.js"
-  echo "  - $EMBED_OUT_DIR/${ENGINE_NAME}_bg.wasm"
-  echo "PWA runtime assets must come from the standard wasm-pack build (npm run build:wasm)."
+  cd "$ROOT_DIR"
+  node ./scripts/package-embed-wasm.mjs
   exit 0
 else
   if ! command -v wasm-pack >/dev/null 2>&1; then

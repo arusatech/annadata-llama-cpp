@@ -2,7 +2,10 @@ import { mkdir, rm, copyFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 const root = resolve(process.cwd());
-const wasmPkgDir = resolve(root, 'src-rust', 'pkg');
+const useEmbed =
+  process.env.LLAMA_WASM_EMBED_CPP === '1' ||
+  process.env.LLAMA_WASM_EMBED_CPP === 'true';
+const wasmPkgDir = resolve(root, 'src-rust', useEmbed ? 'pkg-embed' : 'pkg');
 const targetDir = resolve(root, 'dist', 'wasm');
 const files = [
   'llama_engine.js',
@@ -19,4 +22,3 @@ for (const file of files) {
 
 console.log(`Copied wasm assets from ${wasmPkgDir} to ${targetDir}`);
 console.log('Expected runtime entrypoints: dist/wasm/llama_engine.js and dist/wasm/llama_engine.wasm');
-
