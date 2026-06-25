@@ -28,13 +28,16 @@ const engineName = 'llama_engine';
 const wasmPkgDir = resolve(root, 'src-rust', 'pkg');
 
 // Inputs produced by `wasm-bindgen --target no-modules`
-const wasmBgPath   = resolve(wasmPkgDir, `${engineName}_bg.wasm`);
-const noModJsPath  = resolve(wasmPkgDir, `${engineName}.js`);
+// NOTE: no-modules target emits `library_bindgen.js` (the Emscripten-aware glue)
+// and `llama_engine_bg.wasm`. It does NOT produce `llama_engine.js` — that is
+// only from --target web/bundler, which breaks on Emscripten .wasm.
+const wasmBgPath     = resolve(wasmPkgDir, `${engineName}_bg.wasm`);
+const noModJsPath    = resolve(wasmPkgDir, 'library_bindgen.js');
 
-// Outputs
+// Outputs (all written fresh by this script)
 const wasmOutPath  = resolve(wasmPkgDir, `${engineName}.wasm`);
-const jsOutPath    = resolve(wasmPkgDir, `${engineName}.js`);   // overwrites no-modules js
-const dtsOutPath   = resolve(wasmPkgDir, `${engineName}.d.ts`); // overwrites no-modules d.ts
+const jsOutPath    = resolve(wasmPkgDir, `${engineName}.js`);
+const dtsOutPath   = resolve(wasmPkgDir, `${engineName}.d.ts`);
 const pkgJsonPath  = resolve(wasmPkgDir, 'package.json');
 
 const fail = (msg) => { console.error(`[package-embed-wasm] ERROR: ${msg}`); process.exit(1); };
@@ -51,7 +54,7 @@ const requireFile = async (path, label) => {
 
 // ── 1. Verify inputs ───────────────────────────────────────────────────────
 await requireFile(wasmBgPath,  'wasm-bindgen binary (llama_engine_bg.wasm)');
-await requireFile(noModJsPath, 'wasm-bindgen no-modules JS (llama_engine.js)');
+await requireFile(noModJsPath, 'wasm-bindgen no-modules glue (library_bindgen.js)');
 
 // ── 2. Rename _bg.wasm → llama_engine.wasm ────────────────────────────────
 await copyFile(wasmBgPath, wasmOutPath);
