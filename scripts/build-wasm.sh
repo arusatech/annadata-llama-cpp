@@ -92,13 +92,23 @@ cd "$RUST_DIR"
 echo "Stage 1: cargo build (wasm32-unknown-emscripten, SIDE_MODULE) ..."
 CARGO_TARGET_DIR="$TARGET_DIR" cargo build --release --target wasm32-unknown-emscripten
 
+# When all artifacts are already up-to-date, cargo skips the final link step and
+# never calls the linker wrapper.  Detect this by checking whether the capture file
+# was written; if not, touch lib.rs to bump its mtime and run a second build that
+# forces rustc to recompile the crate and invoke the linker.
+if [[ ! -f "$EMCC_ARGS_FILE" ]]; then
+  echo "Stage 1b: build was up-to-date (no re-link); forcing linker invocation..."
+  touch "$RUST_DIR/src/lib.rs"
+  CARGO_TARGET_DIR="$TARGET_DIR" cargo build --release --target wasm32-unknown-emscripten
+fi
+
 CARGO_WASM_PATH="$TARGET_DIR/wasm32-unknown-emscripten/release/${ENGINE_NAME}.wasm"
 if [[ ! -f "$CARGO_WASM_PATH" ]]; then
   echo "Error: expected cargo wasm binary not found at $CARGO_WASM_PATH"
   exit 1
 fi
 if [[ ! -f "$EMCC_ARGS_FILE" ]]; then
-  echo "Error: linker capture file not created at $EMCC_ARGS_FILE — emcc-capture-link.sh may not have run"
+  echo "Error: linker capture file not created at $EMCC_ARGS_FILE after forced re-link"
   exit 1
 fi
 
