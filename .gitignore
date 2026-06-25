@@ -148,3 +148,4 @@ llama-cpp-capacitor-*.tgz
 src-rust/target/
 src-rust/pkg/
 src-rust/pkg-embed/
+src-rust/pkg-test/
