@@ -18,6 +18,7 @@
       "default": "./dist/wasm/llama_engine.js"
     },
     "./wasm/llama_engine.wasm": "./dist/wasm/llama_engine.wasm",
+    "./wasm/llama_engine_emscripten.mjs": "./dist/wasm/llama_engine_emscripten.mjs",
     "./wasm/package.json": "./dist/wasm/package.json",
     "./dist/*": "./dist/*",
     "./package.json": "./package.json"

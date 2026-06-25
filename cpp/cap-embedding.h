@@ -23,6 +23,11 @@ void llama_embedding_unregister_context(int64_t contextId);
 // Note: The returned pointer is valid until the next call to this function on the same thread
 float* llama_embedding(int64_t contextId, const char* text, const char* paramsJson);
 
+// JSON wrapper for embedding — used by Rust FFI (ffi.rs).
+// Returns: C string with {"embedding": [f32, ...]} or {"embedding": []} on error.
+// Note: Returned pointer is valid until the next call on the same thread.
+const char* llama_embedding_json(int64_t contextId, const char* text, const char* paramsJson);
+
 #ifdef __cplusplus
 }
 #endif

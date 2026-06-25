@@ -1,11 +1,11 @@
-// C wrapper functions for iOS embedding support
-// These functions are loaded via dlsym in Swift
+// C wrapper functions for iOS and Wasm embedding support
 
 #include "cap-llama.h"
 #include "llama.h"
 #include "common.h"
 #include <cstring>
 #include <cmath>
+#include <string>
 #include <vector>
 #include <map>
 #include <mutex>
@@ -185,4 +185,40 @@ extern "C" float* llama_embedding(int64_t contextId, const char* text, const cha
     } catch (...) {
         return nullptr;
     }
+}
+
+// JSON wrapper used by Rust FFI (ffi.rs).
+// Returns {"embedding": [f32, ...]} as a thread-local C string.
+// The pointer is valid until the next call on the same thread.
+extern "C" const char* llama_embedding_json(int64_t contextId, const char* text, const char* paramsJson) {
+    static thread_local std::string json_buf;
+
+    // Resolve embedding dimension before delegating to llama_embedding.
+    int32_t n_embd = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_contexts_mutex);
+        auto it = g_contexts.find(contextId);
+        if (it != g_contexts.end() && it->second != nullptr && it->second->model != nullptr) {
+            n_embd = llama_model_n_embd(it->second->model);
+        }
+    }
+
+    float* floats = llama_embedding(contextId, text, paramsJson);
+    if (!floats || n_embd <= 0) {
+        json_buf = "{\"embedding\":[]}";
+        return json_buf.c_str();
+    }
+
+    json_buf.clear();
+    json_buf.reserve(16 + n_embd * 14);
+    json_buf += "{\"embedding\":[";
+    for (int i = 0; i < n_embd; ++i) {
+        if (i > 0) json_buf += ',';
+        // Use snprintf for portable float serialization.
+        char tmp[32];
+        std::snprintf(tmp, sizeof(tmp), "%.8g", static_cast<double>(floats[i]));
+        json_buf += tmp;
+    }
+    json_buf += "]}";
+    return json_buf.c_str();
 }

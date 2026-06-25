@@ -25,9 +25,16 @@ extern "C" {
         params_json: *const c_char,
     ) -> *const c_char;
 
-    /// Generate embeddings for input text
-    /// Returns JSON string with embedding vector
+    /// Generate embeddings for input text — returns raw float* (use llama_embedding_json instead)
     pub fn llama_embedding(
+        context_id: i64,
+        text: *const c_char,
+        params_json: *const c_char,
+    ) -> *mut f32;
+
+    /// Generate embeddings as JSON string {"embedding": [f32, ...]}
+    /// Safe wrapper over llama_embedding that serialises the float array and size.
+    pub fn llama_embedding_json(
         context_id: i64,
         text: *const c_char,
         params_json: *const c_char,
@@ -90,7 +97,7 @@ pub fn completion(context_id: i64, params_json: &str) -> Result<String, String> 
     }
 }
 
-/// Safe wrapper for embedding
+/// Safe wrapper for embedding — calls `llama_embedding_json` which returns a proper JSON string.
 pub fn embedding(context_id: i64, text: &str, params_json: &str) -> Result<Vec<f32>, String> {
     let text_cstr = CString::new(text)
         .map_err(|e| format!("Invalid text: {}", e))?;
@@ -98,7 +105,8 @@ pub fn embedding(context_id: i64, text: &str, params_json: &str) -> Result<Vec<f
         .map_err(|e| format!("Invalid params JSON: {}", e))?;
 
     unsafe {
-        let result_ptr = llama_embedding(context_id, text_cstr.as_ptr(), params_cstr.as_ptr());
+        let result_ptr =
+            llama_embedding_json(context_id, text_cstr.as_ptr(), params_cstr.as_ptr());
         if result_ptr.is_null() {
             return Err("Embedding returned null".to_string());
         }
@@ -108,7 +116,6 @@ pub fn embedding(context_id: i64, text: &str, params_json: &str) -> Result<Vec<f
             .to_str()
             .map_err(|e| format!("Invalid UTF-8 in embedding result: {}", e))?;
 
-        // Parse JSON response: {"embedding": [f32, f32, ...]}
         let json_result: serde_json::Value = serde_json::from_str(result_str)
             .map_err(|e| format!("Invalid JSON response: {}", e))?;
 

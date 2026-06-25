@@ -90,13 +90,29 @@ pub fn load_model(model_id: String, bytes: &[u8], opts_json: String) -> Result<(
         let params_json = serde_json::to_string(&ctx_params)
             .map_err(|e| JsValue::from_str(&format!("Failed to serialize params: {}", e)))?;
 
+        // On Emscripten (wasm build), write the model bytes into the virtual filesystem
+        // so that llama_init_context can open the file via the standard path API.
+        // bytes is the raw GGUF content passed from the browser (OPFS → ArrayBuffer → &[u8]).
+        #[cfg(target_os = "emscripten")]
+        {
+            use std::io::Write;
+            if let Some(parent) = std::path::Path::new(&ctx_params.model).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let mut f = std::fs::File::create(&ctx_params.model)
+                .map_err(|e| JsValue::from_str(&format!("MEMFS write failed: {}", e)))?;
+            f.write_all(bytes)
+                .map_err(|e| JsValue::from_str(&format!("MEMFS write failed: {}", e)))?;
+        }
+        #[cfg(not(target_os = "emscripten"))]
+        {
+            let _ = bytes;
+        }
+
         let context_id =
             ffi::init_context(&ctx_params.model, &params_json).map_err(|e| JsValue::from_str(&e))?;
 
         state.set_context(&model_id, context_id);
-
-        // bytes parameter is kept for future in-memory loading support
-        let _ = bytes;
         Ok(())
     }
 

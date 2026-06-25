@@ -1,44 +1,45 @@
 /**
  * package-embed-wasm.mjs
  *
- * Post-processes the output of `wasm-bindgen --target no-modules` (which is
- * compatible with the wasm32-unknown-emscripten Cargo target) and assembles
- * it into a browser-importable ES module that wasm.engine.ts can dynamic-import().
+ * Stage 5 of the wasm build pipeline.  Called by build-wasm.sh after the
+ * emcc MAIN_MODULE re-link (Stage 4) has produced:
+ *   src-rust/pkg/llama_engine_emscripten.mjs   — Emscripten JS runtime
+ *   src-rust/pkg/llama_engine_emscripten.wasm  — compiled wasm (llama.cpp + Rust)
  *
- * WHY --target no-modules and NOT --target web:
- *   The Cargo build uses wasm32-unknown-emscripten so that embedded llama.cpp
- *   C++ code has access to Emscripten's POSIX layer (malloc, file I/O, etc.).
- *   `wasm-bindgen --target web` cannot handle an Emscripten .wasm — it produces
- *   broken glue full of `import * as importN from "env"` lines.
- *   `--target no-modules` correctly emits the Emscripten-aware library_bindgen.js
- *   glue alongside the _bg.wasm binary.
+ * This script synthesises the public-facing pkg/ files:
+ *   llama_engine.wasm    → rename of llama_engine_emscripten.wasm
+ *   llama_engine.js      → thin ESM shim (imports createLlamaModule and re-exports)
+ *   llama_engine.d.ts    → TypeScript declarations
+ *   package.json         → sub-package manifest
  *
- * What this script produces in src-rust/pkg/:
- *   llama_engine.wasm   — the Wasm binary (renamed from _bg.wasm)
- *   llama_engine.js     — ES module wrapper (synthesised from no-modules glue)
- *   llama_engine.d.ts   — clean public TypeScript declarations
- *   package.json        — sub-package manifest
+ * The shim pattern is required because wasm.engine.ts dynamic-imports
+ * llama_engine.js and expects:
+ *   mod.default()         — async, initialises the wasm module
+ *   mod.init()            — Rust-level engine init  (set by initBindgen/addOnInit)
+ *   mod.load_model(...)   — synchronous after init
+ *   mod.generate(...)     — synchronous after init
+ *   mod.embed(...)        — synchronous after init
+ *   mod.health()          — synchronous after init
+ *   mod.memory_snapshot() — synchronous after init
+ *   mod.unload_model(...) — synchronous after init
  */
 
 import { readFile, rm, writeFile, copyFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
-const root = resolve(process.cwd());
-const engineName = 'llama_engine';
-const wasmPkgDir = resolve(root, 'src-rust', 'pkg');
+const root        = resolve(process.cwd());
+const engineName  = 'llama_engine';
+const wasmPkgDir  = resolve(root, 'src-rust', 'pkg');
 
-// Inputs produced by `wasm-bindgen --target no-modules`
-// NOTE: no-modules target emits `library_bindgen.js` (the Emscripten-aware glue)
-// and `llama_engine_bg.wasm`. It does NOT produce `llama_engine.js` — that is
-// only from --target web/bundler, which breaks on Emscripten .wasm.
-const wasmBgPath     = resolve(wasmPkgDir, `${engineName}_bg.wasm`);
-const noModJsPath    = resolve(wasmPkgDir, 'library_bindgen.js');
+// ── Inputs (produced by Stage 4 emcc MAIN_MODULE link) ─────────────────────
+const emscriptenMjs  = resolve(wasmPkgDir, `${engineName}_emscripten.mjs`);
+const emscriptenWasm = resolve(wasmPkgDir, `${engineName}_emscripten.wasm`);
 
-// Outputs (all written fresh by this script)
-const wasmOutPath  = resolve(wasmPkgDir, `${engineName}.wasm`);
-const jsOutPath    = resolve(wasmPkgDir, `${engineName}.js`);
-const dtsOutPath   = resolve(wasmPkgDir, `${engineName}.d.ts`);
-const pkgJsonPath  = resolve(wasmPkgDir, 'package.json');
+// ── Outputs ─────────────────────────────────────────────────────────────────
+const wasmOutPath   = resolve(wasmPkgDir, `${engineName}.wasm`);
+const jsOutPath     = resolve(wasmPkgDir, `${engineName}.js`);
+const dtsOutPath    = resolve(wasmPkgDir, `${engineName}.d.ts`);
+const pkgJsonPath   = resolve(wasmPkgDir, 'package.json');
 
 const fail = (msg) => { console.error(`[package-embed-wasm] ERROR: ${msg}`); process.exit(1); };
 
@@ -52,163 +53,196 @@ const requireFile = async (path, label) => {
   }
 };
 
-// ── 1. Verify inputs ───────────────────────────────────────────────────────
-await requireFile(wasmBgPath,  'wasm-bindgen binary (llama_engine_bg.wasm)');
-await requireFile(noModJsPath, 'wasm-bindgen no-modules glue (library_bindgen.js)');
+// ── 1. Verify emcc outputs exist ─────────────────────────────────────────────
+await requireFile(emscriptenMjs,  'emcc ESM runtime (llama_engine_emscripten.mjs)');
+await requireFile(emscriptenWasm, 'emcc wasm binary (llama_engine_emscripten.wasm)');
 
-// ── 2. Rename _bg.wasm → llama_engine.wasm ────────────────────────────────
-await copyFile(wasmBgPath, wasmOutPath);
-await rm(wasmBgPath, { force: true });
-
-// ── 3. Read the no-modules glue produced by wasm-bindgen ──────────────────
-// It is an IIFE that sets up wasm_bindgen on globalThis.  We extract the
-// inner body and re-export it as a proper ES module.
-const noModSrc = await readFile(noModJsPath, 'utf8');
-
-// ── 4. Synthesise an ES module wrapper ────────────────────────────────────
-//
-// The no-modules output looks like:
-//   let wasm_bindgen; (function() { ... wasm_bindgen = Object.assign(init, { ... }); })();
-//
-// We wrap this in an ES module that:
-//   a) Embeds the no-modules glue verbatim in a local scope
-//   b) Exposes init as `export default` (matches the WasmModule.default type)
-//   c) Re-exports each named function (init, load_model, generate, embed, etc.)
-//
-// The default export replaces the .wasm URL token so the caller can pass a
-// custom path/fetch Response, matching wasm-bindgen's standard web API.
-
-const esModuleWrapper = `/* @ts-self-types="./llama_engine.d.ts" */
-/* Auto-generated by package-embed-wasm.mjs — do not edit */
-
-// ── Embedded no-modules glue (wasm-bindgen --target no-modules) ──────────
-let __wbg;
-(function () {
-  // Redirect the global assignment so it stays module-local.
-  const _global = typeof globalThis !== 'undefined' ? globalThis : self;
-  const _prev = _global.wasm_bindgen;
-
-${noModSrc.replace(`${engineName}.wasm`, `${engineName}.wasm`)}
-
-  __wbg = _global.wasm_bindgen;
-  if (typeof _prev === 'undefined') delete _global.wasm_bindgen;
-  else _global.wasm_bindgen = _prev;
-})();
-
-// ── Default export: initialise the module ────────────────────────────────
-// Resolves the .wasm URL relative to this JS file when no argument is given.
-export default async function init(moduleOrPath) {
-  if (moduleOrPath === undefined) {
-    moduleOrPath = new URL('./${engineName}.wasm', import.meta.url);
-  }
-  await __wbg(moduleOrPath);
+const emscriptenWasmBytes = (await readFile(emscriptenWasm)).byteLength;
+const MIN_EMBEDDED_BYTES  = 1_000_000;
+if (emscriptenWasmBytes < MIN_EMBEDDED_BYTES) {
+  fail(
+    `llama_engine_emscripten.wasm is only ${emscriptenWasmBytes} bytes — ` +
+    `expected at least ${MIN_EMBEDDED_BYTES} for a build with embedded llama.cpp. ` +
+    `Ensure Stage 4 (emcc MAIN_MODULE re-link) succeeded.`,
+  );
 }
 
-// ── Named exports (public API surface) ───────────────────────────────────
-export function wasm_init()                              { return __wbg.init(); }
-export const init_engine = wasm_init;
-export function load_model(model_id, bytes, opts_json)  { return __wbg.load_model(model_id, bytes, opts_json); }
-export function unload_model(model_id)                  { return __wbg.unload_model(model_id); }
-export function generate(model_id, req_json)             { return __wbg.generate(model_id, req_json); }
-export function embed(model_id, req_json)                { return __wbg.embed(model_id, req_json); }
-export function health()                                 { return __wbg.health(); }
-export function memory_snapshot()                        { return __wbg.memory_snapshot(); }
+// ── 2. llama_engine.wasm = the emcc-produced wasm ────────────────────────────
+await copyFile(emscriptenWasm, wasmOutPath);
+
+// ── 3. Synthesise ESM shim (llama_engine.js) ─────────────────────────────────
+//
+// The shim:
+//   a) Imports createLlamaModule from the emcc runtime (llama_engine_emscripten.mjs).
+//   b) Resolves the .wasm URL relative to import.meta.url so bundlers and CDNs
+//      can relocate the asset directory.
+//   c) Exposes export default init() which awaits the module and stores it in _mod.
+//   d) Re-exports each named function as a thin synchronous wrapper over the
+//      corresponding Module.* property that library_bindgen.js/initBindgen sets up.
+//
+// Timing guarantee:
+//   Emscripten's addOnInit() callback (initBindgen inside library_bindgen.js)
+//   fires after the main module wasm is instantiated and after preRun hooks
+//   have completed.  With MODULARIZE=1 the returned Promise resolves only when
+//   addOnInit callbacks are done, so all Module.* properties are set by the time
+//   `await createLlamaModule()` returns.
+//
+const shimSrc = `/* @ts-self-types="./llama_engine.d.ts" */
+/* Auto-generated by package-embed-wasm.mjs — do not edit */
+import createLlamaModule from './${engineName}_emscripten.mjs';
+
+let _mod = null;
+
+// ── Default export: loads and instantiates the WebAssembly module ─────────────
+// wasm.engine.ts calls: await mod.default()
+// Named "initWasm" internally so the "init" named export (below) can remain
+// unambiguously the Rust-level engine initialiser (mod.init).
+export default async function initWasm(_pathHint) {
+  if (_mod) return _mod;
+  _mod = await createLlamaModule({
+    // Resolve assets relative to this JS file so the module works regardless
+    // of where the dist/wasm/ directory is served from.
+    locateFile: (filename) => new URL(filename, import.meta.url).href,
+  });
+  return _mod;
+}
+
+// ── Named exports (synchronous; safe to call after await initWasm()) ─────────
+// These match the wasm-bindgen function names that initBindgen assigns to Module.*
+
+/** Rust-level engine init — must be called once after the default export resolves. */
+export function init() {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  return _mod.init();
+}
+
+/** Load a GGUF model from bytes. */
+export function load_model(model_id, bytes, opts_json) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  return _mod.load_model(model_id, bytes, opts_json);
+}
+
+/** Unload a loaded model and release resources. */
+export function unload_model(model_id) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  return _mod.unload_model(model_id);
+}
+
+/** Run text generation. Returns JSON GenerateResponse. */
+export function generate(model_id, req_json) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  return _mod.generate(model_id, req_json);
+}
+
+/** Generate embeddings. Returns JSON EmbedResponse. */
+export function embed(model_id, req_json) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  return _mod.embed(model_id, req_json);
+}
+
+/** Return engine health as a JSON string. */
+export function health() {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  return _mod.health();
+}
+
+/** Return memory usage as a JSON string. */
+export function memory_snapshot() {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  return _mod.memory_snapshot();
+}
 `;
+await writeFile(jsOutPath, shimSrc);
 
-await writeFile(jsOutPath, esModuleWrapper);
-
-// ── 5. Write clean TypeScript declarations ────────────────────────────────
-const dtsContent = `/* @ts-self-types="./llama_engine.d.ts" */
+// ── 4. TypeScript declarations ────────────────────────────────────────────────
+const dtsSrc = `/* @ts-self-types="./llama_engine.d.ts" */
 /* eslint-disable */
 /* tslint:disable */
 
 /**
- * Public API surface of the llama_engine Wasm module.
- * Matches the interface consumed by src/workers/wasm.engine.ts.
+ * Public API of the llama_engine Wasm module.
+ * Consumed by src/workers/wasm.engine.ts.
  */
 
-/** Initialize the Wasm engine. Must be called before any other operations. Throws on failure. */
-export function wasm_init(): void;
-export { wasm_init as init_engine };
+/** Rust-level engine initialiser — call once after the default export resolves. */
+export function init(): void;
 
-/** Load a GGUF model from raw bytes. Throws on failure. */
+/** Load a GGUF model from raw bytes. */
 export function load_model(model_id: string, bytes: Uint8Array, opts_json: string): void;
 
-/** Unload a previously loaded model and release resources. Throws on failure. */
+/** Unload a loaded model and free resources. */
 export function unload_model(model_id: string): void;
 
-/** Generate text. Returns JSON-serialised GenerateResponse. Throws on failure. */
+/** Run text generation. Returns JSON-serialised GenerateResponse. */
 export function generate(model_id: string, req_json: string): string;
 
-/** Generate embeddings. Returns JSON-serialised EmbedResponse. Throws on failure. */
+/** Generate text embeddings. Returns JSON-serialised EmbedResponse. */
 export function embed(model_id: string, req_json: string): string;
 
-/** Return engine health status as a JSON string. */
+/** Engine health status as a JSON string. */
 export function health(): string;
 
-/** Return current memory usage as a JSON string. */
+/** Current memory usage as a JSON string. */
 export function memory_snapshot(): string;
 
 /**
- * Default export: initialise the Wasm module.
- * When called without an argument the .wasm is resolved via import.meta.url.
+ * Default export — loads and instantiates the WebAssembly module.
+ * Resolves the .wasm binary relative to import.meta.url when called without arguments.
  */
-export default function init(
-  moduleOrPath?: RequestInfo | URL | Response | BufferSource | WebAssembly.Module,
-): Promise<void>;
+export default function initWasm(
+  pathHint?: string | URL,
+): Promise<unknown>;
 `;
+await writeFile(dtsOutPath, dtsSrc);
 
-await writeFile(dtsOutPath, dtsContent);
-
-// ── 6. Write package.json ─────────────────────────────────────────────────
+// ── 5. package.json ───────────────────────────────────────────────────────────
 const pkgJson = {
   name: engineName,
   type: 'module',
-  description: 'Embedded llama.cpp Wasm runtime for llama-cpp-capacitor web/PWA',
+  description: 'Embedded llama.cpp Wasm runtime for llama-cpp-capacitor (web/PWA)',
   version: '0.1.0',
   license: 'MIT',
-  files: [`${engineName}.wasm`, `${engineName}.js`, `${engineName}.d.ts`],
+  files: [
+    `${engineName}.wasm`,
+    `${engineName}.js`,
+    `${engineName}.d.ts`,
+    `${engineName}_emscripten.mjs`,
+  ],
   main: `${engineName}.js`,
   types: `${engineName}.d.ts`,
   sideEffects: [],
 };
 await writeFile(pkgJsonPath, `${JSON.stringify(pkgJson, null, 2)}\n`);
 
-// ── 7. Clean up stale side-files ──────────────────────────────────────────
+// ── 6. Clean up wasm-bindgen side files we no longer ship ────────────────────
+// Note: llama_engine.d.ts is NOT in this list — we already wrote our own above.
 const stale = [
   resolve(wasmPkgDir, 'library_bindgen.js'),
+  resolve(wasmPkgDir, `${engineName}_bg.wasm`),
   resolve(wasmPkgDir, `${engineName}_bg.wasm.d.ts`),
-  resolve(wasmPkgDir, `${engineName}_emscripten.mjs`),
-  resolve(wasmPkgDir, `${engineName}_emscripten.wasm`),
 ];
 for (const p of stale) { await rm(p, { force: true }); }
 
-// ── 8. Final validation ───────────────────────────────────────────────────
-await requireFile(jsOutPath,   'ES module JS wrapper');
-await requireFile(wasmOutPath, 'Wasm binary');
-await requireFile(dtsOutPath,  'TypeScript declarations');
-await requireFile(pkgJsonPath, 'package manifest');
+// ── 7. Final validation ───────────────────────────────────────────────────────
+await requireFile(jsOutPath,      'ESM shim (llama_engine.js)');
+await requireFile(wasmOutPath,    'wasm binary (llama_engine.wasm)');
+await requireFile(dtsOutPath,     'TypeScript declarations (llama_engine.d.ts)');
+await requireFile(pkgJsonPath,    'package manifest (package.json)');
+await requireFile(emscriptenMjs,  'emcc runtime (llama_engine_emscripten.mjs)');
 
 const finalJs = await readFile(jsOutPath, 'utf8');
-
-// Must not contain the broken Emscripten import pattern.
-if (/^import\s+\*\s+as\s+import\d+\s+from\s+["']env["']/m.test(finalJs.slice(0, 4096))) {
-  fail(
-    'Generated JS still contains broken Emscripten import lines.\n' +
-    'Ensure build-wasm.sh passes --target no-modules to wasm-bindgen, not --target web.',
-  );
+if (/import\s+\*\s+as\s+import\d+\s+from\s+["']env["']/m.test(finalJs.slice(0, 4096))) {
+  fail('Generated JS contains broken Emscripten import lines — Stage 4 may have failed.');
 }
-
-// Must have a default export and named exports.
-if (!finalJs.includes('export default') || !finalJs.includes('export function load_model')) {
+if (!finalJs.includes('export default') || !finalJs.includes('export function init') || !finalJs.includes('export function load_model')) {
   fail('Generated JS is missing expected ES module exports.');
 }
-
-if (!finalJs.includes(`${engineName}.wasm`)) {
-  fail(`Generated JS does not reference ${engineName}.wasm`);
+if (!finalJs.includes(`${engineName}_emscripten.mjs`)) {
+  fail(`Generated JS does not import ${engineName}_emscripten.mjs`);
 }
 
 console.log('[package-embed-wasm] Wasm package ready:');
-console.log(`  JS  : ${jsOutPath}`);
-console.log(`  Wasm: ${wasmOutPath}`);
-console.log(`  d.ts: ${dtsOutPath}`);
+console.log(`  Shim : ${jsOutPath}`);
+console.log(`  Wasm : ${wasmOutPath}  (${emscriptenWasmBytes.toLocaleString()} bytes)`);
+console.log(`  ESM  : ${emscriptenMjs}`);
+console.log(`  d.ts : ${dtsOutPath}`);

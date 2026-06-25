@@ -4,10 +4,15 @@ import { resolve } from 'node:path';
 const root = resolve(process.cwd());
 const wasmPkgDir = resolve(root, 'src-rust', 'pkg');
 const targetDir = resolve(root, 'dist', 'wasm');
+
+// llama_engine.js + llama_engine.wasm are the public entrypoints.
+// llama_engine_emscripten.mjs is the Emscripten JS runtime loaded by the shim.
+// The _emscripten.wasm is already represented by llama_engine.wasm (same file).
 const files = [
   'llama_engine.js',
   'llama_engine.wasm',
   'llama_engine.d.ts',
+  'llama_engine_emscripten.mjs',
   'package.json',
 ];
 
@@ -18,4 +23,6 @@ for (const file of files) {
 }
 
 console.log(`Copied wasm assets from ${wasmPkgDir} to ${targetDir}`);
-console.log('Expected runtime entrypoints: dist/wasm/llama_engine.js and dist/wasm/llama_engine.wasm');
+console.log('Public entrypoint : dist/wasm/llama_engine.js');
+console.log('Wasm binary       : dist/wasm/llama_engine.wasm');
+console.log('Emscripten runtime: dist/wasm/llama_engine_emscripten.mjs');
