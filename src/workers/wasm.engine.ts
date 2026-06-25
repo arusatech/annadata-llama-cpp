@@ -32,7 +32,15 @@ export type WasmEngine = {
 };
 
 type WasmModule = {
+  /** Default export: loads and initialises the .wasm binary. */
   default?: (moduleOrPath?: string | URL | Request | Response | BufferSource | WebAssembly.Module) => Promise<unknown>;
+  /**
+   * Engine-level init (wasm_bindgen export named `init` in Rust).
+   * Exported as `init_engine` / `wasm_init` in the ES module wrapper to avoid
+   * colliding with the wasm-module-load default export.
+   */
+  init_engine?: () => void;
+  /** @deprecated use init_engine — kept for backwards compat with older builds */
   init?: () => void;
   load_model?: (modelId: string, bytes: Uint8Array, optsJson: string) => void;
   unload_model?: (modelId: string) => void;
@@ -94,7 +102,9 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
 
   return {
     init: async () => {
-      mod.init?.();
+      // init_engine is the Rust #[wasm_bindgen] pub fn init() export.
+      // Older builds may still expose it as `init`; fall back gracefully.
+      (mod.init_engine ?? mod.init)?.();
     },
     loadModel: async (modelId, modelBuffer, opts) => {
       const loadModel = mod.load_model;

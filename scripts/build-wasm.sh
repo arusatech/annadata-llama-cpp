@@ -88,10 +88,20 @@ if [[ ! -f "$CARGO_WASM_PATH" ]]; then
   exit 1
 fi
 
+# NOTE: The Cargo target is wasm32-unknown-emscripten because the embedded
+# llama.cpp C++ sources need Emscripten's POSIX layer (malloc, file I/O, etc.).
+# This means we CANNOT use `wasm-bindgen --target web` — that target expects a
+# wasm32-unknown-unknown binary and produces broken glue (hundreds of
+# `import * as importN from "env"` lines) when given an Emscripten .wasm.
+#
+# Instead we use `--target no-modules` which produces an Emscripten-compatible
+# library_bindgen.js glue file plus the _bg.wasm.  package-embed-wasm.mjs then
+# assembles those into a valid ES module wrapper that browsers can import().
+
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 wasm-bindgen \
-  --target web \
+  --target no-modules \
   --out-dir "$OUT_DIR" \
   --out-name "$ENGINE_NAME" \
   "$CARGO_WASM_PATH"
