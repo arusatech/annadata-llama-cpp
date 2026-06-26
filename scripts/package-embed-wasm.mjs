@@ -108,6 +108,25 @@ export default async function initWasm(_pathHint) {
       const name = filename === '${engineName}_emscripten.wasm' ? '${engineName}.wasm' : filename;
       return new URL(name, import.meta.url).href;
     },
+    // The WASM binary imports wasm-bindgen helpers from "__wbindgen_placeholder__"
+    // but Emscripten's addToLibrary places them all under the "env" key.
+    // Alias the module so WebAssembly.instantiate receives the expected key.
+    instantiateWasm: (imports, successCallback) => {
+      const wasmUrl = new URL('${engineName}.wasm', import.meta.url).href;
+      const patchedImports = {
+        ...imports,
+        '__wbindgen_placeholder__': imports['env'] ?? {},
+      };
+      WebAssembly.instantiateStreaming(fetch(wasmUrl), patchedImports)
+        .catch(() =>
+          fetch(wasmUrl)
+            .then(r => r.arrayBuffer())
+            .then(bytes => WebAssembly.instantiate(bytes, patchedImports))
+        )
+        .then(result => successCallback(result.instance, result.module))
+        .catch(err => { throw err; });
+      return {}; // Emscripten requires a synchronous {} return
+    },
   });
   return _mod;
 }
