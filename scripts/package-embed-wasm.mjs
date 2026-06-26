@@ -67,6 +67,21 @@ if (emscriptenWasmBytes < MIN_EMBEDDED_BYTES) {
   );
 }
 
+// ── 1b. Patch emcc ESM runtime: optional-chain __wbindgen_start ──────────────
+// The emscripten MAIN_MODULE target does not export __wbindgen_start (unlike
+// wasm32-unknown-unknown builds). library_bindgen.js calls it unconditionally,
+// so we patch the mjs here to avoid a TypeError at module init time.
+{
+  let mjsSrc = await readFile(emscriptenMjs, 'utf8');
+  const ORIG = 'wasmExports.__wbindgen_start();';
+  const PATCHED = 'wasmExports.__wbindgen_start?.();';
+  if (mjsSrc.includes(ORIG)) {
+    mjsSrc = mjsSrc.replace(ORIG, PATCHED);
+    await writeFile(emscriptenMjs, mjsSrc);
+    console.log('[package-embed-wasm] Patched __wbindgen_start → optional chain');
+  }
+}
+
 // ── 2. llama_engine.wasm = the emcc-produced wasm ────────────────────────────
 await copyFile(emscriptenWasm, wasmOutPath);
 
@@ -122,10 +137,126 @@ export default async function initWasm(_pathHint) {
     // Alias the module so WebAssembly.instantiate receives the expected key.
     instantiateWasm: (imports, successCallback) => {
       const wasmUrl = new URL('${engineName}.wasm', import.meta.url).href;
+      // wasm-bindgen externref xform: manages a growable JS-side index space
+      // for externref table slots. Indices are tracked with a monotonic counter;
+      // the Emscripten runtime's heap handles actual JS object storage.
+      let _extRefNextIdx = 128; // skip wasm-bindgen's pre-filled reserved slots
+      const extRefXform = {
+        __wbindgen_externref_table_grow: (delta) => {
+          const prev = _extRefNextIdx;
+          _extRefNextIdx += delta;
+          return prev;
+        },
+        __wbindgen_externref_table_set_null: (_idx) => {},
+      };
+
+      // The MAIN_MODULE binary was originally a SIDE_MODULE: it imports ggml
+      // quantisation functions via GOT.func even though those functions are
+      // compiled into the same binary (as "_generic" suffixed exports).
+      // Emscripten's reportUndefinedSymbols crashes when GOT entries that are
+      // marked "required" cannot be resolved.  We fix this in two steps:
+      //
+      // 1. Wrap GOT.func/GOT.mem so every entry is marked weak (required=false).
+      //    This stops the GL/AL/console stubs (never called by llama inference)
+      //    from crashing reportUndefinedSymbols.
+      //
+      // 2. After instantiation, grow __indirect_function_table by one slot per
+      //    ggml symbol, store the "_generic" function there, and write that slot
+      //    index into the GOT global before calling successCallback.
+      //    Emscripten's updateGOT sees value != -1 and leaves them untouched.
+      const gotGlobals = {};
+      const weakenGOT = (proxy) => new Proxy({}, {
+        get(_, symName) {
+          if (typeof symName !== 'string') return undefined;
+          const global = proxy[symName];
+          if (global instanceof WebAssembly.Global) {
+            global.required = false;
+            gotGlobals[symName] = global;
+          }
+          return global;
+        },
+      });
+
+      // GOT.func symbol → exported "_generic" implementation present in the binary.
+      const FUNC_ALIASES = {
+        'lm_ggml_vec_dot_q4_0_q8_0': 'lm_ggml_vec_dot_q4_0_q8_0_generic',
+        'lm_ggml_vec_dot_q5_0_q8_0': 'lm_ggml_vec_dot_q5_0_q8_0_generic',
+        'lm_ggml_vec_dot_q5_1_q8_1': 'lm_ggml_vec_dot_q5_1_q8_1_generic',
+        'quantize_row_q8_0':          'quantize_row_q8_0_generic',
+        'lm_ggml_vec_dot_q8_0_q8_0': 'lm_ggml_vec_dot_q8_0_q8_0_generic',
+        'quantize_row_q8_1':          'quantize_row_q8_1_generic',
+        'lm_ggml_vec_dot_q2_K_q8_K': 'lm_ggml_vec_dot_q2_K_q8_K_generic',
+        'lm_ggml_vec_dot_q3_K_q8_K': 'lm_ggml_vec_dot_q3_K_q8_K_generic',
+        'lm_ggml_vec_dot_q4_K_q8_K': 'lm_ggml_vec_dot_q4_K_q8_K_generic',
+        'lm_ggml_vec_dot_q5_K_q8_K': 'lm_ggml_vec_dot_q5_K_q8_K_generic',
+        'lm_ggml_vec_dot_q6_K_q8_K': 'lm_ggml_vec_dot_q6_K_q8_K_generic',
+        'quantize_row_q8_K':          'quantize_row_q8_K_generic',
+      };
+
       const patchedImports = {
         ...imports,
         '__wbindgen_placeholder__': imports['env'] ?? {},
+        '__wbindgen_externref_xform__': extRefXform,
+        'GOT.func': weakenGOT(imports['GOT.func']),
+        'GOT.mem':  weakenGOT(imports['GOT.mem']),
       };
+
+      const patchGOTAndCall = (result) => {
+        const exports = result.instance.exports;
+        const table = exports.__indirect_function_table;
+        if (table) {
+          for (const [gotSym, exportSym] of Object.entries(FUNC_ALIASES)) {
+            const fn = exports[exportSym];
+            if (fn && gotGlobals[gotSym]) {
+              const idx = table.grow(1);
+              table.set(idx, fn);
+              gotGlobals[gotSym].value = idx;
+            }
+          }
+        }
+
+        // instance.exports is a sealed object — we cannot add properties to it.
+        // The emscripten MAIN_MODULE does not export the wasm-bindgen ABI shims
+        // that library_bindgen.js expects under these names.  Proxy the instance
+        // so that wasmExports = instance.exports inside receiveInstance picks
+        // up a patched view that adds the missing symbols transparently.
+        const sp = exports.__stack_pointer; // mutable i32 global (shadow stack)
+        let cachedExportsProxy = null;
+        const patchedInstance = new Proxy(result.instance, {
+          get(target, prop) {
+            if (prop !== 'exports') return target[prop];
+            if (!cachedExportsProxy) {
+              cachedExportsProxy = new Proxy(target.exports, {
+                get(ex, p) {
+                  switch (p) {
+                    // Shadow-stack allocator used by wasm-bindgen ABI
+                    case '__wbindgen_add_to_stack_pointer':
+                      return (delta) => {
+                        const v = (sp.value + delta) | 0;
+                        sp.value = v;
+                        return v;
+                      };
+                    // wasm-bindgen canonical export aliases → actual WASM exports
+                    case '__wbindgen_export2': return ex.__wbindgen_malloc;
+                    case '__wbindgen_export3': return ex.__wbindgen_realloc;
+                    case '__wbindgen_export4': return ex.__wbindgen_free;
+                    // handleError in wasm-bindgen emscripten glue calls
+                    // wasm.__wbindgen_export(heapIdx) to store a caught JS
+                    // exception so Rust can retrieve it via the error out-ptr.
+                    // The actual WASM export is __wbindgen_exn_store.
+                    case '__wbindgen_export': return ex.__wbindgen_exn_store;
+                    default: return ex[p];
+                  }
+                },
+              });
+            }
+            return cachedExportsProxy;
+          },
+        });
+
+        successCallback(patchedInstance, result.module);
+      };
+
       const reportInstantiateFailure = (err) => {
         const error = err instanceof Error ? err : new Error(String(err));
         rejectWasmInstantiate(error);
@@ -141,7 +272,7 @@ export default async function initWasm(_pathHint) {
             })
             .then((bytes) => WebAssembly.instantiate(bytes, patchedImports))
         )
-        .then((result) => successCallback(result.instance, result.module))
+        .then(patchGOTAndCall)
         .catch(reportInstantiateFailure);
       return {}; // Emscripten requires a synchronous {} return
     },

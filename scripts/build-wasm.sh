@@ -143,10 +143,15 @@ PATCHED_GLUE="$OUT_DIR/library_bindgen_patched.js"
 node -e "
 const { readFileSync, writeFileSync } = require('fs');
 let src = readFileSync(process.argv[1], 'utf8');
+// Remove the 'memory' addToLibrary entry (references the linker-level 'memory' symbol
+// which is undefined when library_bindgen.js is evaluated as a --js-library).
 src = src.replace(
   /addToLibrary\(\{\s*memory:\s*memory\s*\|\|\s*new WebAssembly\.Memory\([^)]+\),\s*\}\);/g,
   ''
 );
+// Use optional chaining for __wbindgen_start: the emscripten MAIN_MODULE target
+// does not export __wbindgen_start (unlike wasm32-unknown-unknown targets).
+src = src.replace('wasmExports.__wbindgen_start();', 'wasmExports.__wbindgen_start?.();');
 writeFileSync(process.argv[2], src);
 " "$LIBRARY_BINDGEN" "$PATCHED_GLUE"
 
