@@ -99,7 +99,16 @@ let _mod = null;
 // unambiguously the Rust-level engine initialiser (mod.init).
 export default async function initWasm(_pathHint) {
   if (_mod) return _mod;
-  _mod = await createLlamaModule({
+
+  // Emscripten's instantiateWasm hook has no failure callback — if instantiation
+  // fails we must reject this outer promise via Promise.race (never throw from
+  // the async chain inside instantiateWasm or the module hangs forever).
+  let rejectWasmInstantiate;
+  const wasmInstantiateFailed = new Promise((_, reject) => {
+    rejectWasmInstantiate = reject;
+  });
+
+  const modulePromise = createLlamaModule({
     // Resolve assets relative to this JS file so the module works regardless
     // of where the dist/wasm/ directory is served from.
     // Emscripten requests 'llama_engine_emscripten.wasm' but we ship the
@@ -117,17 +126,28 @@ export default async function initWasm(_pathHint) {
         ...imports,
         '__wbindgen_placeholder__': imports['env'] ?? {},
       };
+      const reportInstantiateFailure = (err) => {
+        const error = err instanceof Error ? err : new Error(String(err));
+        rejectWasmInstantiate(error);
+      };
       WebAssembly.instantiateStreaming(fetch(wasmUrl), patchedImports)
         .catch(() =>
           fetch(wasmUrl)
-            .then(r => r.arrayBuffer())
-            .then(bytes => WebAssembly.instantiate(bytes, patchedImports))
+            .then((r) => {
+              if (!r.ok) {
+                throw new Error(\`Failed to fetch wasm: \${r.status} \${r.statusText}\`);
+              }
+              return r.arrayBuffer();
+            })
+            .then((bytes) => WebAssembly.instantiate(bytes, patchedImports))
         )
-        .then(result => successCallback(result.instance, result.module))
-        .catch(err => { throw err; });
+        .then((result) => successCallback(result.instance, result.module))
+        .catch(reportInstantiateFailure);
       return {}; // Emscripten requires a synchronous {} return
     },
   });
+
+  _mod = await Promise.race([modulePromise, wasmInstantiateFailed]);
   return _mod;
 }
 
