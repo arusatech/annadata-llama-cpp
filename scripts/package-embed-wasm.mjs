@@ -102,7 +102,12 @@ export default async function initWasm(_pathHint) {
   _mod = await createLlamaModule({
     // Resolve assets relative to this JS file so the module works regardless
     // of where the dist/wasm/ directory is served from.
-    locateFile: (filename) => new URL(filename, import.meta.url).href,
+    // Emscripten requests 'llama_engine_emscripten.wasm' but we ship the
+    // MAIN_MODULE binary under the stable name 'llama_engine.wasm'.
+    locateFile: (filename) => {
+      const name = filename === '${engineName}_emscripten.wasm' ? '${engineName}.wasm' : filename;
+      return new URL(name, import.meta.url).href;
+    },
   });
   return _mod;
 }
