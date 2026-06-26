@@ -1,5 +1,8 @@
 import type { WorkerEvent, WorkerRequest } from './worker.protocol';
 import { loadLlamaWasmEngine, type WasmEngine } from './wasm.engine';
+// readModelBufferFromOpfs reads from OPFS inside the worker so the buffer
+// is never created on the main thread, halving peak memory usage (#9).
+import { readModelBufferFromOpfs } from '../storage/opfs.store';
 
 type GenerateResult = {
   text: string;
@@ -33,24 +36,14 @@ const ensureEngine = (): WasmEngine => {
   return state.engine;
 };
 
-const splitTokenFallback = (text: string): string[] => {
-  if (!text) return [];
-  const parts: string[] = [];
-  let chunk = '';
-  for (const ch of text) {
-    chunk += ch;
-    if (ch === ' ' || ch === '\n' || chunk.length >= 16) {
-      parts.push(chunk);
-      chunk = '';
-    }
-  }
-  if (chunk) parts.push(chunk);
-  return parts;
-};
-
 const tryLoadEngine = async (): Promise<WasmEngine> => {
   const engine = await loadLlamaWasmEngine();
-  if (!engine || typeof engine.loadModel !== 'function' || typeof engine.generate !== 'function' || typeof engine.embed !== 'function') {
+  if (
+    !engine ||
+    typeof engine.loadModel !== 'function' ||
+    typeof engine.generate !== 'function' ||
+    typeof engine.embed !== 'function'
+  ) {
     throw new Error('Loaded wasm engine does not expose required methods.');
   }
   return engine;
@@ -74,13 +67,31 @@ self.onmessage = async (evt: MessageEvent<WorkerRequest>) => {
         });
         return;
       }
+
       case 'LOAD_MODEL': {
         if (!state.initialized) {
           postError(req.id, 'WASM_INIT_FAILED', 'Worker is not initialized. Send INIT first.');
           return;
         }
         const engine = ensureEngine();
-        await engine.loadModel(req.modelId, req.modelBuffer, req.opts);
+
+        // Fix #9: read from OPFS here in the worker, not on the main thread.
+        // This means the ArrayBuffer is only ever alive inside the worker heap.
+        let buffer: ArrayBuffer;
+        let sizeBytes: number;
+        try {
+          const result = await readModelBufferFromOpfs(req.modelId);
+          buffer = result.buffer;
+          sizeBytes = result.sizeBytes;
+        } catch (readErr) {
+          postError(req.id, 'STORAGE_IO_FAILED', `Failed to read model '${req.modelId}' from OPFS in worker: ${readErr instanceof Error ? readErr.message : String(readErr)}`);
+          return;
+        }
+
+        await engine.loadModel(req.modelId, buffer, {
+          ...(req.opts ?? {}),
+          modelBytes: sizeBytes,
+        });
         state.loadedModels.add(req.modelId);
         postEvent({
           id: req.id,
@@ -89,6 +100,7 @@ self.onmessage = async (evt: MessageEvent<WorkerRequest>) => {
         });
         return;
       }
+
       case 'UNLOAD_MODEL': {
         if (!state.loadedModels.has(req.modelId)) {
           postEvent({
@@ -108,16 +120,18 @@ self.onmessage = async (evt: MessageEvent<WorkerRequest>) => {
         });
         return;
       }
+
       case 'GENERATE': {
         if (!state.loadedModels.has(req.modelId)) {
           postError(req.id, 'MODEL_NOT_LOADED', `Model '${req.modelId}' is not loaded in worker.`);
           return;
         }
         const engine = ensureEngine();
-        let emitted = 0;
+
+        // Fix #3: use the real streaming callback when stream=true so tokens
+        // arrive from the WASM generation loop, not as a post-hoc string split.
         const onToken = req.req.stream
           ? (token: string, index: number) => {
-              emitted++;
               postEvent({
                 id: req.id,
                 type: 'TOKEN',
@@ -129,18 +143,6 @@ self.onmessage = async (evt: MessageEvent<WorkerRequest>) => {
           : undefined;
 
         const result = await engine.generate(req.modelId, req.req, onToken);
-        if (req.req.stream && emitted === 0 && result?.text) {
-          const fallbackTokens = splitTokenFallback(result.text);
-          fallbackTokens.forEach((token, index) => {
-            postEvent({
-              id: req.id,
-              type: 'TOKEN',
-              modelId: req.modelId,
-              token,
-              index,
-            });
-          });
-        }
         postEvent({
           id: req.id,
           type: 'RESULT',
@@ -148,6 +150,7 @@ self.onmessage = async (evt: MessageEvent<WorkerRequest>) => {
         });
         return;
       }
+
       case 'EMBED': {
         if (!state.loadedModels.has(req.modelId)) {
           postError(req.id, 'MODEL_NOT_LOADED', `Model '${req.modelId}' is not loaded in worker.`);
@@ -162,6 +165,7 @@ self.onmessage = async (evt: MessageEvent<WorkerRequest>) => {
         });
         return;
       }
+
       case 'HEALTH': {
         const details = state.engine ? await state.engine.health?.() : undefined;
         postEvent({
@@ -176,6 +180,7 @@ self.onmessage = async (evt: MessageEvent<WorkerRequest>) => {
         });
         return;
       }
+
       case 'MEMORY': {
         const details = state.engine ? await state.engine.memory?.() : undefined;
         postEvent({
@@ -188,6 +193,7 @@ self.onmessage = async (evt: MessageEvent<WorkerRequest>) => {
         });
         return;
       }
+
       default: {
         const unknownReq = req as any;
         postError(
@@ -203,4 +209,3 @@ self.onmessage = async (evt: MessageEvent<WorkerRequest>) => {
     postError(req.id, code, message, { requestType: req.type });
   }
 };
-

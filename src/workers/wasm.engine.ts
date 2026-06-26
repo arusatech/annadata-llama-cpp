@@ -45,6 +45,8 @@ type WasmModule = {
   load_model?: (modelId: string, bytes: Uint8Array, optsJson: string) => void;
   unload_model?: (modelId: string) => void;
   generate?: (modelId: string, reqJson: string) => string;
+  // generate_stream is the real streaming export from Rust/wasm-bindgen (#3).
+  generate_stream?: (modelId: string, reqJson: string, onToken: (token: string, index: number) => void) => string;
   embed?: (modelId: string, reqJson: string) => string;
   health?: () => string;
   memory_snapshot?: () => string;
@@ -58,24 +60,39 @@ const safeJsonParse = <T>(raw: string, fallback: T): T => {
   }
 };
 
+// Fix #15: worker URL resolution is now explicit and bundler-friendly.
+// - First try the global escape hatch (__LLAMA_WORKER_URL__) set by the app.
+// - Then try the canonical package-relative path using import.meta.url so
+//   Vite / Rollup / Webpack can detect it as a static asset and bundle it.
+// - Fall back to a same-origin relative path for legacy setups.
 const resolveModuleCandidates = (): string[] => {
-  const candidates = [
-    // Package/runtime path when assets are copied beside dist/esm output.
-    new URL('../../wasm/llama_engine.js', import.meta.url).href,
-    // Local repo runtime path.
-    new URL('../../dist/wasm/llama_engine.js', import.meta.url).href,
-  ];
+  const candidates: string[] = [];
 
-  if (typeof self !== 'undefined' && (self as any).location?.origin) {
-    candidates.push(`${(self as any).location.origin}/dist/wasm/llama_engine.js`);
-    candidates.push(`${(self as any).location.origin}/wasm/llama_engine.js`);
+  const customUrl = (globalThis as any)?.__LLAMA_WORKER_URL__;
+  if (typeof customUrl === 'string' && customUrl.length > 0) {
+    candidates.push(customUrl);
+  }
+
+  try {
+    // Static import.meta.url reference — detected correctly by bundlers.
+    const base = new URL('../../wasm/llama_engine.js', import.meta.url).href;
+    candidates.push(base);
+    candidates.push(new URL('../../dist/wasm/llama_engine.js', import.meta.url).href);
+  } catch {
+    // import.meta.url unavailable (CommonJS transform or test runner).
+  }
+
+  const origin = (globalThis as any)?.location?.origin ?? '';
+  if (origin) {
+    candidates.push(`${origin}/dist/wasm/llama_engine.js`);
+    candidates.push(`${origin}/wasm/llama_engine.js`);
   }
 
   return [...new Set(candidates)];
 };
 
 const loadWasmModule = async (): Promise<WasmModule> => {
-  let lastError: unknown = undefined;
+  let lastError: unknown;
   for (const url of resolveModuleCandidates()) {
     try {
       const mod = (await import(/* @vite-ignore */ url)) as WasmModule;
@@ -91,9 +108,9 @@ const loadWasmModule = async (): Promise<WasmModule> => {
     }
   }
   throw new Error(
-    `Unable to load wasm wrapper module (llama_engine.js). Last error: ${
-      lastError instanceof Error ? lastError.message : String(lastError)
-    }`,
+    `Unable to load wasm wrapper module (llama_engine.js). ` +
+    `Set window.__LLAMA_WORKER_URL__ to the correct path. ` +
+    `Last error: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
   );
 };
 
@@ -106,25 +123,38 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
       // Older builds may still expose it as `init`; fall back gracefully.
       (mod.init_engine ?? mod.init)?.();
     },
+
     loadModel: async (modelId, modelBuffer, opts) => {
       const loadModel = mod.load_model;
       if (!loadModel) {
         throw new Error('Wasm module missing load_model export');
       }
+      // Pass the full ArrayBuffer (read from OPFS inside the worker — #9).
       loadModel(modelId, new Uint8Array(modelBuffer), JSON.stringify(opts ?? {}));
     },
+
     unloadModel: async (modelId) => {
       const unloadModel = mod.unload_model;
-      if (!unloadModel) {
-        throw new Error('Wasm module missing unload_model export');
-      }
+      if (!unloadModel) throw new Error('Wasm module missing unload_model export');
       unloadModel(modelId);
     },
-    generate: async (modelId, req, _onToken) => {
-      const generate = mod.generate;
-      if (!generate) {
-        throw new Error('Wasm module missing generate export');
+
+    generate: async (modelId, req, onToken) => {
+      // Fix #3: use generate_stream when a streaming callback is provided so
+      // tokens arrive incrementally from the C++ generation loop, not as a
+      // post-hoc split of the completed string.
+      if (onToken && typeof mod.generate_stream === 'function') {
+        const raw = mod.generate_stream(modelId, JSON.stringify(req ?? {}), onToken);
+        return safeJsonParse<GenerateResult>(raw, {
+          text: '',
+          tokens_predicted: 0,
+          tokens_evaluated: 0,
+          finish_reason: 'error',
+        });
       }
+
+      const generate = mod.generate;
+      if (!generate) throw new Error('Wasm module missing generate export');
       const raw = generate(modelId, JSON.stringify(req ?? {}));
       return safeJsonParse<GenerateResult>(raw, {
         text: '',
@@ -133,24 +163,22 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
         finish_reason: 'error',
       });
     },
+
     embed: async (modelId, input) => {
       const embed = mod.embed;
-      if (!embed) {
-        throw new Error('Wasm module missing embed export');
-      }
+      if (!embed) throw new Error('Wasm module missing embed export');
       const raw = embed(modelId, JSON.stringify({ input }));
       return safeJsonParse<EmbedResult>(raw, { vectors: [] });
     },
+
     health: async () => {
-      const health = mod.health;
-      if (!health) return {};
-      return safeJsonParse<Record<string, unknown>>(health(), {});
+      if (!mod.health) return {};
+      return safeJsonParse<Record<string, unknown>>(mod.health(), {});
     },
+
     memory: async () => {
-      const memory = mod.memory_snapshot;
-      if (!memory) return { pressure: 'unknown' };
-      return safeJsonParse<Record<string, unknown>>(memory(), { pressure: 'unknown' });
+      if (!mod.memory_snapshot) return { pressure: 'unknown' };
+      return safeJsonParse<Record<string, unknown>>(mod.memory_snapshot(), { pressure: 'unknown' });
     },
   };
 };
-

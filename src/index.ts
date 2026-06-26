@@ -27,6 +27,8 @@ import type {
   CompletionParams,
   BenchResult,
   LlamaCppPlugin,
+  ToolCall,
+  TokenData,
 } from './definitions';
 
 // Constants
@@ -80,28 +82,11 @@ export type {
   CompletionResponseFormat,
   CompletionParams,
   BenchResult,
+  ToolCall,
+  TokenData,
 };
 
 export const RNLLAMA_MTMD_DEFAULT_MEDIA_MARKER = LLAMACPP_MTMD_DEFAULT_MEDIA_MARKER;
-
-export type ToolCall = {
-  type: 'function';
-  id?: string;
-  function: {
-    name: string;
-    arguments: string; // JSON string
-  };
-};
-
-export type TokenData = {
-  token: string;
-  completion_probabilities?: Array<NativeCompletionTokenProb>;
-  // Parsed content from accumulated text
-  content?: string;
-  reasoning_content?: string;
-  tool_calls?: Array<ToolCall>;
-  accumulated_text?: string;
-};
 
 type TokenNativeEvent = {
   contextId: number;
@@ -658,9 +643,9 @@ export async function setContextLimit(limit: number): Promise<void> {
   return LlamaCpp.setContextLimit({ limit });
 }
 
+// Fix #14: pure monotonic counter — adding random() caused ID collisions when
+// counter + random happened to produce the same value on successive calls.
 let contextIdCounter = 0;
-const contextIdRandom = () =>
-  process.env.NODE_ENV === 'test' ? 0 : Math.floor(Math.random() * 100000);
 
 const modelInfoSkip = [
   // Large fields
@@ -709,8 +694,7 @@ export async function initLlama(
       scaled: l.scaled,
     }));
 
-  const contextId = contextIdCounter + contextIdRandom();
-  contextIdCounter += 1;
+  const contextId = ++contextIdCounter;
 
   let removeProgressListener: any = null;
   if (onProgress) {

@@ -102,6 +102,7 @@ fn main() {
         "cap-completion.cpp",
         "cap-embedding.cpp",
         "cap-ios-bridge.cpp",
+        // cap-ios-bridge.cpp now contains WASM-specific code gated by CAPLLAMA_BUILD_WASM
     ];
 
     let mut c_sources: Vec<PathBuf> = Vec::new();
@@ -122,6 +123,15 @@ fn main() {
         }
     }
 
+    // Enable WASM SIMD128 for significantly faster quantized matrix multiply (#17).
+    // All major browsers have supported simd128 since 2021. Use rustc env to
+    // emit the same flag for the Rust side; the C/C++ side gets -msimd128.
+    let is_wasm = target.contains("wasm");
+    if is_wasm {
+        println!("cargo:rustc-env=WASM_SIMD=1");
+        println!("cargo:rustc-cfg=wasm_simd");
+    }
+
     let mut c_build = cc::Build::new();
     c_build
         .cpp(false)
@@ -133,6 +143,10 @@ fn main() {
         .define("GGML_USE_WASM", None)
         .define("CAPLLAMA_BUILD_WASM", None)
         .warnings(false);
+
+    if is_wasm {
+        c_build.flag("-msimd128");
+    }
 
     let mut cxx_build = cc::Build::new();
     cxx_build
@@ -147,6 +161,10 @@ fn main() {
         .define("GGML_USE_WASM", None)
         .define("CAPLLAMA_BUILD_WASM", None)
         .warnings(false);
+
+    if is_wasm {
+        cxx_build.flag("-msimd128");
+    }
 
     if let Ok(sysroot) = env::var("LLAMA_WASM_SYSROOT") {
         let sysroot_path = PathBuf::from(&sysroot);

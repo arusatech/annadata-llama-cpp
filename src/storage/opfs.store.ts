@@ -51,14 +51,20 @@ const ensureParentDirAndFileHandle = async (path: string, create = true): Promis
   return current.getFileHandle(fileName, { create });
 };
 
-const writeStreamToFile = async (res: Response, fileHandle: any): Promise<number> => {
+const writeStreamToFile = async (
+  res: Response,
+  fileHandle: any,
+  onProgress?: (downloaded: number, total: number) => void,
+): Promise<number> => {
   const writable = await fileHandle.createWritable();
+  const total = Number(res.headers.get('content-length') ?? 0);
   let written = 0;
   try {
     if (!res.body) {
       const buf = await res.arrayBuffer();
       await writable.write(buf);
       written += buf.byteLength;
+      onProgress?.(written, total || written);
       return written;
     }
 
@@ -69,6 +75,7 @@ const writeStreamToFile = async (res: Response, fileHandle: any): Promise<number
       if (value) {
         await writable.write(value);
         written += value.byteLength;
+        onProgress?.(written, total || written);
       }
     }
     return written;
@@ -77,7 +84,11 @@ const writeStreamToFile = async (res: Response, fileHandle: any): Promise<number
   }
 };
 
-export async function ensureModelInOpfs(modelId: string, modelUrl: string): Promise<ModelManifestEntry> {
+export async function ensureModelInOpfs(
+  modelId: string,
+  modelUrl: string,
+  onProgress?: (downloaded: number, total: number) => void,
+): Promise<ModelManifestEntry> {
   if (!modelId) {
     throw new LlmError('INVALID_REQUEST', 'modelId is required for OPFS storage.');
   }
@@ -113,7 +124,7 @@ export async function ensureModelInOpfs(modelId: string, modelUrl: string): Prom
   let sizeBytes = 0;
   try {
     const fileHandle = await ensureParentDirAndFileHandle(path, true);
-    sizeBytes = await writeStreamToFile(res, fileHandle);
+    sizeBytes = await writeStreamToFile(res, fileHandle, onProgress);
   } catch (error) {
     throw new LlmError('STORAGE_IO_FAILED', `Failed to persist model '${modelId}' in OPFS.`, {
       modelId,
@@ -133,6 +144,17 @@ export async function ensureModelInOpfs(modelId: string, modelUrl: string): Prom
   };
   await upsertManifestEntry(entry);
   return entry;
+}
+
+/**
+ * Read the model from OPFS as an ArrayBuffer, entirely within the caller's
+ * context (intended to be called from inside the Web Worker, not the main
+ * thread, so the buffer never crosses the thread boundary — fixes #9).
+ */
+export async function readModelBufferFromOpfs(modelId: string): Promise<{ buffer: ArrayBuffer; sizeBytes: number }> {
+  const file = await readModelFromOpfs(modelId);
+  const buffer = await file.arrayBuffer();
+  return { buffer, sizeBytes: file.size };
 }
 
 export async function readModelFromOpfs(modelId: string): Promise<File> {

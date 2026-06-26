@@ -500,6 +500,7 @@ export interface ContextParams extends Omit<
   cache_type_k?:
     | 'f16'
     | 'f32'
+    | 'bf16'
     | 'q8_0'
     | 'q4_0'
     | 'q4_1'
@@ -509,6 +510,7 @@ export interface ContextParams extends Omit<
   cache_type_v?:
     | 'f16'
     | 'f32'
+    | 'bf16'
     | 'q8_0'
     | 'q4_0'
     | 'q4_1'

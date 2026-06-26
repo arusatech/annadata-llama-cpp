@@ -2,27 +2,44 @@
 /// These are the foreign function declarations that link to the compiled llama.cpp library
 
 use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int, c_void};
 
 /// Extern C declarations for llama.cpp context management
 #[link(name = "llama_engine_embedded_c", kind = "static")]
 #[link(name = "llama_engine_embedded_cpp", kind = "static")]
 extern "C" {
-    /// Initialize a new inference context from a GGUF model file
-    /// Returns a context handle (pointer cast to i64) or 0 on failure
+    /// Initialize a new inference context from a GGUF model file path
     pub fn llama_init_context(
         model_path: *const c_char,
+        params_json: *const c_char,
+    ) -> i64;
+
+    /// Initialize a context directly from in-memory model bytes (#1 / #9).
+    /// Available only in CAPLLAMA_BUILD_WASM builds; writes bytes to a
+    /// temporary VFS path (Emscripten MEMFS or WASI /tmp/) then loads.
+    pub fn llama_init_context_from_buffer(
+        data: *const u8,
+        size: usize,
         params_json: *const c_char,
     ) -> i64;
 
     /// Release a context and free its resources
     pub fn llama_release_context(context_id: i64) -> i32;
 
-    /// Run text completion/generation
-    /// Returns JSON string with completion result
+    /// Run text completion/generation (synchronous, returns full result)
     pub fn llama_completion(
         context_id: i64,
         params_json: *const c_char,
+    ) -> *const c_char;
+
+    /// Streaming completion (#3): calls `token_callback` once per token.
+    /// The global g_mutex is held only for context lookup, not during
+    /// the entire generation loop, fixing the mutex-held-too-long bug (#2).
+    pub fn llama_completion_stream(
+        context_id: i64,
+        params_json: *const c_char,
+        token_callback: unsafe extern "C" fn(*const c_char, *mut c_void, c_int),
+        user_data: *mut c_void,
     ) -> *const c_char;
 
     /// Generate embeddings for input text — returns raw float* (use llama_embedding_json instead)
@@ -51,6 +68,25 @@ extern "C" {
         context_id: i64,
         tokens_json: *const c_char,
     ) -> *const c_char;
+}
+
+/// Safe wrapper for initializing a context from raw in-memory model bytes (#1).
+/// Only available when the embedded C++ is compiled in (CAPLLAMA_BUILD_WASM).
+pub fn init_context_from_buffer(bytes: &[u8], params_json: &str) -> Result<i64, String> {
+    let params_cstr = CString::new(params_json)
+        .map_err(|e| format!("Invalid params JSON: {}", e))?;
+
+    unsafe {
+        let id = llama_init_context_from_buffer(
+            bytes.as_ptr(),
+            bytes.len(),
+            params_cstr.as_ptr(),
+        );
+        if id <= 0 {
+            return Err("llama_init_context_from_buffer failed — check that the WASM VFS (/tmp/) is available".to_string());
+        }
+        Ok(id)
+    }
 }
 
 /// Safe wrapper for initialization
@@ -164,6 +200,58 @@ pub fn tokenize(context_id: i64, text: &str) -> Result<Vec<i32>, String> {
             .collect();
 
         Ok(tokens)
+    }
+}
+
+/// Safe wrapper for streaming completion (#3).
+/// Calls `on_token(token_text, index)` for every generated token.
+/// The C layer holds the context mutex only briefly for lookup (#2).
+pub fn completion_stream<F>(
+    context_id: i64,
+    params_json: &str,
+    mut on_token: F,
+) -> Result<String, String>
+where
+    F: FnMut(&str, i32),
+{
+    let params_cstr = CString::new(params_json)
+        .map_err(|e| format!("Invalid params JSON: {}", e))?;
+
+    // Use a fat pointer (trait object) as user_data so the closure can
+    // capture local variables without any extra allocation trickery.
+    type BoxedFn<'a> = &'a mut dyn FnMut(&str, i32);
+
+    unsafe extern "C" fn trampoline(
+        token: *const c_char,
+        user_data: *mut c_void,
+        index: c_int,
+    ) {
+        let cb = &mut *(user_data as *mut BoxedFn<'_>);
+        if token.is_null() {
+            return;
+        }
+        let tok = CStr::from_ptr(token).to_str().unwrap_or("");
+        cb(tok, index as i32);
+    }
+
+    let mut erased: BoxedFn<'_> = &mut on_token;
+    let user_data = &mut erased as *mut BoxedFn<'_> as *mut c_void;
+
+    unsafe {
+        let result_ptr = llama_completion_stream(
+            context_id,
+            params_cstr.as_ptr(),
+            trampoline,
+            user_data,
+        );
+        if result_ptr.is_null() {
+            return Err("completion_stream returned null".to_string());
+        }
+        let result_cstr = CStr::from_ptr(result_ptr);
+        Ok(result_cstr
+            .to_str()
+            .map_err(|e| format!("Invalid UTF-8 in stream result: {}", e))?
+            .to_string())
     }
 }
 

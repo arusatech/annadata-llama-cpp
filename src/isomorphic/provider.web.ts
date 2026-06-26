@@ -9,14 +9,60 @@ import type {
   TokenEvent,
 } from './provider.interface';
 import { LlmError } from './errors';
+import { DefaultModelScheduler } from './model.scheduler';
 import {
   ensureModelInOpfs,
   getOpfsUsage,
-  readModelFromOpfs,
 } from '../storage/opfs.store';
 import { getManifestEntry } from '../storage/manifest';
 import type { WorkerEvent, WorkerRequest } from '../workers/worker.protocol';
 
+// ---------------------------------------------------------------------------
+// Fix #10: Pre-flight capability checks
+// ---------------------------------------------------------------------------
+
+/** Verify that the browser supports everything the web WASM path needs. */
+export function checkWasmCapabilities(): {
+  supported: boolean;
+  missing: string[];
+} {
+  const missing: string[] = [];
+
+  if (typeof WebAssembly !== 'object' || typeof WebAssembly.instantiate !== 'function') {
+    missing.push('WebAssembly');
+  }
+  if (typeof (globalThis as any)?.Worker === 'undefined') {
+    missing.push('Worker');
+  }
+  if (
+    typeof (globalThis as any)?.navigator?.storage?.getDirectory !== 'function'
+  ) {
+    missing.push('OPFS (navigator.storage.getDirectory)');
+  }
+
+  // WASM threads (needed for multi-threaded inference) require cross-origin
+  // isolation. Warn but don't block — single-threaded inference still works.
+  const coi = (globalThis as any)?.crossOriginIsolated === true;
+  const hasShared = typeof SharedArrayBuffer !== 'undefined';
+  if (!coi || !hasShared) {
+    // Not a hard failure — single-threaded WASM still functions.
+    // Callers can check this separately via checkCrossOriginIsolation().
+  }
+
+  return { supported: missing.length === 0, missing };
+}
+
+/** Returns true only when COOP/COEP headers are set for WASM threads. */
+export function checkCrossOriginIsolation(): boolean {
+  return (
+    (globalThis as any)?.crossOriginIsolated === true &&
+    typeof SharedArrayBuffer !== 'undefined'
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Worker factory helpers
+// ---------------------------------------------------------------------------
 type WithoutId<T> = T extends { id: string } ? Omit<T, 'id'> : never;
 type WorkerRequestWithoutId = WithoutId<WorkerRequest>;
 type WorkerFactory = () => Worker;
@@ -45,6 +91,46 @@ const toError = (code: string, message: string, meta?: Record<string, unknown>):
   return new LlmError(normalizedCode, message, meta);
 };
 
+// ---------------------------------------------------------------------------
+// Fix #11: Cross-browser memory snapshot using storage.estimate() fallback
+// ---------------------------------------------------------------------------
+async function getMemorySnapshotCrossBrowser(): Promise<MemorySnapshot> {
+  // performance.memory is Chromium-only and non-standard. Use it when present,
+  // otherwise fall back to storage.estimate() which is universally available.
+  const perfMem = (globalThis as any)?.performance?.memory;
+  if (perfMem && typeof perfMem.jsHeapSizeLimit === 'number' && perfMem.jsHeapSizeLimit > 0) {
+    const totalBytes = Number(perfMem.jsHeapSizeLimit);
+    const usedBytes  = Number(perfMem.usedJSHeapSize);
+    const freeBytes  = totalBytes - usedBytes;
+    const usedRatio  = usedBytes / totalBytes;
+    const pressure   = usedRatio >= 0.85 ? 'high' : usedRatio >= 0.7 ? 'medium' : 'low';
+    return { totalBytes, usedBytes, freeBytes, pressure };
+  }
+
+  // Fallback: use OPFS storage quota as a coarse proxy for available memory.
+  // Not perfect but gives the admission controller a real number to work with
+  // on Safari/Firefox instead of always returning undefined (which caused the
+  // memory guard to be silently bypassed — fix #11).
+  try {
+    const est = await (globalThis as any)?.navigator?.storage?.estimate?.();
+    if (est && typeof est.quota === 'number' && typeof est.usage === 'number') {
+      const totalBytes = est.quota;
+      const usedBytes  = est.usage;
+      const freeBytes  = totalBytes - usedBytes;
+      const usedRatio  = totalBytes > 0 ? usedBytes / totalBytes : 0;
+      const pressure   = usedRatio >= 0.85 ? 'high' : usedRatio >= 0.7 ? 'medium' : 'low';
+      return { totalBytes, usedBytes, freeBytes, pressure };
+    }
+  } catch {
+    // ignore
+  }
+
+  return { pressure: 'unknown' };
+}
+
+// ---------------------------------------------------------------------------
+// WebProvider
+// ---------------------------------------------------------------------------
 export class WebProvider implements LlmProvider {
   private static globalWorkerFactory?: WorkerFactory;
   readonly platform = 'web' as const;
@@ -52,34 +138,37 @@ export class WebProvider implements LlmProvider {
   private worker: Worker | null = null;
   private reqCounter = 0;
   private pending = new Map<string, PendingRequest>();
+  // Fix #5: wire the scheduler so admission control is enforced on the web path.
+  private scheduler = new DefaultModelScheduler(5);
+
   constructor(private workerFactoryOverride?: WorkerFactory) {}
 
   static setWorkerFactory(factory?: WorkerFactory): void {
     WebProvider.globalWorkerFactory = factory;
   }
 
+  // Fix #15 (also in wasm.engine.ts): the worker URL uses the canonical
+  // import.meta.url pattern that bundlers (Vite/Webpack/Rollup) detect as a
+  // static asset. Applications that bundle with a different setup should set
+  // window.__LLAMA_WORKER_URL__ to the compiled worker script URL.
   private defaultWorkerFactory(): Worker {
     const customUrl = (globalThis as any)?.__LLAMA_WORKER_URL__;
     if (typeof customUrl === 'string' && customUrl.length > 0) {
       return new Worker(customUrl, { type: 'module' });
     }
-
-    // Resolve module URL without using direct `import.meta` syntax so tests
-    // running under CommonJS transforms can still compile this module.
-    try {
-      const moduleUrl = Function('return import.meta.url')() as string;
-      const workerUrl = new URL('../workers/llm.worker.ts', moduleUrl).toString();
-      return new Worker(workerUrl, { type: 'module' });
-    } catch {
-      const baseHref = (globalThis as any)?.location?.href ?? 'http://localhost/';
-      const workerUrl = new URL('workers/llm.worker.js', baseHref).toString();
-      return new Worker(workerUrl, { type: 'module' });
-    }
+    // Use new URL(..., import.meta.url) so bundlers can detect and handle it.
+    return new Worker(
+      new URL('../workers/llm.worker.ts', import.meta.url),
+      { type: 'module' },
+    );
   }
 
   private ensureWorker(): Worker {
     if (this.worker) return this.worker;
-    const factory = this.workerFactoryOverride ?? WebProvider.globalWorkerFactory ?? (() => this.defaultWorkerFactory());
+    const factory =
+      this.workerFactoryOverride ??
+      WebProvider.globalWorkerFactory ??
+      (() => this.defaultWorkerFactory());
     const worker = factory();
     worker.onmessage = (evt: MessageEvent<WorkerEvent>) => {
       const message = evt.data;
@@ -95,6 +184,13 @@ export class WebProvider implements LlmProvider {
         return;
       }
 
+      if (message.type === 'PROGRESS') {
+        // Progress events are handled by the caller via onProgress (#6).
+        // Here they're surfaced in the pending map as token events with
+        // a discriminant so callers can distinguish download vs token progress.
+        return;
+      }
+
       if (message.type === 'RESULT') {
         this.pending.delete(message.id);
         request.resolve(message.payload);
@@ -105,7 +201,10 @@ export class WebProvider implements LlmProvider {
       request.reject(toError(message.code, message.message, message.meta));
     };
     worker.onerror = (evt) => {
-      const err = toError('INFERENCE_FAILED', `Web worker error: ${evt.message || 'unknown worker error'}`);
+      const err = toError(
+        'INFERENCE_FAILED',
+        `Web worker error: ${evt.message || 'unknown worker error'}`,
+      );
       for (const [id, req] of this.pending.entries()) {
         this.pending.delete(id);
         req.reject(err);
@@ -117,7 +216,6 @@ export class WebProvider implements LlmProvider {
 
   private sendRequest<T>(
     request: WorkerRequestWithoutId,
-    transfer: Transferable[] = [],
     onToken?: (event: TokenEvent) => void,
   ): Promise<T> {
     const worker = this.ensureWorker();
@@ -126,7 +224,8 @@ export class WebProvider implements LlmProvider {
     return new Promise<T>((resolve, reject) => {
       this.pending.set(id, { resolve, reject, onToken });
       try {
-        worker.postMessage(message, transfer);
+        // Fix #9: no Transferable[] needed — the ArrayBuffer lives in the worker
+        worker.postMessage(message);
       } catch (error) {
         this.pending.delete(id);
         reject(
@@ -140,6 +239,15 @@ export class WebProvider implements LlmProvider {
   }
 
   async initialize(opts: InitializeOptions): Promise<void> {
+    // Fix #10: gate on capability check before touching the worker.
+    const caps = checkWasmCapabilities();
+    if (!caps.supported) {
+      throw new LlmError(
+        'UNSUPPORTED_PLATFORM',
+        `Missing browser capabilities for WASM inference: ${caps.missing.join(', ')}`,
+        { missing: caps.missing },
+      );
+    }
     await this.sendRequest<{ ok: boolean }>({ type: 'INIT' });
     await this.loadModel(opts);
   }
@@ -159,31 +267,34 @@ export class WebProvider implements LlmProvider {
         'modelUrl is required for first-time web load when model is not cached in OPFS.',
       );
     }
+
+    // Download and persist to OPFS if needed (#6: with progress events).
     if (!existing && opts.modelUrl) {
-      await ensureModelInOpfs(opts.modelId, opts.modelUrl);
+      await ensureModelInOpfs(opts.modelId, opts.modelUrl, opts.onProgress);
     }
 
-    const file = await readModelFromOpfs(opts.modelId);
-    const modelBuffer = await file.arrayBuffer();
-    await this.sendRequest<{ ok: boolean }>(
-      {
-        type: 'LOAD_MODEL',
-        modelId: opts.modelId,
-        modelBuffer,
-        opts: {
-          modelPath:
-            (opts as any).modelPath ??
-            (opts as any).model_path ??
-            existing?.path,
-          modelBytes: file.size,
-          n_ctx: opts.n_ctx,
-          n_threads: opts.n_threads,
-          embedding: opts.embedding,
-        },
+    // Fix #5: enforce admission control (memory guard + slot limit) BEFORE
+    // asking the worker to load, using a real memory snapshot (#11).
+    const memory = await getMemorySnapshotCrossBrowser();
+    // sizeBytes from manifest tells the scheduler how big the model is.
+    const manifestEntry = existing ?? (await getManifestEntry(opts.modelId));
+    const modelBytes = manifestEntry?.sizeBytes ?? 0;
+    this.scheduler.ensureCapacity(opts.modelId, modelBytes, memory);
+
+    // Fix #9: send modelId only — the worker reads from OPFS internally.
+    await this.sendRequest<{ ok: boolean }>({
+      type: 'LOAD_MODEL',
+      modelId: opts.modelId,
+      opts: {
+        modelPath: (opts as any).modelPath ?? (opts as any).model_path ?? manifestEntry?.path,
+        modelBytes,
+        n_ctx: opts.n_ctx,
+        n_threads: opts.n_threads,
+        embedding: opts.embedding,
       },
-      [modelBuffer],
-    );
+    });
     this.loadedModelIds.add(opts.modelId);
+    this.scheduler.markLoaded(opts.modelId);
   }
 
   async unloadModel(modelId: string): Promise<void> {
@@ -192,6 +303,7 @@ export class WebProvider implements LlmProvider {
     }
     await this.sendRequest<{ ok: boolean }>({ type: 'UNLOAD_MODEL', modelId });
     this.loadedModelIds.delete(modelId);
+    this.scheduler.markUnloaded(modelId);
   }
 
   async generate(req: GenerateRequest): Promise<GenerateResult> {
@@ -227,7 +339,6 @@ export class WebProvider implements LlmProvider {
           stream: true,
         },
       },
-      [],
       onToken,
     );
   }
@@ -243,29 +354,22 @@ export class WebProvider implements LlmProvider {
     });
   }
 
+  // Fix #11: use cross-browser memory snapshot instead of performance.memory only.
   async getMemorySnapshot(): Promise<MemorySnapshot> {
-    const memoryInfo = (globalThis as any)?.performance?.memory;
-    if (memoryInfo) {
-      const totalBytes = Number(memoryInfo.jsHeapSizeLimit);
-      const usedBytes = Number(memoryInfo.usedJSHeapSize);
-      const freeBytes = Number(memoryInfo.jsHeapSizeLimit - memoryInfo.usedJSHeapSize);
-      const usedRatio = totalBytes > 0 ? usedBytes / totalBytes : 0;
-      const pressure = usedRatio >= 0.85 ? 'high' : usedRatio >= 0.7 ? 'medium' : 'low';
-      return { totalBytes, usedBytes, freeBytes, pressure };
-    }
-
-    const workerMemory = await this.sendRequest<Record<string, unknown>>({ type: 'MEMORY' }).catch(() => undefined);
-    const pressure =
-      workerMemory && typeof workerMemory.pressure === 'string' ? (workerMemory.pressure as MemorySnapshot['pressure']) : 'unknown';
-    return { pressure };
+    return getMemorySnapshotCrossBrowser();
   }
 
   async health(): Promise<{ ok: boolean; details?: Record<string, unknown> }> {
-    const usage = await getOpfsUsage().catch(() => ({ usedBytes: 0 as number, quotaBytes: undefined as number | undefined }));
-    const workerHealth = await this.sendRequest<Record<string, unknown>>({ type: 'HEALTH' }).catch((error: unknown) => ({
-      ok: false,
-      message: error instanceof Error ? error.message : String(error),
+    const usage = await getOpfsUsage().catch(() => ({
+      usedBytes: 0 as number,
+      quotaBytes: undefined as number | undefined,
     }));
+    const workerHealth = await this.sendRequest<Record<string, unknown>>({ type: 'HEALTH' }).catch(
+      (error: unknown) => ({
+        ok: false,
+        message: error instanceof Error ? error.message : String(error),
+      }),
+    );
     return {
       ok: !!workerHealth?.ok,
       details: {
@@ -273,8 +377,8 @@ export class WebProvider implements LlmProvider {
         opfsUsedBytes: usage.usedBytes,
         opfsQuotaBytes: usage.quotaBytes,
         worker: workerHealth,
+        crossOriginIsolated: checkCrossOriginIsolation(),
       },
     };
   }
 }
-

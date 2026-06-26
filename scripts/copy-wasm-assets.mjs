@@ -1,4 +1,4 @@
-import { mkdir, rm, copyFile } from 'node:fs/promises';
+import { access, mkdir, rm, copyFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 const root = resolve(process.cwd());
@@ -15,6 +15,18 @@ const files = [
   'llama_engine_emscripten.mjs',
   'package.json',
 ];
+
+// Fix #16: assert that wasm-pack output exists before attempting the copy so a
+// cold clone produces a clear error rather than silently writing an empty dist/wasm/.
+try {
+  await access(wasmPkgDir);
+} catch {
+  console.error(
+    `[copy-wasm-assets] ERROR: '${wasmPkgDir}' does not exist.\n` +
+    `Run 'npm run build:wasm:embed' (or 'wasm-pack build src-rust --target web') first.`,
+  );
+  process.exit(1);
+}
 
 await rm(targetDir, { recursive: true, force: true });
 await mkdir(targetDir, { recursive: true });

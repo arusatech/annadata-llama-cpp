@@ -43,7 +43,11 @@ pub fn init() -> Result<(), JsValue> {
     Ok(())
 }
 
-/// Load a model from a file path. The model must be in GGUF format.
+/// Load a model from raw bytes (#1 / #9).
+/// The `bytes` parameter is the full GGUF model content read from OPFS
+/// inside the Web Worker (not the main thread — fixes #9).
+/// On Emscripten/WASI builds the bytes are written to a temp VFS path and
+/// loaded; on the mock scaffold the model is registered with a stub context.
 #[wasm_bindgen]
 pub fn load_model(model_id: String, bytes: &[u8], opts_json: String) -> Result<(), JsValue> {
     #[cfg(llama_embed_cpp)]
@@ -59,58 +63,27 @@ pub fn load_model(model_id: String, bytes: &[u8], opts_json: String) -> Result<(
         let opts: ModelInitOptions = serde_json::from_str(&opts_json)
             .map_err(|e| JsValue::from_str(&format!("Invalid options JSON: {}", e)))?;
 
-        let model_path = opts
-            .model_path
-            .ok_or_else(|| JsValue::from_str("modelPath is required"))?;
-
+        // Build context parameters from opts (model_path is ignored for WASM —
+        // bytes are the source of truth, fixing the silent-discard bug #1).
         let mut ctx_params = ContextParams::default();
-        ctx_params.model = model_path;
-        if let Some(n_ctx) = opts.n_ctx {
-            ctx_params.n_ctx = n_ctx;
-        }
-        if let Some(n_threads) = opts.n_threads {
-            ctx_params.n_threads = n_threads;
-        }
-        if let Some(n_batch) = opts.n_batch {
-            ctx_params.n_batch = n_batch;
-        }
-        if let Some(n_gpu_layers) = opts.n_gpu_layers {
-            ctx_params.n_gpu_layers = n_gpu_layers;
-        }
-        if let Some(embedding) = opts.embedding {
-            ctx_params.embedding = embedding;
-        }
-        if let Some(use_mmap) = opts.use_mmap {
-            ctx_params.use_mmap = use_mmap;
-        }
-        if let Some(use_mlock) = opts.use_mlock {
-            ctx_params.use_mlock = use_mlock;
-        }
+        // Still populate model name from opts for logging / metadata purposes.
+        ctx_params.model = opts.model_path.unwrap_or_else(|| model_id.clone());
+        if let Some(n_ctx) = opts.n_ctx { ctx_params.n_ctx = n_ctx; }
+        if let Some(n_threads) = opts.n_threads { ctx_params.n_threads = n_threads; }
+        if let Some(n_batch) = opts.n_batch { ctx_params.n_batch = n_batch; }
+        if let Some(n_gpu_layers) = opts.n_gpu_layers { ctx_params.n_gpu_layers = n_gpu_layers; }
+        if let Some(embedding) = opts.embedding { ctx_params.embedding = embedding; }
+        // Disable mmap for WASM — no real filesystem mmap available.
+        ctx_params.use_mmap = false;
+        if let Some(use_mlock) = opts.use_mlock { ctx_params.use_mlock = use_mlock; }
 
         let params_json = serde_json::to_string(&ctx_params)
             .map_err(|e| JsValue::from_str(&format!("Failed to serialize params: {}", e)))?;
 
-        // On Emscripten (wasm build), write the model bytes into the virtual filesystem
-        // so that llama_init_context can open the file via the standard path API.
-        // bytes is the raw GGUF content passed from the browser (OPFS → ArrayBuffer → &[u8]).
-        #[cfg(target_os = "emscripten")]
-        {
-            use std::io::Write;
-            if let Some(parent) = std::path::Path::new(&ctx_params.model).parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let mut f = std::fs::File::create(&ctx_params.model)
-                .map_err(|e| JsValue::from_str(&format!("MEMFS write failed: {}", e)))?;
-            f.write_all(bytes)
-                .map_err(|e| JsValue::from_str(&format!("MEMFS write failed: {}", e)))?;
-        }
-        #[cfg(not(target_os = "emscripten"))]
-        {
-            let _ = bytes;
-        }
-
-        let context_id =
-            ffi::init_context(&ctx_params.model, &params_json).map_err(|e| JsValue::from_str(&e))?;
+        // Use bytes-based init so the model is loaded from the buffer the
+        // worker read from OPFS, not from a (nonexistent) file path (#1).
+        let context_id = ffi::init_context_from_buffer(bytes, &params_json)
+            .map_err(|e| JsValue::from_str(&e))?;
 
         state.set_context(&model_id, context_id);
         Ok(())
@@ -144,21 +117,26 @@ pub fn unload_model(model_id: String) -> Result<(), JsValue> {
     Ok(())
 }
 
-/// Generate text from a prompt
+/// Generate text from a prompt (non-streaming).
+/// The global state mutex is released before calling into C to avoid
+/// blocking all other WASM operations for the duration of inference (#2).
 #[wasm_bindgen]
 pub fn generate(model_id: String, req_json: String) -> Result<String, JsValue> {
     #[cfg(llama_embed_cpp)]
     {
-        let lock = global_state();
-        let state = lock
-            .lock()
-            .map_err(|_| JsValue::from_str("Failed to acquire engine state lock"))?;
-        if !state.initialized {
-            return Err(JsValue::from_str("Engine not initialized"));
-        }
-        let context_id = state
-            .get_context(&model_id)
-            .ok_or_else(|| JsValue::from_str("Model not loaded"))?;
+        // Step 1: grab context_id then release the lock before inference (#2).
+        let context_id = {
+            let lock = global_state();
+            let state = lock
+                .lock()
+                .map_err(|_| JsValue::from_str("Failed to acquire engine state lock"))?;
+            if !state.initialized {
+                return Err(JsValue::from_str("Engine not initialized"));
+            }
+            state
+                .get_context(&model_id)
+                .ok_or_else(|| JsValue::from_str("Model not loaded"))?
+        }; // lock released here
 
         let req: GenerateRequest = serde_json::from_str(&req_json)
             .map_err(|e| JsValue::from_str(&format!("Invalid request JSON: {}", e)))?;
@@ -186,7 +164,9 @@ pub fn generate(model_id: String, req_json: String) -> Result<String, JsValue> {
         let params_json = serde_json::to_string(&comp_params)
             .map_err(|e| JsValue::from_str(&format!("Failed to serialize params: {}", e)))?;
 
-        let raw = ffi::completion(context_id, &params_json).map_err(|e| JsValue::from_str(&e))?;
+        // Step 2: inference without holding the global state lock (#2).
+        let raw = ffi::completion(context_id, &params_json)
+            .map_err(|e| JsValue::from_str(&e))?;
 
         let completion_json: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| JsValue::from_str(&format!("Invalid completion response JSON: {}", e)))?;
@@ -231,21 +211,148 @@ pub fn generate(model_id: String, req_json: String) -> Result<String, JsValue> {
     }
 }
 
+/// Streaming generation: calls `on_token(token, index)` for each token (#3).
+/// Uses `llama_completion_stream` which releases the global mutex between
+/// the context lookup and the inference loop, fixing #2 for the WASM path.
+#[wasm_bindgen]
+pub fn generate_stream(
+    model_id: String,
+    req_json: String,
+    on_token: js_sys::Function,
+) -> Result<String, JsValue> {
+    use std::ffi::CStr;
+    use std::os::raw::{c_char, c_int, c_void};
+
+    #[cfg(llama_embed_cpp)]
+    {
+        // Grab context_id then release the lock before inference (#2).
+        let context_id = {
+            let lock = global_state();
+            let state = lock
+                .lock()
+                .map_err(|_| JsValue::from_str("Failed to acquire engine state lock"))?;
+            if !state.initialized {
+                return Err(JsValue::from_str("Engine not initialized"));
+            }
+            state
+                .get_context(&model_id)
+                .ok_or_else(|| JsValue::from_str("Model not loaded"))?
+        };
+
+        let req: GenerateRequest = serde_json::from_str(&req_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid request JSON: {}", e)))?;
+
+        let prompt = if let Some(p) = req.prompt {
+            p
+        } else if let Some(msgs) = req.messages {
+            msgs.iter()
+                .map(|m| format!("{}: {}", m.role, m.content))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            return Err(JsValue::from_str("No prompt or messages provided"));
+        };
+
+        let mut comp_params = CompletionParams::default();
+        comp_params.prompt = prompt;
+        comp_params.n_predict = req.max_tokens.unwrap_or(128);
+        comp_params.temperature = req.temperature.unwrap_or(0.7);
+        comp_params.top_p = req.top_p.unwrap_or(0.95);
+        comp_params.top_k = req.top_k.unwrap_or(40);
+        comp_params.stop = req.stop;
+
+        let params_json = serde_json::to_string(&comp_params)
+            .map_err(|e| JsValue::from_str(&format!("Failed to serialize params: {}", e)))?;
+
+        // Trampoline: bridges the C callback into the Rust closure that calls JS.
+        // SAFETY: WASM is single-threaded; the pointer outlives the C call.
+        struct CallbackState {
+            f: js_sys::Function,
+        }
+
+        unsafe extern "C" fn token_trampoline(
+            token: *const c_char,
+            user_data: *mut c_void,
+            index: c_int,
+        ) {
+            if token.is_null() || user_data.is_null() {
+                return;
+            }
+            let cb = &*(user_data as *const CallbackState);
+            let tok = CStr::from_ptr(token).to_str().unwrap_or("");
+            let _ = cb.f.call2(
+                &JsValue::null(),
+                &JsValue::from_str(tok),
+                &JsValue::from_f64(index as f64),
+            );
+        }
+
+        let cb_state = CallbackState { f: on_token };
+        let user_data = &cb_state as *const CallbackState as *mut c_void;
+
+        let raw = unsafe {
+            use std::ffi::CString;
+            let params_cstr = CString::new(params_json.clone())
+                .map_err(|e| JsValue::from_str(&format!("CString error: {}", e)))?;
+            let result_ptr = ffi::llama_completion_stream(
+                context_id,
+                params_cstr.as_ptr(),
+                token_trampoline,
+                user_data,
+            );
+            if result_ptr.is_null() {
+                return Err(JsValue::from_str("llama_completion_stream returned null"));
+            }
+            CStr::from_ptr(result_ptr)
+                .to_str()
+                .map_err(|e| JsValue::from_str(&format!("UTF-8 error: {}", e)))?
+                .to_string()
+        };
+
+        Ok(raw)
+    }
+
+    #[cfg(not(llama_embed_cpp))]
+    {
+        // Mock scaffold: split the echo result into fake tokens via the callback.
+        let result = generate(model_id, req_json)?;
+        let parsed: serde_json::Value = serde_json::from_str(&result)
+            .unwrap_or(serde_json::Value::Null);
+        let text = parsed.get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let words: Vec<&str> = text.split_whitespace().collect();
+        for (i, word) in words.iter().enumerate() {
+            let tok = if i == 0 { word.to_string() } else { format!(" {}", word) };
+            let _ = on_token.call2(
+                &JsValue::null(),
+                &JsValue::from_str(&tok),
+                &JsValue::from_f64(i as f64),
+            );
+        }
+        Ok(result)
+    }
+}
+
 /// Generate embeddings for text
 #[wasm_bindgen]
 pub fn embed(model_id: String, req_json: String) -> Result<String, JsValue> {
     #[cfg(llama_embed_cpp)]
     {
-        let lock = global_state();
-        let state = lock
-            .lock()
-            .map_err(|_| JsValue::from_str("Failed to acquire engine state lock"))?;
-        if !state.initialized {
-            return Err(JsValue::from_str("Engine not initialized"));
-        }
-        let context_id = state
-            .get_context(&model_id)
-            .ok_or_else(|| JsValue::from_str("Model not loaded"))?;
+        // Grab context_id then release lock before inference (#2).
+        let context_id = {
+            let lock = global_state();
+            let state = lock
+                .lock()
+                .map_err(|_| JsValue::from_str("Failed to acquire engine state lock"))?;
+            if !state.initialized {
+                return Err(JsValue::from_str("Engine not initialized"));
+            }
+            state
+                .get_context(&model_id)
+                .ok_or_else(|| JsValue::from_str("Model not loaded"))?
+        };
 
         let request: EmbedRequest = serde_json::from_str(&req_json)
             .map_err(|e| JsValue::from_str(&format!("Invalid embedding request JSON: {}", e)))?;

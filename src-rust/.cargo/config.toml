@@ -1,0 +1,12 @@
+# Enable WASM SIMD128 for ~2-4x faster quantized matrix multiply during
+# LLM inference. All major browsers have supported simd128 since 2021.
+# Issue #17: WASM SIMD was not enabled, leaving significant performance on
+# the table for the primary web workload.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]
+
+[target.wasm32-wasi]
+rustflags = ["-C", "target-feature=+simd128"]
+
+[target.wasm32-wasip1]
+rustflags = ["-C", "target-feature=+simd128"]

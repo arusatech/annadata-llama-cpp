@@ -449,6 +449,176 @@ bool llama_toggle_native_log(bool enabled) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// WASM-specific: load context from an in-memory byte buffer (#1 / #9).
+// On Emscripten the bytes are written to the VFS at /tmp/; on other builds
+// (wasm32-unknown-unknown) the caller must ensure file-I/O is provided.
+// ---------------------------------------------------------------------------
+#ifdef CAPLLAMA_BUILD_WASM
+
+static std::string g_wasm_tmp_path;
+
+// Forward-declared to avoid duplicating all of llama_init_context's setup.
+static int64_t init_context_with_cparams(common_params cparams);
+
+int64_t llama_init_context_from_buffer(
+    const uint8_t * data,
+    size_t          size,
+    const char *    params_json)
+{
+    if (!data || size == 0) {
+        return -1;
+    }
+
+    // Choose a unique temporary path so concurrent loads don't clash.
+    static int g_tmp_counter = 0;
+    std::string tmp_path = std::string("/tmp/wasm_model_") + std::to_string(g_tmp_counter++) + ".gguf";
+
+    // Write bytes to the in-process virtual filesystem (Emscripten MEMFS or
+    // a wasi-compatible /tmp/). If fopen fails here the target does not
+    // support this path; callers should check the return value.
+    FILE * f = fopen(tmp_path.c_str(), "wb");
+    if (!f) {
+        return -1;
+    }
+    size_t written = fwrite(data, 1, size, f);
+    fclose(f);
+    if (written != size) {
+        remove(tmp_path.c_str());
+        return -1;
+    }
+
+    int64_t id = llama_init_context(tmp_path.c_str(), params_json);
+    remove(tmp_path.c_str());
+    return id;
+}
+
+// ---------------------------------------------------------------------------
+// WASM-specific: streaming completion with per-token C callback (#2 / #3).
+// The global g_mutex is held only while looking up the context pointer so
+// that callers can cancel or query status during inference.
+// ---------------------------------------------------------------------------
+const char * llama_completion_stream(
+    int64_t  context_id,
+    const char * params_json,
+    void (* token_callback)(const char * token_text, void * user_data, int token_index),
+    void * user_data)
+{
+    try {
+        // Brief critical section — get the context pointer, then release.
+        capllama::llama_cap_context * ctx = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            ctx = get_ctx(context_id);
+            if (!ctx || !ctx->ctx) {
+                return tls_cstr("{\"error\":\"invalid context\"}");
+            }
+        }
+
+        std::string prompt_str;
+        int n_predict = 50;
+        parse_completion_params(ctx, params_json, prompt_str, n_predict);
+
+        capllama::llama_cap_tokenize_result tokenize_result = ctx->tokenize(prompt_str, {});
+        std::vector<llama_token> prompt_tokens = tokenize_result.tokens;
+
+        if (!ctx->completion) {
+            if (!ctx->ctx || !ctx->model) {
+                return tls_cstr("{\"error\":\"invalid context\"}");
+            }
+            try {
+                ctx->completion = new capllama::llama_cap_context_completion(ctx);
+                if (!ctx->completion->initSampling() || !ctx->completion->ctx_sampling) {
+                    delete ctx->completion;
+                    ctx->completion = nullptr;
+                    return tls_cstr("{\"error\":\"sampling init failed\"}");
+                }
+            } catch (const std::exception & e) {
+                if (ctx->completion) {
+                    delete ctx->completion;
+                    ctx->completion = nullptr;
+                }
+                json err = {{"error", std::string("completion init: ") + e.what()}};
+                return tls_cstr(err.dump());
+            }
+        }
+
+        std::string generated_text;
+        int tokens_generated = 0;
+        bool hit_eos = false;
+        const llama_vocab * vocab = llama_model_get_vocab(ctx->model);
+
+        try {
+            ctx->completion->rewind();
+            ctx->completion->loadPrompt({});
+            ctx->completion->beginCompletion();
+
+            while (tokens_generated < n_predict && !ctx->completion->is_interrupted) {
+                capllama::completion_token_output token_output = ctx->completion->nextToken();
+                if (llama_vocab_is_eog(vocab, token_output.tok)) {
+                    hit_eos = true;
+                    break;
+                }
+                std::string token_text = capllama::tokens_to_output_formatted_string(ctx->ctx, token_output.tok);
+                generated_text += token_text;
+
+                if (token_callback) {
+                    token_callback(token_text.c_str(), user_data, tokens_generated);
+                }
+                tokens_generated++;
+            }
+            ctx->completion->endCompletion();
+        } catch (const std::exception & e) {
+            try {
+                if (ctx->completion) ctx->completion->endCompletion();
+            } catch (...) {}
+            json err = {{"error", e.what()}};
+            return tls_cstr(err.dump());
+        }
+
+        const bool stopped_limit  = tokens_generated >= n_predict;
+        const bool interrupted    = ctx->completion && ctx->completion->is_interrupted;
+
+        json timings = {
+            {"prompt_n",                static_cast<int>(prompt_tokens.size())},
+            {"predicted_n",             tokens_generated},
+            {"prompt_ms",               0},
+            {"predicted_ms",            0},
+            {"prompt_per_token_ms",     0},
+            {"predicted_per_token_ms",  0},
+            {"prompt_per_second",       0},
+            {"predicted_per_second",    0},
+        };
+
+        json result = {
+            {"text",              generated_text},
+            {"content",          generated_text},
+            {"reasoning_content",""},
+            {"tool_calls",       json::array()},
+            {"tokens_predicted", tokens_generated},
+            {"tokens_evaluated", static_cast<int>(prompt_tokens.size())},
+            {"truncated",        false},
+            {"stopped_eos",      hit_eos},
+            {"stopped_word",     ""},
+            {"stopped_limit",    stopped_limit},
+            {"stopping_word",    ""},
+            {"context_full",     false},
+            {"interrupted",      interrupted},
+            {"chat_format",      0},
+            {"tokens_cached",    0},
+            {"timings",          timings},
+        };
+        return tls_cstr(result.dump());
+    } catch (const std::exception & e) {
+        json err = {{"error", e.what()}};
+        return tls_cstr(err.dump());
+    } catch (...) {
+        return tls_cstr("{\"error\":\"unknown\"}");
+    }
+}
+
+#endif // CAPLLAMA_BUILD_WASM
+
 const char * llama_model_info(const char * model_path, const char * skip_json) {
     (void)skip_json;
     if (!model_path || !std::strlen(model_path)) {
