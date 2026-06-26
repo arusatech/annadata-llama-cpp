@@ -147,9 +147,74 @@ export async function ensureModelInOpfs(
 }
 
 /**
- * Read the model from OPFS as an ArrayBuffer, entirely within the caller's
- * context (intended to be called from inside the Web Worker, not the main
- * thread, so the buffer never crosses the thread boundary — fixes #9).
+ * Choice 3 — primary web model load path.
+ * Opens an OPFS FileSystemSyncAccessHandle in the worker and reads the
+ * model in fixed-size chunks (default 4MB). Chunks are streamed into WASM
+ * MEMFS; the full GGUF is never materialised as a single JS ArrayBuffer.
+ *
+ * Worker-only: createSyncAccessHandle is not available on the main thread.
+ */
+export const OPFS_MODEL_CHUNK_BYTES = 4 * 1024 * 1024;
+
+export interface OpfsModelSyncReader {
+  readonly sizeBytes: number;
+  readChunk(offset: number, length?: number): Uint8Array;
+  close(): void;
+}
+
+export async function openOpfsModelSyncReader(modelId: string): Promise<OpfsModelSyncReader> {
+  const entry = await getManifestEntry(modelId);
+  if (!entry) {
+    throw new LlmError('MODEL_NOT_LOADED', `Model '${modelId}' is not present in OPFS manifest.`);
+  }
+
+  const fileHandle = await ensureParentDirAndFileHandle(entry.path, false);
+  if (typeof fileHandle.createSyncAccessHandle !== 'function') {
+    throw new LlmError(
+      'STORAGE_UNAVAILABLE',
+      'OPFS sync access handles are not available in this browser/worker context.',
+      { modelId },
+    );
+  }
+
+  let accessHandle: {
+    getSize(): number;
+    read(buffer: Uint8Array, options: { at: number }): number;
+    close(): void;
+  };
+  try {
+    accessHandle = await fileHandle.createSyncAccessHandle();
+  } catch (error) {
+    throw new LlmError('STORAGE_IO_FAILED', `Failed to open OPFS sync handle for '${modelId}'.`, {
+      modelId,
+      path: entry.path,
+      cause: String(error),
+    });
+  }
+
+  const sizeBytes = accessHandle.getSize();
+  await upsertManifestEntry({ ...entry, lastUsedAt: Date.now() });
+
+  return {
+    sizeBytes,
+    readChunk(offset: number, length = OPFS_MODEL_CHUNK_BYTES) {
+      const toRead = Math.min(length, sizeBytes - offset);
+      if (toRead <= 0) {
+        return new Uint8Array(0);
+      }
+      const buf = new Uint8Array(toRead);
+      const bytesRead = accessHandle.read(buf, { at: offset });
+      return buf.subarray(0, bytesRead);
+    },
+    close() {
+      accessHandle.close();
+    },
+  };
+}
+
+/**
+ * Read the model from OPFS as an ArrayBuffer (fallback when sync handles
+ * are unavailable). Prefer openOpfsModelSyncReader in workers.
  */
 export async function readModelBufferFromOpfs(modelId: string): Promise<{ buffer: ArrayBuffer; sizeBytes: number }> {
   const file = await readModelFromOpfs(modelId);

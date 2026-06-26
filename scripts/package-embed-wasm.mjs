@@ -156,6 +156,34 @@ export function memory_snapshot() {
   if (!_mod) throw new Error('llama_engine not ready — await init() first');
   return _mod.memory_snapshot();
 }
+
+// ── VFS streaming API (preferred over load_model for large models) ────────────
+// These allow writing the GGUF in chunks via Emscripten MEMFS, which keeps
+// peak WASM heap usage at ~1.4 GB instead of ~2.1 GB for a 697 MB model.
+
+/** Begin streaming a model into MEMFS. Returns the temp VFS path. */
+export function model_vfs_begin() {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  return _mod.model_vfs_begin();
+}
+
+/** Append a chunk to an in-progress VFS model write. */
+export function model_vfs_write(vfs_path, chunk) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  return _mod.model_vfs_write(vfs_path, chunk);
+}
+
+/** Abort a partial VFS write and remove the temp file. */
+export function model_vfs_abort(vfs_path) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  return _mod.model_vfs_abort(vfs_path);
+}
+
+/** Finish a streamed VFS write and load the model (deletes the VFS file). */
+export function load_model_from_vfs(model_id, vfs_path, opts_json) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  return _mod.load_model_from_vfs(model_id, vfs_path, opts_json);
+}
 `;
 await writeFile(jsOutPath, shimSrc);
 
@@ -189,6 +217,15 @@ export function health(): string;
 
 /** Current memory usage as a JSON string. */
 export function memory_snapshot(): string;
+
+/** Begin streaming a model into MEMFS. Returns the temp VFS path. */
+export function model_vfs_begin(): string;
+/** Append a chunk to an in-progress VFS model write. */
+export function model_vfs_write(vfs_path: string, chunk: Uint8Array): void;
+/** Abort a partial VFS write and remove the temp file. */
+export function model_vfs_abort(vfs_path: string): void;
+/** Finish a streamed VFS write and load the model (deletes the VFS file). */
+export function load_model_from_vfs(model_id: string, vfs_path: string, opts_json: string): void;
 
 /**
  * Default export — loads and instantiates the WebAssembly module.

@@ -147,20 +147,22 @@ export class WebProvider implements LlmProvider {
     WebProvider.globalWorkerFactory = factory;
   }
 
-  // Fix #15 (also in wasm.engine.ts): the worker URL uses the canonical
-  // import.meta.url pattern that bundlers (Vite/Webpack/Rollup) detect as a
-  // static asset. Applications that bundle with a different setup should set
-  // window.__LLAMA_WORKER_URL__ to the compiled worker script URL.
-  private defaultWorkerFactory(): Worker {
+  // Fix #15: resolve compiled worker .js first; fall back to .ts for dev.
+  private resolveWorkerUrl(): string | URL {
     const customUrl = (globalThis as any)?.__LLAMA_WORKER_URL__;
     if (typeof customUrl === 'string' && customUrl.length > 0) {
-      return new Worker(customUrl, { type: 'module' });
+      return customUrl;
     }
-    // Use new URL(..., import.meta.url) so bundlers can detect and handle it.
-    return new Worker(
-      new URL('../workers/llm.worker.ts', import.meta.url),
-      { type: 'module' },
-    );
+    try {
+      const metaUrl = new Function('return import.meta.url')() as string;
+      return new URL('../../dist/workers/llm.worker.js', metaUrl);
+    } catch {
+      return '/dist/workers/llm.worker.js';
+    }
+  }
+
+  private defaultWorkerFactory(): Worker {
+    return new Worker(this.resolveWorkerUrl(), { type: 'module' });
   }
 
   private ensureWorker(): Worker {
@@ -240,13 +242,18 @@ export class WebProvider implements LlmProvider {
 
   async initialize(opts: InitializeOptions): Promise<void> {
     // Fix #10: gate on capability check before touching the worker.
-    const caps = checkWasmCapabilities();
-    if (!caps.supported) {
-      throw new LlmError(
-        'UNSUPPORTED_PLATFORM',
-        `Missing browser capabilities for WASM inference: ${caps.missing.join(', ')}`,
-        { missing: caps.missing },
-      );
+    // Skip when a custom worker factory is injected (tests / custom hosts).
+    const usingCustomWorker =
+      !!this.workerFactoryOverride || !!WebProvider.globalWorkerFactory;
+    if (!usingCustomWorker) {
+      const caps = checkWasmCapabilities();
+      if (!caps.supported) {
+        throw new LlmError(
+          'UNSUPPORTED_PLATFORM',
+          `Missing browser capabilities for WASM inference: ${caps.missing.join(', ')}`,
+          { missing: caps.missing },
+        );
+      }
     }
     await this.sendRequest<{ ok: boolean }>({ type: 'INIT' });
     await this.loadModel(opts);

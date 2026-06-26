@@ -191,7 +191,11 @@ describe('WebProvider contract (browser-level with worker indirection)', () => {
     });
     const provider = new WebProvider();
     await provider.initialize({ modelId: 'fresh-model', modelUrl: 'https://example.com/fresh.gguf' });
-    expect(mockedEnsureModelInOpfs).toHaveBeenCalledWith('fresh-model', 'https://example.com/fresh.gguf');
+    expect(mockedEnsureModelInOpfs).toHaveBeenCalledWith(
+      'fresh-model',
+      'https://example.com/fresh.gguf',
+      undefined,
+    );
   });
 });
 

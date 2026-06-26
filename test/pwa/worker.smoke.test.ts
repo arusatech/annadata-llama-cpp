@@ -4,6 +4,17 @@ jest.mock('../../src/workers/wasm.engine', () => ({
   loadLlamaWasmEngine: jest.fn(),
 }));
 
+jest.mock('../../src/storage/opfs.store', () => ({
+  openOpfsModelSyncReader: jest.fn().mockRejectedValue(
+    Object.assign(new Error('OPFS sync access handle unavailable'), { code: 'STORAGE_UNAVAILABLE' }),
+  ),
+  readModelBufferFromOpfs: jest.fn().mockResolvedValue({
+    buffer: new Uint8Array([1, 2, 3]).buffer,
+    sizeBytes: 3,
+  }),
+  OPFS_MODEL_CHUNK_BYTES: 4 * 1024 * 1024,
+}));
+
 type WorkerSelf = {
   onmessage?: (evt: { data: unknown }) => Promise<void> | void;
   postMessage: (evt: WorkerEvent) => void;
@@ -11,6 +22,12 @@ type WorkerSelf = {
 
 const flush = async (): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, 0));
+
+/** Engine mocks must expose choice-3 streaming load (tests fall back to loadModel). */
+const withWasmEngineMocks = (engine: Record<string, unknown>) => ({
+  loadModelFromOpfsReader: async () => {},
+  ...engine,
+});
 
 const bootstrapWorker = async (engine?: Record<string, unknown>) => {
   jest.resetModules();
@@ -25,7 +42,7 @@ const bootstrapWorker = async (engine?: Record<string, unknown>) => {
     const wasmEngineModule = await import('../../src/workers/wasm.engine');
     const mockedLoadEngine = wasmEngineModule
       .loadLlamaWasmEngine as jest.MockedFunction<typeof wasmEngineModule.loadLlamaWasmEngine>;
-    mockedLoadEngine.mockResolvedValue(engine as any);
+    mockedLoadEngine.mockResolvedValue(withWasmEngineMocks(engine) as any);
   }
 
   await import('../../src/workers/llm.worker');
@@ -74,7 +91,6 @@ describe('PWA worker smoke', () => {
       id: 'load-before-init',
       type: 'LOAD_MODEL',
       modelId: 'm1',
-      modelBuffer: new ArrayBuffer(1),
       opts: {},
     });
 
@@ -112,7 +128,6 @@ describe('PWA worker smoke', () => {
       id: 'flow-load',
       type: 'LOAD_MODEL',
       modelId: 'model-a',
-      modelBuffer: new Uint8Array([1, 2, 3]).buffer,
       opts: {},
     });
     await sendRequest(selfObj, {

@@ -23,7 +23,7 @@ try {
 } catch {
   console.error(
     `[copy-wasm-assets] ERROR: '${wasmPkgDir}' does not exist.\n` +
-    `Run 'npm run build:wasm:embed' (or 'wasm-pack build src-rust --target web') first.`,
+    `Run 'npm run build:wasm' first.`,
   );
   process.exit(1);
 }

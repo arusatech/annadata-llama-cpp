@@ -1,8 +1,9 @@
 import type { WorkerEvent, WorkerRequest } from './worker.protocol';
 import { loadLlamaWasmEngine, type WasmEngine } from './wasm.engine';
-// readModelBufferFromOpfs reads from OPFS inside the worker so the buffer
-// is never created on the main thread, halving peak memory usage (#9).
-import { readModelBufferFromOpfs } from '../storage/opfs.store';
+import {
+  openOpfsModelSyncReader,
+  readModelBufferFromOpfs,
+} from '../storage/opfs.store';
 
 type GenerateResult = {
   text: string;
@@ -49,6 +50,43 @@ const tryLoadEngine = async (): Promise<WasmEngine> => {
   return engine;
 };
 
+const loadModelFromOpfs = async (
+  engine: WasmEngine,
+  modelId: string,
+  opts: Record<string, unknown> | undefined,
+): Promise<void> => {
+  // Choice 3 (primary): OPFS sync access handle → chunked stream → WASM MEMFS.
+  // Never materialises the full model in the JS heap (required for 2GB+ models).
+  if (typeof engine.loadModelFromOpfsReader !== 'function') {
+    throw new Error(
+      'WASM module is missing OPFS streaming exports (model_vfs_*). ' +
+        'Rebuild with: npm run build:wasm',
+    );
+  }
+
+  try {
+    const reader = await openOpfsModelSyncReader(modelId);
+    await engine.loadModelFromOpfsReader(modelId, reader, opts);
+    return;
+  } catch (error) {
+    const code = (error as { code?: string })?.code;
+    const message = error instanceof Error ? error.message : String(error);
+    const syncUnavailable =
+      code === 'STORAGE_UNAVAILABLE' || /sync access handle/i.test(message);
+    if (!syncUnavailable) {
+      throw error;
+    }
+  }
+
+  // Legacy fallback (choice 1): only when sync handles are unavailable (older browsers).
+  console.warn(
+    `[llama-cpp] OPFS sync access handle unavailable for '${modelId}'; ` +
+      'falling back to full-buffer load (not suitable for models >2GB).',
+  );
+  const { buffer, sizeBytes } = await readModelBufferFromOpfs(modelId);
+  await engine.loadModel(modelId, buffer, { ...(opts ?? {}), modelBytes: sizeBytes });
+};
+
 self.onmessage = async (evt: MessageEvent<WorkerRequest>) => {
   const req = evt.data;
 
@@ -75,23 +113,14 @@ self.onmessage = async (evt: MessageEvent<WorkerRequest>) => {
         }
         const engine = ensureEngine();
 
-        // Fix #9: read from OPFS here in the worker, not on the main thread.
-        // This means the ArrayBuffer is only ever alive inside the worker heap.
-        let buffer: ArrayBuffer;
-        let sizeBytes: number;
+        // Fix #9: read from OPFS in the worker via sync-handle streaming when
+        // available; never on the main thread.
         try {
-          const result = await readModelBufferFromOpfs(req.modelId);
-          buffer = result.buffer;
-          sizeBytes = result.sizeBytes;
+          await loadModelFromOpfs(engine, req.modelId, req.opts);
         } catch (readErr) {
           postError(req.id, 'STORAGE_IO_FAILED', `Failed to read model '${req.modelId}' from OPFS in worker: ${readErr instanceof Error ? readErr.message : String(readErr)}`);
           return;
         }
-
-        await engine.loadModel(req.modelId, buffer, {
-          ...(req.opts ?? {}),
-          modelBytes: sizeBytes,
-        });
         state.loadedModels.add(req.modelId);
         postEvent({
           id: req.id,

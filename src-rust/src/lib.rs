@@ -43,11 +43,10 @@ pub fn init() -> Result<(), JsValue> {
     Ok(())
 }
 
-/// Load a model from raw bytes (#1 / #9).
-/// The `bytes` parameter is the full GGUF model content read from OPFS
-/// inside the Web Worker (not the main thread — fixes #9).
-/// On Emscripten/WASI builds the bytes are written to a temp VFS path and
-/// loaded; on the mock scaffold the model is registered with a stub context.
+/// Load a model from raw bytes (legacy fallback — choice 1).
+/// Production web loads use choice 3: OPFS sync-handle streaming via
+/// `model_vfs_begin` / `model_vfs_write` / `load_model_from_vfs` so the
+/// full GGUF is never held in the JS heap at once.
 #[wasm_bindgen]
 pub fn load_model(model_id: String, bytes: &[u8], opts_json: String) -> Result<(), JsValue> {
     #[cfg(llama_embed_cpp)]
@@ -92,6 +91,72 @@ pub fn load_model(model_id: String, bytes: &[u8], opts_json: String) -> Result<(
     #[cfg(not(llama_embed_cpp))]
     {
         let _ = (model_id, bytes, opts_json);
+        Err(embedded_unavailable())
+    }
+}
+
+/// Begin streaming a model from OPFS sync-handle chunks into MEMFS (choice 3).
+/// Returns the temporary VFS path to pass to `model_vfs_write` / `load_model_from_vfs`.
+#[wasm_bindgen]
+pub fn model_vfs_begin() -> Result<String, JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        ffi::model_vfs_begin().map_err(|e| JsValue::from_str(&e))
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        Err(embedded_unavailable())
+    }
+}
+
+/// Append one chunk to a VFS model file opened via `model_vfs_begin`.
+#[wasm_bindgen]
+pub fn model_vfs_write(vfs_path: String, chunk: &[u8]) -> Result<(), JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        ffi::model_vfs_write(&vfs_path, chunk).map_err(|e| JsValue::from_str(&e))
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = (vfs_path, chunk);
+        Err(embedded_unavailable())
+    }
+}
+
+/// Abort a partial VFS model write and remove the temp file.
+#[wasm_bindgen]
+pub fn model_vfs_abort(vfs_path: String) {
+    #[cfg(llama_embed_cpp)]
+    {
+        ffi::model_vfs_abort(&vfs_path);
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = vfs_path;
+    }
+}
+
+/// Finish a streamed VFS model write and register the loaded model.
+#[wasm_bindgen]
+pub fn load_model_from_vfs(model_id: String, vfs_path: String, opts_json: String) -> Result<(), JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        let lock = global_state();
+        let mut state = lock
+            .lock()
+            .map_err(|_| JsValue::from_str("Failed to acquire engine state lock"))?;
+        if !state.initialized {
+            return Err(JsValue::from_str("Engine not initialized"));
+        }
+
+        let context_id = ffi::model_vfs_finish(&vfs_path, &opts_json)
+            .map_err(|e| JsValue::from_str(&e))?;
+        state.set_context(&model_id, context_id);
+        Ok(())
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = (model_id, vfs_path, opts_json);
         Err(embedded_unavailable())
     }
 }
@@ -212,8 +277,8 @@ pub fn generate(model_id: String, req_json: String) -> Result<String, JsValue> {
 }
 
 /// Streaming generation: calls `on_token(token, index)` for each token (#3).
-/// Uses `llama_completion_stream` which releases the global mutex between
-/// the context lookup and the inference loop, fixing #2 for the WASM path.
+/// The Rust EngineState lock is released before calling into C (#2); the C++
+/// g_mutex is held for the full streaming inference to prevent context UAF.
 #[wasm_bindgen]
 pub fn generate_stream(
     model_id: String,

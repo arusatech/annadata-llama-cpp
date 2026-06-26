@@ -23,8 +23,20 @@ extern "C" {
         params_json: *const c_char,
     ) -> i64;
 
+    /// Begin streaming a model file into MEMFS (OPFS sync-handle path, #9).
+    pub fn llama_model_vfs_begin() -> *const c_char;
+
+    /// Append a chunk to an in-progress VFS model file.
+    pub fn llama_model_vfs_write(path: *const c_char, data: *const u8, len: usize) -> i32;
+
+    /// Abort and remove a partial VFS model file.
+    pub fn llama_model_vfs_abort(path: *const c_char);
+
+    /// Close the VFS file and load the model from the written path.
+    pub fn llama_model_vfs_finish(path: *const c_char, params_json: *const c_char) -> i64;
+
     /// Release a context and free its resources
-    pub fn llama_release_context(context_id: i64) -> i32;
+    pub fn llama_release_context(context_id: i64);
 
     /// Run text completion/generation (synchronous, returns full result)
     pub fn llama_completion(
@@ -33,8 +45,7 @@ extern "C" {
     ) -> *const c_char;
 
     /// Streaming completion (#3): calls `token_callback` once per token.
-    /// The global g_mutex is held only for context lookup, not during
-    /// the entire generation loop, fixing the mutex-held-too-long bug (#2).
+    /// Holds g_mutex for the full inference (same as llama_completion).
     pub fn llama_completion_stream(
         context_id: i64,
         params_json: *const c_char,
@@ -89,6 +100,55 @@ pub fn init_context_from_buffer(bytes: &[u8], params_json: &str) -> Result<i64, 
     }
 }
 
+/// Begin a streaming VFS write for OPFS sync-handle model loading (#9).
+pub fn model_vfs_begin() -> Result<String, String> {
+    unsafe {
+        let path_ptr = llama_model_vfs_begin();
+        if path_ptr.is_null() {
+            return Err("llama_model_vfs_begin failed — MEMFS may be unavailable".to_string());
+        }
+        CStr::from_ptr(path_ptr)
+            .to_str()
+            .map(|s| s.to_string())
+            .map_err(|e| format!("Invalid VFS path: {}", e))
+    }
+}
+
+/// Write one chunk to an in-progress VFS model file.
+pub fn model_vfs_write(path: &str, chunk: &[u8]) -> Result<(), String> {
+    let path_cstr = CString::new(path).map_err(|e| format!("Invalid VFS path: {}", e))?;
+    unsafe {
+        let rc = llama_model_vfs_write(path_cstr.as_ptr(), chunk.as_ptr(), chunk.len());
+        if rc != 0 {
+            return Err("llama_model_vfs_write failed".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Abort a partial VFS model write.
+pub fn model_vfs_abort(path: &str) {
+    if let Ok(path_cstr) = CString::new(path) {
+        unsafe {
+            llama_model_vfs_abort(path_cstr.as_ptr());
+        }
+    }
+}
+
+/// Finish the VFS write and load the model.
+pub fn model_vfs_finish(path: &str, params_json: &str) -> Result<i64, String> {
+    let path_cstr = CString::new(path).map_err(|e| format!("Invalid VFS path: {}", e))?;
+    let params_cstr = CString::new(params_json)
+        .map_err(|e| format!("Invalid params JSON: {}", e))?;
+    unsafe {
+        let id = llama_model_vfs_finish(path_cstr.as_ptr(), params_cstr.as_ptr());
+        if id <= 0 {
+            return Err("llama_model_vfs_finish failed — model may be invalid".to_string());
+        }
+        Ok(id)
+    }
+}
+
 /// Safe wrapper for initialization
 pub fn init_context(model_path: &str, params_json: &str) -> Result<i64, String> {
     let model_path_cstr = CString::new(model_path)
@@ -108,7 +168,7 @@ pub fn init_context(model_path: &str, params_json: &str) -> Result<i64, String> 
 /// Safe wrapper for context release
 pub fn release_context(context_id: i64) {
     unsafe {
-        let _ = llama_release_context(context_id);
+        llama_release_context(context_id);
     }
 }
 
@@ -205,7 +265,7 @@ pub fn tokenize(context_id: i64, text: &str) -> Result<Vec<i32>, String> {
 
 /// Safe wrapper for streaming completion (#3).
 /// Calls `on_token(token_text, index)` for every generated token.
-/// The C layer holds the context mutex only briefly for lookup (#2).
+/// The C++ g_mutex is held for the full inference (same as llama_completion).
 pub fn completion_stream<F>(
     context_id: i64,
     params_json: &str,

@@ -20,6 +20,12 @@ type EmbedResult = {
 export type WasmEngine = {
   init?: () => Promise<void> | void;
   loadModel: (modelId: string, modelBuffer: ArrayBuffer, opts?: Record<string, unknown>) => Promise<void> | void;
+  /** Stream from OPFS sync handle without holding full model in JS heap (#9). */
+  loadModelFromOpfsReader?: (
+    modelId: string,
+    reader: { sizeBytes: number; readChunk: (offset: number, length?: number) => Uint8Array; close: () => void },
+    opts?: Record<string, unknown>,
+  ) => Promise<void> | void;
   unloadModel: (modelId: string) => Promise<void> | void;
   generate: (
     modelId: string,
@@ -43,6 +49,10 @@ type WasmModule = {
   /** @deprecated use init_engine — kept for backwards compat with older builds */
   init?: () => void;
   load_model?: (modelId: string, bytes: Uint8Array, optsJson: string) => void;
+  model_vfs_begin?: () => string;
+  model_vfs_write?: (vfsPath: string, chunk: Uint8Array) => void;
+  model_vfs_abort?: (vfsPath: string) => void;
+  load_model_from_vfs?: (modelId: string, vfsPath: string, optsJson: string) => void;
   unload_model?: (modelId: string) => void;
   generate?: (modelId: string, reqJson: string) => string;
   // generate_stream is the real streaming export from Rust/wasm-bindgen (#3).
@@ -125,12 +135,72 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
     },
 
     loadModel: async (modelId, modelBuffer, opts) => {
-      const loadModel = mod.load_model;
-      if (!loadModel) {
-        throw new Error('Wasm module missing load_model export');
+      // Prefer VFS chunked write to keep peak WASM heap at ~1.4 GB instead
+      // of ~2.1 GB.  load_model(bytes) causes: wasm-bindgen copy (697 MB) +
+      // fwrite to VFS (697 MB) + llama context (697 MB) = OOM / unreachable.
+      // VFS path: 32 MB chunk per write + accumulated VFS (697 MB) +
+      // llama context (697 MB) during finish = 1.4 GB peak, VFS freed after.
+      const begin = mod.model_vfs_begin;
+      const write = mod.model_vfs_write;
+      const finish = mod.load_model_from_vfs;
+      const abort = mod.model_vfs_abort;
+
+      if (begin && write && finish) {
+        const vfsPath = begin();
+        if (!vfsPath) throw new Error('model_vfs_begin returned empty path');
+        const optsJson = JSON.stringify(opts ?? {});
+        try {
+          const CHUNK = 32 * 1024 * 1024; // 32 MB — keeps per-iteration WASM alloc small
+          const bytes = new Uint8Array(modelBuffer);
+          for (let offset = 0; offset < bytes.length; offset += CHUNK) {
+            // subarray is a zero-copy view; wasm-bindgen copies only 32 MB per call
+            write(vfsPath, bytes.subarray(offset, offset + CHUNK));
+          }
+          finish(modelId, vfsPath, optsJson);
+        } catch (err) {
+          abort?.(vfsPath);
+          throw err;
+        }
+        return;
       }
-      // Pass the full ArrayBuffer (read from OPFS inside the worker — #9).
-      loadModel(modelId, new Uint8Array(modelBuffer), JSON.stringify(opts ?? {}));
+
+      // Fallback for builds that pre-date the VFS streaming API.
+      const loadModelFn = mod.load_model;
+      if (!loadModelFn) throw new Error('Wasm module missing load_model export');
+      loadModelFn(modelId, new Uint8Array(modelBuffer), JSON.stringify(opts ?? {}));
+    },
+
+    loadModelFromOpfsReader: async (modelId, reader, opts) => {
+      const begin = mod.model_vfs_begin;
+      const write = mod.model_vfs_write;
+      const finish = mod.load_model_from_vfs;
+      const abort = mod.model_vfs_abort;
+      if (!begin || !write || !finish) {
+        throw new Error('Wasm module missing OPFS streaming exports (model_vfs_*)');
+      }
+
+      const vfsPath = begin();
+      if (!vfsPath) {
+        throw new Error('model_vfs_begin returned empty path');
+      }
+
+      try {
+        const chunkSize = 4 * 1024 * 1024;
+        for (let offset = 0; offset < reader.sizeBytes; ) {
+          const chunk = reader.readChunk(offset, chunkSize);
+          if (chunk.byteLength === 0) {
+            break;
+          }
+          write(vfsPath, chunk);
+          offset += chunk.byteLength;
+        }
+        finish(modelId, vfsPath, JSON.stringify(opts ?? {}));
+      } catch (error) {
+        abort?.(vfsPath);
+        throw error;
+      } finally {
+        reader.close();
+      }
     },
 
     unloadModel: async (modelId) => {

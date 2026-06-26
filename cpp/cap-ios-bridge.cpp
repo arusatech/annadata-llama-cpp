@@ -494,9 +494,69 @@ int64_t llama_init_context_from_buffer(
 }
 
 // ---------------------------------------------------------------------------
+// Choice 3: stream model bytes from OPFS sync access handle into MEMFS.
+// JS reads fixed-size chunks via FileSystemSyncAccessHandle and calls
+// llama_model_vfs_write; llama_model_vfs_finish loads from the VFS path.
+// Peak JS heap holds one chunk (~4MB), not the full GGUF.
+// ---------------------------------------------------------------------------
+static std::map<std::string, FILE *> g_model_vfs_writes;
+static int g_vfs_stream_counter = 0;
+
+const char * llama_model_vfs_begin() {
+    std::string path = std::string("/tmp/wasm_stream_") + std::to_string(g_vfs_stream_counter++) + ".gguf";
+    FILE * f = fopen(path.c_str(), "wb");
+    if (!f) {
+        return nullptr;
+    }
+    g_model_vfs_writes[path] = f;
+    return tls_cstr(path);
+}
+
+int llama_model_vfs_write(const char * path, const uint8_t * data, size_t len) {
+    if (!path || !data || len == 0) {
+        return -1;
+    }
+    auto it = g_model_vfs_writes.find(path);
+    if (it == g_model_vfs_writes.end() || !it->second) {
+        return -1;
+    }
+    return fwrite(data, 1, len, it->second) == len ? 0 : -1;
+}
+
+void llama_model_vfs_abort(const char * path) {
+    if (!path) {
+        return;
+    }
+    auto it = g_model_vfs_writes.find(path);
+    if (it != g_model_vfs_writes.end()) {
+        if (it->second) {
+            fclose(it->second);
+        }
+        g_model_vfs_writes.erase(it);
+    }
+    remove(path);
+}
+
+int64_t llama_model_vfs_finish(const char * path, const char * params_json) {
+    if (!path) {
+        return -1;
+    }
+    auto it = g_model_vfs_writes.find(path);
+    if (it != g_model_vfs_writes.end()) {
+        if (it->second) {
+            fclose(it->second);
+        }
+        g_model_vfs_writes.erase(it);
+    }
+    int64_t id = llama_init_context(path, params_json);
+    remove(path);
+    return id;
+}
+
+// ---------------------------------------------------------------------------
 // WASM-specific: streaming completion with per-token C callback (#2 / #3).
-// The global g_mutex is held only while looking up the context pointer so
-// that callers can cancel or query status during inference.
+// Holds g_mutex for the full inference (same as llama_completion) so another
+// thread cannot erase the context from g_contexts while streaming is active.
 // ---------------------------------------------------------------------------
 const char * llama_completion_stream(
     int64_t  context_id,
@@ -505,14 +565,10 @@ const char * llama_completion_stream(
     void * user_data)
 {
     try {
-        // Brief critical section — get the context pointer, then release.
-        capllama::llama_cap_context * ctx = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            ctx = get_ctx(context_id);
-            if (!ctx || !ctx->ctx) {
-                return tls_cstr("{\"error\":\"invalid context\"}");
-            }
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto * ctx = get_ctx(context_id);
+        if (!ctx || !ctx->ctx) {
+            return tls_cstr("{\"error\":\"invalid context\"}");
         }
 
         std::string prompt_str;
