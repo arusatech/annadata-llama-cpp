@@ -23,6 +23,9 @@ export type WorkerRequest =
       };
     }
   | { id: string; type: 'EMBED'; modelId: string; input: string | string[] }
+  | { id: string; type: 'TOKENIZE'; modelId: string; text: string }
+  | { id: string; type: 'DETOKENIZE'; modelId: string; tokens: number[] }
+  | { id: string; type: 'CONVERT_GRAMMAR'; schemaJson: string }
   | { id: string; type: 'HEALTH' }
   | { id: string; type: 'MEMORY' };
 

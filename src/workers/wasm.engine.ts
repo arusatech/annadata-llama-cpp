@@ -17,6 +17,18 @@ type EmbedResult = {
   vectors: number[][];
 };
 
+export type TokenizeResult = { tokens: number[]; has_media?: boolean };
+export type DetokenizeResult = { text: string };
+
+import {
+  heapfsAlloc,
+  heapfsModelPath,
+  heapfsWrite,
+  patchHeapFS,
+  supportsHeapFS,
+  type EmscriptenModule,
+} from './heapfs';
+
 export type WasmEngine = {
   init?: () => Promise<void> | void;
   loadModel: (modelId: string, modelBuffer: ArrayBuffer, opts?: Record<string, unknown>) => Promise<void> | void;
@@ -33,6 +45,12 @@ export type WasmEngine = {
     onToken?: (token: string, index: number) => void,
   ) => Promise<GenerateResult> | GenerateResult;
   embed: (modelId: string, input: string | string[]) => Promise<EmbedResult> | EmbedResult;
+  /** Tokenize text using the loaded model vocabulary. */
+  tokenize?: (modelId: string, text: string) => Promise<TokenizeResult> | TokenizeResult;
+  /** Detokenize a token ID array back to text. */
+  detokenize?: (modelId: string, tokens: number[]) => Promise<DetokenizeResult> | DetokenizeResult;
+  /** Convert a JSON Schema to a GBNF grammar string for constrained sampling. */
+  convertJsonSchemaToGrammar?: (schemaJson: string) => Promise<string> | string;
   health?: () => Promise<Record<string, unknown>> | Record<string, unknown>;
   memory?: () => Promise<Record<string, unknown>> | Record<string, unknown>;
 };
@@ -40,6 +58,7 @@ export type WasmEngine = {
 type WasmModule = {
   /** Default export: loads and initialises the .wasm binary. */
   default?: (moduleOrPath?: string | URL | Request | Response | BufferSource | WebAssembly.Module) => Promise<unknown>;
+  getEmscriptenModule?: () => EmscriptenModule | null;
   /**
    * Engine-level init (wasm_bindgen export named `init` in Rust).
    * Exported as `init_engine` / `wasm_init` in the ES module wrapper to avoid
@@ -53,11 +72,15 @@ type WasmModule = {
   model_vfs_write?: (vfsPath: string, chunk: Uint8Array) => void;
   model_vfs_abort?: (vfsPath: string) => void;
   load_model_from_vfs?: (modelId: string, vfsPath: string, optsJson: string) => void;
+  load_model_from_path?: (modelId: string, vfsPath: string, optsJson: string) => void;
   unload_model?: (modelId: string) => void;
   generate?: (modelId: string, reqJson: string) => string;
   // generate_stream is the real streaming export from Rust/wasm-bindgen (#3).
   generate_stream?: (modelId: string, reqJson: string, onToken: (token: string, index: number) => void) => string;
   embed?: (modelId: string, reqJson: string) => string;
+  tokenize?: (modelId: string, text: string) => string;
+  detokenize?: (modelId: string, tokensJson: string) => string;
+  convert_json_schema_to_grammar?: (schemaJson: string) => string;
   health?: () => string;
   memory_snapshot?: () => string;
 };
@@ -126,12 +149,24 @@ const loadWasmModule = async (): Promise<WasmModule> => {
 
 export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
   const mod = await loadWasmModule();
+  const emscripten = (): EmscriptenModule | null => mod.getEmscriptenModule?.() ?? null;
+
+  const ensureHeapFS = (): EmscriptenModule => {
+    const em = emscripten();
+    if (!em || !supportsHeapFS(em)) {
+      throw new Error('Wasm build missing HeapFS runtime (mmapAlloc/MEMFS/FS) — rebuild with npm run build:wasm');
+    }
+    patchHeapFS(em);
+    return em;
+  };
 
   return {
     init: async () => {
-      // init_engine is the Rust #[wasm_bindgen] pub fn init() export.
-      // Older builds may still expose it as `init`; fall back gracefully.
       (mod.init_engine ?? mod.init)?.();
+      const em = emscripten();
+      if (em && supportsHeapFS(em)) {
+        patchHeapFS(em);
+      }
     },
 
     loadModel: async (modelId, modelBuffer, opts) => {
@@ -171,33 +206,59 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
     },
 
     loadModelFromOpfsReader: async (modelId, reader, opts) => {
-      const begin = mod.model_vfs_begin;
-      const write = mod.model_vfs_write;
-      const finish = mod.load_model_from_vfs;
-      const abort = mod.model_vfs_abort;
-      if (!begin || !write || !finish) {
-        throw new Error('Wasm module missing OPFS streaming exports (model_vfs_*)');
-      }
-
-      const vfsPath = begin();
-      if (!vfsPath) {
-        throw new Error('model_vfs_begin returned empty path');
-      }
+      const loadFromPath = mod.load_model_from_path;
+      const optsJson = JSON.stringify({ ...(opts ?? {}), use_mmap: true });
+      const chunkSize = 4 * 1024 * 1024;
 
       try {
-        const chunkSize = 4 * 1024 * 1024;
-        for (let offset = 0; offset < reader.sizeBytes; ) {
-          const chunk = reader.readChunk(offset, chunkSize);
-          if (chunk.byteLength === 0) {
-            break;
+        // HeapFS path (wllama-style): allocate model directly in WASM linear memory.
+        if (loadFromPath) {
+          try {
+            const em = ensureHeapFS();
+            const basename = `${modelId.replace(/[^\w.-]/g, '_')}.gguf`;
+            const vfsPath = heapfsModelPath(basename);
+            em.FS.createDataFile('/models', basename, new ArrayBuffer(0), true, true, true);
+            const fileId = heapfsAlloc(em, basename, reader.sizeBytes, true);
+            for (let offset = 0; offset < reader.sizeBytes; ) {
+              const chunk = reader.readChunk(offset, chunkSize);
+              if (chunk.byteLength === 0) break;
+              heapfsWrite(em, fileId, chunk, offset);
+              offset += chunk.byteLength;
+            }
+            loadFromPath(modelId, vfsPath, optsJson);
+            return;
+          } catch (heapErr) {
+            console.warn('[llama-cpp] HeapFS load failed; falling back to VFS streaming:', heapErr);
           }
-          write(vfsPath, chunk);
-          offset += chunk.byteLength;
         }
-        finish(modelId, vfsPath, JSON.stringify(opts ?? {}));
-      } catch (error) {
-        abort?.(vfsPath);
-        throw error;
+
+        const begin = mod.model_vfs_begin;
+        const write = mod.model_vfs_write;
+        const finish = mod.load_model_from_vfs;
+        const abort = mod.model_vfs_abort;
+        if (!begin || !write || !finish) {
+          throw new Error('Wasm module missing OPFS streaming exports (model_vfs_* / load_model_from_path)');
+        }
+
+        const vfsPath = begin();
+        if (!vfsPath) {
+          throw new Error('model_vfs_begin returned empty path');
+        }
+
+        try {
+          for (let offset = 0; offset < reader.sizeBytes; ) {
+            const chunk = reader.readChunk(offset, chunkSize);
+            if (chunk.byteLength === 0) {
+              break;
+            }
+            write(vfsPath, chunk);
+            offset += chunk.byteLength;
+          }
+          finish(modelId, vfsPath, optsJson);
+        } catch (error) {
+          abort?.(vfsPath);
+          throw error;
+        }
       } finally {
         reader.close();
       }
@@ -210,10 +271,30 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
     },
 
     generate: async (modelId, req, onToken) => {
-      // Fix #3: use generate_stream when a streaming callback is provided so
-      // tokens arrive incrementally from the C++ generation loop, not as a
-      // post-hoc split of the completed string.
       if (onToken && typeof mod.generate_stream === 'function') {
+        const em = emscripten() as (EmscriptenModule & {
+          __llamaWasmJspi?: boolean;
+          __llamaStreamOnToken?: (token: string, index: number) => void | Promise<void>;
+        }) | null;
+
+        // JSPI build: tokens delivered incrementally via EM_ASYNC_JS in C++.
+        if (em?.__llamaWasmJspi) {
+          em.__llamaStreamOnToken = async (token: string, index: number) => {
+            onToken(token, index);
+          };
+          try {
+            const raw = mod.generate_stream(modelId, JSON.stringify(req ?? {}), () => {});
+            return safeJsonParse<GenerateResult>(raw, {
+              text: '',
+              tokens_predicted: 0,
+              tokens_evaluated: 0,
+              finish_reason: 'error',
+            });
+          } finally {
+            em.__llamaStreamOnToken = undefined;
+          }
+        }
+
         const raw = mod.generate_stream(modelId, JSON.stringify(req ?? {}), onToken);
         return safeJsonParse<GenerateResult>(raw, {
           text: '',
@@ -239,6 +320,34 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
       if (!embed) throw new Error('Wasm module missing embed export');
       const raw = embed(modelId, JSON.stringify({ input }));
       return safeJsonParse<EmbedResult>(raw, { vectors: [] });
+    },
+
+    tokenize: async (modelId, text) => {
+      if (!mod.tokenize) {
+        throw new Error('Wasm module missing tokenize export — rebuild with npm run build:wasm');
+      }
+      const raw = mod.tokenize(modelId, text);
+      const parsed = safeJsonParse<Record<string, unknown>>(raw, {});
+      const tokens = Array.isArray(parsed['tokens'])
+        ? (parsed['tokens'] as number[])
+        : [];
+      return { tokens, has_media: Boolean(parsed['has_media']) };
+    },
+
+    detokenize: async (modelId, tokens) => {
+      if (!mod.detokenize) {
+        throw new Error('Wasm module missing detokenize export — rebuild with npm run build:wasm');
+      }
+      const raw = mod.detokenize(modelId, JSON.stringify(tokens));
+      const parsed = safeJsonParse<{ text?: string }>(raw, {});
+      return { text: parsed.text ?? raw };
+    },
+
+    convertJsonSchemaToGrammar: async (schemaJson) => {
+      if (!mod.convert_json_schema_to_grammar) {
+        throw new Error('Wasm module missing convert_json_schema_to_grammar export — rebuild with npm run build:wasm');
+      }
+      return mod.convert_json_schema_to_grammar(schemaJson);
     },
 
     health: async () => {

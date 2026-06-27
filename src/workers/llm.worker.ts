@@ -1,5 +1,5 @@
 import type { WorkerEvent, WorkerRequest } from './worker.protocol';
-import { loadLlamaWasmEngine, type WasmEngine } from './wasm.engine';
+import { loadLlamaWasmEngine, type WasmEngine, type TokenizeResult, type DetokenizeResult } from './wasm.engine';
 import {
   openOpfsModelSyncReader,
   readModelBufferFromOpfs,
@@ -192,6 +192,47 @@ self.onmessage = async (evt: MessageEvent<WorkerRequest>) => {
           type: 'RESULT',
           payload: result,
         });
+        return;
+      }
+
+      case 'TOKENIZE': {
+        if (!state.loadedModels.has(req.modelId)) {
+          postError(req.id, 'MODEL_NOT_LOADED', `Model '${req.modelId}' is not loaded in worker.`);
+          return;
+        }
+        const engine = ensureEngine();
+        if (typeof engine.tokenize !== 'function') {
+          postError(req.id, 'INFERENCE_FAILED', 'tokenize is not supported by this WASM build — rebuild with npm run build:wasm');
+          return;
+        }
+        const result: TokenizeResult = await engine.tokenize(req.modelId, req.text);
+        postEvent({ id: req.id, type: 'RESULT', payload: result });
+        return;
+      }
+
+      case 'DETOKENIZE': {
+        if (!state.loadedModels.has(req.modelId)) {
+          postError(req.id, 'MODEL_NOT_LOADED', `Model '${req.modelId}' is not loaded in worker.`);
+          return;
+        }
+        const engine = ensureEngine();
+        if (typeof engine.detokenize !== 'function') {
+          postError(req.id, 'INFERENCE_FAILED', 'detokenize is not supported by this WASM build — rebuild with npm run build:wasm');
+          return;
+        }
+        const result: DetokenizeResult = await engine.detokenize(req.modelId, req.tokens);
+        postEvent({ id: req.id, type: 'RESULT', payload: result });
+        return;
+      }
+
+      case 'CONVERT_GRAMMAR': {
+        const engine = ensureEngine();
+        if (typeof engine.convertJsonSchemaToGrammar !== 'function') {
+          postError(req.id, 'INFERENCE_FAILED', 'convertJsonSchemaToGrammar is not supported by this WASM build — rebuild with npm run build:wasm');
+          return;
+        }
+        const grammar: string = await engine.convertJsonSchemaToGrammar(req.schemaJson);
+        postEvent({ id: req.id, type: 'RESULT', payload: { grammar } });
         return;
       }
 

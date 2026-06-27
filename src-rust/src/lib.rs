@@ -161,6 +161,32 @@ pub fn load_model_from_vfs(model_id: String, vfs_path: String, opts_json: String
     }
 }
 
+/// Load a model from an existing VFS path (HeapFS — file already in WASM linear memory).
+#[wasm_bindgen]
+pub fn load_model_from_path(model_id: String, vfs_path: String, opts_json: String) -> Result<(), JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        let lock = global_state();
+        let mut state = lock
+            .lock()
+            .map_err(|_| JsValue::from_str("Failed to acquire engine state lock"))?;
+        if !state.initialized {
+            return Err(JsValue::from_str("Engine not initialized"));
+        }
+
+        let context_id = ffi::load_context_from_path(&vfs_path, &opts_json)
+            .map_err(|e| JsValue::from_str(&e))?;
+        state.set_context(&model_id, context_id);
+        Ok(())
+    }
+
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = (model_id, vfs_path, opts_json);
+        Err(embedded_unavailable())
+    }
+}
+
 /// Unload a model and free its resources
 #[wasm_bindgen]
 pub fn unload_model(model_id: String) -> Result<(), JsValue> {
@@ -277,8 +303,10 @@ pub fn generate(model_id: String, req_json: String) -> Result<String, JsValue> {
 }
 
 /// Streaming generation: calls `on_token(token, index)` for each token (#3).
-/// The Rust EngineState lock is released before calling into C (#2); the C++
-/// g_mutex is held for the full streaming inference to prevent context UAF.
+///
+/// When built with JSPI (`LLAMA_WASM_JSPI=1`), tokens are delivered incrementally
+/// via `Module.__llamaStreamOnToken` (EM_ASYNC_JS in C++). Otherwise tokens are
+/// buffered in Rust and delivered after inference completes.
 #[wasm_bindgen]
 pub fn generate_stream(
     model_id: String,
@@ -290,7 +318,6 @@ pub fn generate_stream(
 
     #[cfg(llama_embed_cpp)]
     {
-        // Grab context_id then release the lock before inference (#2).
         let context_id = {
             let lock = global_state();
             let state = lock
@@ -329,40 +356,54 @@ pub fn generate_stream(
         let params_json = serde_json::to_string(&comp_params)
             .map_err(|e| JsValue::from_str(&format!("Failed to serialize params: {}", e)))?;
 
-        // Trampoline: bridges the C callback into the Rust closure that calls JS.
-        // SAFETY: WASM is single-threaded; the pointer outlives the C call.
-        struct CallbackState {
-            f: js_sys::Function,
+        #[cfg(capllama_wasm_jspi)]
+        unsafe extern "C" fn stream_trampoline(
+            _token: *const c_char,
+            _user_data: *mut c_void,
+            _index: c_int,
+        ) {
+            // Tokens dispatched via EM_ASYNC_JS → Module.__llamaStreamOnToken in C++.
         }
 
-        unsafe extern "C" fn token_trampoline(
+        #[cfg(not(capllama_wasm_jspi))]
+        struct TokenCollector {
+            tokens: Vec<String>,
+        }
+
+        #[cfg(not(capllama_wasm_jspi))]
+        unsafe extern "C" fn stream_trampoline(
             token: *const c_char,
             user_data: *mut c_void,
-            index: c_int,
+            _index: c_int,
         ) {
             if token.is_null() || user_data.is_null() {
                 return;
             }
-            let cb = &*(user_data as *const CallbackState);
-            let tok = CStr::from_ptr(token).to_str().unwrap_or("");
-            let _ = cb.f.call2(
-                &JsValue::null(),
-                &JsValue::from_str(tok),
-                &JsValue::from_f64(index as f64),
-            );
+            let collector = &mut *(user_data as *mut TokenCollector);
+            if let Ok(tok) = CStr::from_ptr(token).to_str() {
+                if !tok.is_empty() {
+                    collector.tokens.push(tok.to_string());
+                }
+            }
         }
 
-        let cb_state = CallbackState { f: on_token };
-        let user_data = &cb_state as *const CallbackState as *mut c_void;
+        #[cfg(not(capllama_wasm_jspi))]
+        let mut collector = TokenCollector { tokens: Vec::new() };
+
+        #[cfg(not(capllama_wasm_jspi))]
+        let user_data = &mut collector as *mut TokenCollector as *mut c_void;
+
+        #[cfg(capllama_wasm_jspi)]
+        let user_data = std::ptr::null_mut();
 
         let raw = unsafe {
             use std::ffi::CString;
-            let params_cstr = CString::new(params_json.clone())
+            let params_cstr = CString::new(params_json)
                 .map_err(|e| JsValue::from_str(&format!("CString error: {}", e)))?;
             let result_ptr = ffi::llama_completion_stream(
                 context_id,
                 params_cstr.as_ptr(),
-                token_trampoline,
+                stream_trampoline,
                 user_data,
             );
             if result_ptr.is_null() {
@@ -373,6 +414,18 @@ pub fn generate_stream(
                 .map_err(|e| JsValue::from_str(&format!("UTF-8 error: {}", e)))?
                 .to_string()
         };
+
+        #[cfg(not(capllama_wasm_jspi))]
+        for (index, token) in collector.tokens.iter().enumerate() {
+            let _ = on_token.call2(
+                &JsValue::null(),
+                &JsValue::from_str(token),
+                &JsValue::from_f64(index as f64),
+            );
+        }
+
+        #[cfg(capllama_wasm_jspi)]
+        let _ = on_token;
 
         Ok(raw)
     }
@@ -442,6 +495,92 @@ pub fn embed(model_id: String, req_json: String) -> Result<String, JsValue> {
     #[cfg(not(llama_embed_cpp))]
     {
         let _ = (model_id, req_json);
+        Err(embedded_unavailable())
+    }
+}
+
+/// Tokenize text using a loaded model's vocabulary.
+/// Returns a JSON object: `{ "tokens": [i32, ...], "has_media": bool }`.
+#[wasm_bindgen]
+pub fn tokenize(model_id: String, text: String) -> Result<String, JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        let context_id = {
+            let lock = global_state();
+            let state = lock
+                .lock()
+                .map_err(|_| JsValue::from_str("Failed to acquire engine state lock"))?;
+            if !state.initialized {
+                return Err(JsValue::from_str("Engine not initialized"));
+            }
+            state
+                .get_context(&model_id)
+                .ok_or_else(|| JsValue::from_str("Model not loaded"))?
+        };
+
+        let raw = ffi::tokenize(context_id, &text)
+            .map_err(|e| JsValue::from_str(&e))?;
+        Ok(raw)
+    }
+
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = (model_id, text);
+        Err(embedded_unavailable())
+    }
+}
+
+/// Detokenize a JSON array of token IDs back to a text string.
+/// Input: JSON string representing an array of integers, e.g. `[1, 2, 3]`.
+/// Returns a JSON object: `{ "text": "..." }`.
+#[wasm_bindgen]
+pub fn detokenize(model_id: String, tokens_json: String) -> Result<String, JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        let context_id = {
+            let lock = global_state();
+            let state = lock
+                .lock()
+                .map_err(|_| JsValue::from_str("Failed to acquire engine state lock"))?;
+            if !state.initialized {
+                return Err(JsValue::from_str("Engine not initialized"));
+            }
+            state
+                .get_context(&model_id)
+                .ok_or_else(|| JsValue::from_str("Model not loaded"))?
+        };
+
+        let tokens: Vec<i32> = serde_json::from_str(&tokens_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid tokens JSON: {}", e)))?;
+
+        let text = ffi::detokenize(context_id, &tokens)
+            .map_err(|e| JsValue::from_str(&e))?;
+
+        let response = serde_json::json!({ "text": text });
+        serde_json::to_string(&response)
+            .map_err(|e| JsValue::from_str(&format!("Failed to serialize response: {}", e)))
+    }
+
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = (model_id, tokens_json);
+        Err(embedded_unavailable())
+    }
+}
+
+/// Convert a JSON Schema string to a GBNF grammar string for constrained sampling.
+/// This is context-free and does not require a model to be loaded.
+#[wasm_bindgen]
+pub fn convert_json_schema_to_grammar(schema_json: String) -> Result<String, JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        ffi::convert_json_schema_to_grammar(&schema_json)
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = schema_json;
         Err(embedded_unavailable())
     }
 }

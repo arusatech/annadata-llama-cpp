@@ -2,6 +2,8 @@
 set -euo pipefail
 
 export LLAMA_WASM_EMBED_CPP=1
+export LLAMA_WASM_JSPI="${LLAMA_WASM_JSPI:-0}"
+export LLAMA_WASM_PTHREAD="${LLAMA_WASM_PTHREAD:-0}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUST_DIR="$ROOT_DIR/src-rust"
@@ -74,6 +76,8 @@ echo "  - CXX_wasm32_unknown_emscripten=$CXX_wasm32_unknown_emscripten"
 echo "  - CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_LINKER=$CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_LINKER"
 echo "  - EMSDK_CACHE=$EMSDK_CACHE"
 echo "  - LLAMA_WASM_SYSROOT=$LLAMA_WASM_SYSROOT"
+echo "  - LLAMA_WASM_JSPI=$LLAMA_WASM_JSPI"
+echo "  - LLAMA_WASM_PTHREAD=$LLAMA_WASM_PTHREAD"
 
 if ! command -v wasm-bindgen >/dev/null 2>&1; then
   echo "Error: wasm-bindgen CLI not found. Install with: cargo install wasm-bindgen-cli"
@@ -175,11 +179,39 @@ for arg in "${EMCC_CAPTURED_ARGS[@]}"; do
   esac
 done
 
+# wllama-inspired link flags (HeapFS runtime, optional JSPI / pthreads).
+WLLAMA_LINK_FLAGS=(
+  -sFORCE_FILESYSTEM=1
+  -sEXPORTED_RUNTIME_METHODS=['FS','MEMFS','HEAPU8','mmapAlloc','wasmMemory','ENV']
+)
+
+if [[ "$LLAMA_WASM_JSPI" == "1" ]]; then
+  WLLAMA_LINK_FLAGS+=(
+    -fwasm-exceptions
+    -sJSPI=1
+    -sJSPI_EXPORTS=['_llama_completion_stream','_generate_stream']
+  )
+fi
+
+if [[ "$LLAMA_WASM_PTHREAD" == "1" ]]; then
+  WLLAMA_LINK_FLAGS+=(
+    -pthread
+    -sUSE_PTHREADS=1
+    -sPTHREAD_POOL_SIZE='Module["pthreadPoolSize"]||4'
+    -sIMPORTED_MEMORY=1
+  )
+fi
+
 emcc "${NEW_ARGS[@]}" \
   -sMAIN_MODULE=1 \
   -sENVIRONMENT=web,worker \
   --js-library "$PATCHED_GLUE" \
   -sERROR_ON_UNDEFINED_SYMBOLS=0 \
+  -sALLOW_MEMORY_GROWTH=1 \
+  -sINITIAL_MEMORY=872415232 \
+  -sMAXIMUM_MEMORY=2147483648 \
+  -sSTACK_SIZE=5242880 \
+  "${WLLAMA_LINK_FLAGS[@]}" \
   2>&1 | grep -v "^warning:" | grep -v "^emcc: warning:" || true
 
 if [[ ! -f "$ESM_OUT" ]]; then
@@ -199,6 +231,7 @@ rm -f "$EMCC_ARGS_FILE" "$PATCHED_GLUE"
 
 # ── Stage 5: assemble the final pkg/ directory ────────────────────────────────
 cd "$ROOT_DIR"
+export LLAMA_WASM_JSPI LLAMA_WASM_PTHREAD
 node ./scripts/package-embed-wasm.mjs
 
 JS_PATH="$OUT_DIR/$ENGINE_NAME.js"

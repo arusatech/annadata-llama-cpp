@@ -55,6 +55,7 @@ const writeStreamToFile = async (
   res: Response,
   fileHandle: any,
   onProgress?: (downloaded: number, total: number) => void,
+  signal?: AbortSignal,
 ): Promise<number> => {
   const writable = await fileHandle.createWritable();
   const total = Number(res.headers.get('content-length') ?? 0);
@@ -70,6 +71,10 @@ const writeStreamToFile = async (
 
     const reader = res.body.getReader();
     while (true) {
+      if (signal?.aborted) {
+        reader.cancel();
+        throw new LlmError('MODEL_DOWNLOAD_FAILED', 'Download aborted by caller.');
+      }
       const { value, done } = await reader.read();
       if (done) break;
       if (value) {
@@ -88,6 +93,7 @@ export async function ensureModelInOpfs(
   modelId: string,
   modelUrl: string,
   onProgress?: (downloaded: number, total: number) => void,
+  signal?: AbortSignal,
 ): Promise<ModelManifestEntry> {
   if (!modelId) {
     throw new LlmError('INVALID_REQUEST', 'modelId is required for OPFS storage.');
@@ -104,13 +110,16 @@ export async function ensureModelInOpfs(
 
   let res: Response;
   try {
-    res = await fetch(modelUrl);
+    res = await fetch(modelUrl, signal ? { signal } : undefined);
   } catch (error) {
-    throw new LlmError('MODEL_DOWNLOAD_FAILED', `Failed to download model '${modelId}'.`, {
-      modelId,
-      modelUrl,
-      cause: String(error),
-    });
+    const isAbort = error instanceof Error && error.name === 'AbortError';
+    throw new LlmError(
+      'MODEL_DOWNLOAD_FAILED',
+      isAbort
+        ? `Download of model '${modelId}' was cancelled.`
+        : `Failed to download model '${modelId}'.`,
+      { modelId, modelUrl, cause: String(error) },
+    );
   }
   if (!res.ok) {
     throw new LlmError('MODEL_DOWNLOAD_FAILED', `Failed to download model '${modelId}': HTTP ${res.status}`, {
@@ -124,7 +133,7 @@ export async function ensureModelInOpfs(
   let sizeBytes = 0;
   try {
     const fileHandle = await ensureParentDirAndFileHandle(path, true);
-    sizeBytes = await writeStreamToFile(res, fileHandle, onProgress);
+    sizeBytes = await writeStreamToFile(res, fileHandle, onProgress, signal);
   } catch (error) {
     throw new LlmError('STORAGE_IO_FAILED', `Failed to persist model '${modelId}' in OPFS.`, {
       modelId,

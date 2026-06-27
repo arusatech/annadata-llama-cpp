@@ -11,8 +11,11 @@ fn workspace_cpp_dir(crate_dir: &Path) -> PathBuf {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-check-cfg=cfg(llama_embed_cpp)");
+    println!("cargo:rustc-check-cfg=cfg(capllama_wasm_jspi)");
     println!("cargo:rerun-if-env-changed=LLAMA_WASM_EMBED_CPP");
     println!("cargo:rerun-if-env-changed=LLAMA_WASM_SYSROOT");
+    println!("cargo:rerun-if-env-changed=LLAMA_WASM_JSPI");
+    println!("cargo:rerun-if-env-changed=LLAMA_WASM_PTHREAD");
 
     let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string()));
     let cpp_dir = workspace_cpp_dir(&crate_dir);
@@ -102,6 +105,7 @@ fn main() {
         "cap-completion.cpp",
         "cap-embedding.cpp",
         "cap-ios-bridge.cpp",
+        "cap-wasm-jspi.cpp",
         // cap-ios-bridge.cpp now contains WASM-specific code gated by CAPLLAMA_BUILD_WASM
     ];
 
@@ -164,6 +168,25 @@ fn main() {
 
     if is_wasm {
         cxx_build.flag("-msimd128");
+    }
+
+    let jspi = env::var("LLAMA_WASM_JSPI")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let pthread = env::var("LLAMA_WASM_PTHREAD")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if jspi {
+        c_build.define("CAPLLAMA_BUILD_WASM_JSPI", None);
+        cxx_build.define("CAPLLAMA_BUILD_WASM_JSPI", None);
+        println!("cargo:rustc-cfg=capllama_wasm_jspi");
+        println!("cargo:warning=Building embedded llama.cpp with WASM JSPI token streaming");
+    }
+    if pthread {
+        c_build.flag("-pthread");
+        cxx_build.flag("-pthread");
+        println!("cargo:warning=Building embedded llama.cpp with pthread support");
     }
 
     if let Ok(sysroot) = env::var("LLAMA_WASM_SYSROOT") {

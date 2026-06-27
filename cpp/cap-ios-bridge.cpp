@@ -456,6 +456,8 @@ bool llama_toggle_native_log(bool enabled) {
 // ---------------------------------------------------------------------------
 #ifdef CAPLLAMA_BUILD_WASM
 
+#include "cap-wasm-jspi.h"
+
 static std::string g_wasm_tmp_path;
 
 // Forward-declared to avoid duplicating all of llama_init_context's setup.
@@ -553,6 +555,14 @@ int64_t llama_model_vfs_finish(const char * path, const char * params_json) {
     return id;
 }
 
+// Load from an existing VFS path (HeapFS / MEMFS file already populated).
+int64_t llama_load_context_from_path(const char * path, const char * params_json) {
+    if (!path) {
+        return -1;
+    }
+    return llama_init_context(path, params_json);
+}
+
 // ---------------------------------------------------------------------------
 // WASM-specific: streaming completion with per-token C callback (#2 / #3).
 // Holds g_mutex for the full inference (same as llama_completion) so another
@@ -619,7 +629,11 @@ const char * llama_completion_stream(
                 generated_text += token_text;
 
                 if (token_callback) {
+#if defined(CAPLLAMA_BUILD_WASM_JSPI) && defined(__EMSCRIPTEN__)
+                    cap_wasm_jspi_token_callback(token_text.c_str(), user_data, tokens_generated);
+#else
                     token_callback(token_text.c_str(), user_data, tokens_generated);
+#endif
                 }
                 tokens_generated++;
             }

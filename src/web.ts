@@ -34,8 +34,62 @@ const MODEL_DESC_STUB = {
   isChatTemplateSupported: true,
 };
 
-// In-progress downloads: url → { abort: AbortController; progress: number; total: number }
-const activeDownloads = new Map<string, {
+// ---------------------------------------------------------------------------
+// Chat template formatting
+// ---------------------------------------------------------------------------
+
+type ChatMessage = { role: string; content: string };
+
+/**
+ * Format a message array into a prompt string using the specified template.
+ * Supports the four most common open-weight model formats. Defaults to ChatML.
+ */
+function formatMessagesWithTemplate(messages: ChatMessage[], template?: string): string {
+  const tpl = (template ?? 'chatml').toLowerCase();
+
+  if (tpl === 'llama3' || tpl === 'llama-3') {
+    const parts = messages.map(
+      (m) =>
+        `<|start_header_id|>${m.role}<|end_header_id|>\n\n${m.content}<|eot_id|>`,
+    );
+    return `<|begin_of_text|>${parts.join('')}<|start_header_id|>assistant<|end_header_id|>\n\n`;
+  }
+
+  if (tpl === 'mistral') {
+    // Mistral: [INST] user [/INST] assistant </s> [INST] ...
+    let out = '';
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      if (m.role === 'system') {
+        out += `[INST] ${m.content}\n`;
+      } else if (m.role === 'user') {
+        out += `[INST] ${m.content} [/INST]`;
+      } else if (m.role === 'assistant') {
+        out += ` ${m.content}</s>`;
+      }
+    }
+    return out;
+  }
+
+  if (tpl === 'gemma' || tpl === 'gemma2') {
+    const parts = messages.map(
+      (m) => `<start_of_turn>${m.role}\n${m.content}<end_of_turn>`,
+    );
+    return `${parts.join('\n')}\n<start_of_turn>model\n`;
+  }
+
+  // Default: ChatML — widely used by Qwen, Phi, Hermes, OpenChat, etc.
+  const parts = messages.map(
+    (m) => `<|im_start|>${m.role}\n${m.content}<|im_end|>`,
+  );
+  return `${parts.join('\n')}\n<|im_start|>assistant\n`;
+}
+
+// ---------------------------------------------------------------------------
+// In-progress downloads
+// ---------------------------------------------------------------------------
+type ActiveDownload = {
+  abortController: AbortController;
   promise: Promise<void>;
   downloaded: number;
   total: number;
@@ -43,12 +97,25 @@ const activeDownloads = new Map<string, {
   failed: boolean;
   errorMessage?: string;
   localPath?: string;
-}>();
+};
+
+const activeDownloads = new Map<string, ActiveDownload>();
 
 export class LlamaCppWeb implements LlamaCppPlugin {
   private provider = new WebProvider();
   // contextId → modelId
   private contextToModel = new Map<number, string>();
+  // eventName → Set of listener callbacks
+  private listeners = new Map<string, Set<(data: unknown) => void>>();
+
+  private emitListener(eventName: string, data: unknown): void {
+    this.listeners.get(eventName)?.forEach((cb) => cb(data));
+  }
+
+  private hasListeners(eventName: string): boolean {
+    const set = this.listeners.get(eventName);
+    return !!set && set.size > 0;
+  }
 
   // -------------------------------------------------------------------------
   // Core initialization
@@ -121,10 +188,9 @@ export class LlamaCppWeb implements LlamaCppPlugin {
   // Chat and completion
   // -------------------------------------------------------------------------
 
-  async getFormattedChat({ messages }: { contextId: number; messages: string; chatTemplate?: string; params?: any }): Promise<any> {
-    // Web: return a simple prompt string built from messages.
+  async getFormattedChat({ messages, chatTemplate }: { contextId: number; messages: string; chatTemplate?: string; params?: any }): Promise<any> {
     const parsed: Array<{ role: string; content: string }> = JSON.parse(messages);
-    const prompt = parsed.map((m) => `${m.role}: ${m.content}`).join('\n') + '\nassistant:';
+    const prompt = formatMessagesWithTemplate(parsed, chatTemplate);
     return { type: 'llama-chat', prompt, has_media: false, media_paths: [] };
   }
 
@@ -138,13 +204,35 @@ export class LlamaCppWeb implements LlamaCppPlugin {
     const modelId = this.contextToModel.get(contextId);
     if (!modelId) throw new Error('LlamaCppWeb: context not found');
 
-    const result = await this.provider.generate({
-      modelId,
-      prompt: params.prompt,
-      max_tokens: params.n_predict,
-      temperature: params.temperature,
-      stream: false,
-    });
+    const wantStream = this.hasListeners('@LlamaCpp_onToken');
+    const generateFn = wantStream
+      ? this.provider.generateStream.bind(
+          this.provider,
+          {
+            modelId,
+            prompt: params.prompt,
+            max_tokens: params.n_predict,
+            temperature: params.temperature,
+            stream: true,
+          },
+          (evt) => {
+            this.emitListener('@LlamaCpp_onToken', {
+              contextId,
+              token: evt.token,
+              index: evt.index,
+            });
+          },
+        )
+      : () =>
+          this.provider.generate({
+            modelId,
+            prompt: params.prompt,
+            max_tokens: params.n_predict,
+            temperature: params.temperature,
+            stream: false,
+          });
+
+    const result = await generateFn();
 
     return {
       text: result.text,
@@ -212,8 +300,8 @@ export class LlamaCppWeb implements LlamaCppPlugin {
   }
 
   async stopCompletion(): Promise<void> {
-    // WASM single-threaded — cannot interrupt mid-generation.
-    // A future implementation can use a shared flag checked in the Rust loop.
+    // Terminates the worker process; the model must be reloaded on the next call.
+    this.provider.stopGeneration();
   }
 
   // -------------------------------------------------------------------------
@@ -228,14 +316,34 @@ export class LlamaCppWeb implements LlamaCppPlugin {
   }
 
   // -------------------------------------------------------------------------
-  // Tokenization (stubs — require the WASM model to be loaded)
+  // Tokenization
   // -------------------------------------------------------------------------
-  async tokenize(): Promise<any> {
-    throw new Error('LlamaCppWeb: tokenize requires direct WASM engine access; use WebProvider');
+  async tokenize({
+    contextId,
+    text,
+  }: {
+    contextId: number;
+    text: string;
+    [key: string]: unknown;
+  }): Promise<{ tokens: number[]; has_media: boolean }> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) throw new Error('LlamaCppWeb: context not found');
+    const result = await this.provider.tokenize(modelId, text);
+    return { tokens: result.tokens, has_media: result.has_media ?? false };
   }
 
-  async detokenize(): Promise<string> {
-    throw new Error('LlamaCppWeb: detokenize requires direct WASM engine access; use WebProvider');
+  async detokenize({
+    contextId,
+    tokens,
+  }: {
+    contextId: number;
+    tokens: number[];
+    [key: string]: unknown;
+  }): Promise<string> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) throw new Error('LlamaCppWeb: context not found');
+    const result = await this.provider.detokenize(modelId, tokens);
+    return result.text;
   }
 
   // -------------------------------------------------------------------------
@@ -305,27 +413,46 @@ export class LlamaCppWeb implements LlamaCppPlugin {
   // -------------------------------------------------------------------------
   async downloadModel({ url, filename }: { url: string; filename: string }): Promise<string> {
     const modelId = filename;
-    const entry = {
+    const abortController = new AbortController();
+    const entry: ActiveDownload = {
+      abortController,
       promise: Promise.resolve<void>(undefined),
       downloaded: 0,
       total: 0,
       completed: false,
       failed: false,
-      errorMessage: undefined as string | undefined,
-      localPath: undefined as string | undefined,
+      errorMessage: undefined,
+      localPath: undefined,
     };
 
-    entry.promise = ensureModelInOpfs(modelId, url, (downloaded, total) => {
-      entry.downloaded = downloaded;
-      entry.total = total;
-    })
+    entry.promise = ensureModelInOpfs(
+      modelId,
+      url,
+      (downloaded, total) => {
+        entry.downloaded = downloaded;
+        entry.total = total;
+        this.emitListener('@LlamaCpp_onDownloadProgress', {
+          url,
+          modelId,
+          downloaded,
+          total,
+          progress: total > 0 ? downloaded / total : 0,
+        });
+      },
+      abortController.signal,
+    )
       .then((manifest) => {
         entry.completed = true;
         entry.localPath = manifest.path;
+        this.emitListener('@LlamaCpp_onDownloadComplete', { url, modelId, localPath: manifest.path });
       })
       .catch((err: Error) => {
-        entry.failed = true;
+        const cancelled = abortController.signal.aborted;
+        entry.failed = !cancelled;
         entry.errorMessage = err.message;
+        if (!cancelled) {
+          this.emitListener('@LlamaCpp_onDownloadError', { url, modelId, error: err.message });
+        }
       });
 
     activeDownloads.set(url, entry);
@@ -358,9 +485,11 @@ export class LlamaCppWeb implements LlamaCppPlugin {
   }
 
   async cancelDownload({ url }: { url: string }): Promise<boolean> {
-    const has = activeDownloads.has(url);
+    const entry = activeDownloads.get(url);
+    if (!entry) return false;
+    entry.abortController.abort();
     activeDownloads.delete(url);
-    return has;
+    return true;
   }
 
   async getAvailableModels(): Promise<Array<{ name: string; path: string; size: number }>> {
@@ -375,8 +504,13 @@ export class LlamaCppWeb implements LlamaCppPlugin {
   // -------------------------------------------------------------------------
   // Grammar utilities
   // -------------------------------------------------------------------------
-  async convertJsonSchemaToGrammar(): Promise<string> {
-    throw new Error('LlamaCppWeb: convertJsonSchemaToGrammar requires the WASM engine');
+  async convertJsonSchemaToGrammar({
+    schema,
+  }: {
+    schema: string;
+    [key: string]: unknown;
+  }): Promise<string> {
+    return this.provider.convertJsonSchemaToGrammar(schema);
   }
 
   // -------------------------------------------------------------------------
@@ -395,11 +529,21 @@ export class LlamaCppWeb implements LlamaCppPlugin {
   // -------------------------------------------------------------------------
   // Events
   // -------------------------------------------------------------------------
-  async addListener(): Promise<void> {
-    // Events are surfaced via the WebProvider's streaming callbacks.
+  async addListener(eventName: string, listenerFunc: (data: unknown) => void): Promise<{ remove: () => void }> {
+    if (!this.listeners.has(eventName)) {
+      this.listeners.set(eventName, new Set());
+    }
+    this.listeners.get(eventName)!.add(listenerFunc);
+    return {
+      remove: () => {
+        this.listeners.get(eventName)?.delete(listenerFunc);
+      },
+    };
   }
 
-  async removeAllListeners(): Promise<void> {}
+  async removeAllListeners(): Promise<void> {
+    this.listeners.clear();
+  }
 }
 
 const LlamaCpp = registerPlugin<LlamaCppPlugin>('LlamaCpp', {

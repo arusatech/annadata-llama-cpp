@@ -35,6 +35,9 @@ extern "C" {
     /// Close the VFS file and load the model from the written path.
     pub fn llama_model_vfs_finish(path: *const c_char, params_json: *const c_char) -> i64;
 
+    /// Load a model from an existing VFS path (HeapFS / MEMFS).
+    pub fn llama_load_context_from_path(path: *const c_char, params_json: *const c_char) -> i64;
+
     /// Release a context and free its resources
     pub fn llama_release_context(context_id: i64);
 
@@ -68,16 +71,24 @@ extern "C" {
         params_json: *const c_char,
     ) -> *const c_char;
 
-    /// Tokenize text into tokens
-    pub fn llama_tokenize(
+    /// Tokenize text into tokens (cap-ios-bridge wrapper: returns JSON)
+    /// image_paths_json should be "[]" or empty for text-only tokenization.
+    pub fn llama_cap_tokenize(
         context_id: i64,
         text: *const c_char,
+        image_paths_json: *const c_char,
     ) -> *const c_char;
 
-    /// Detokenize tokens back to text
-    pub fn llama_detokenize(
+    /// Detokenize a JSON token array back to text (cap-ios-bridge wrapper)
+    pub fn llama_cap_detokenize(
         context_id: i64,
         tokens_json: *const c_char,
+    ) -> *const c_char;
+
+    /// Convert a JSON Schema string to a GBNF grammar string.
+    /// Context-free — does not require a loaded model.
+    pub fn llama_convert_json_schema_to_grammar(
+        schema_json: *const c_char,
     ) -> *const c_char;
 }
 
@@ -144,6 +155,20 @@ pub fn model_vfs_finish(path: &str, params_json: &str) -> Result<i64, String> {
         let id = llama_model_vfs_finish(path_cstr.as_ptr(), params_cstr.as_ptr());
         if id <= 0 {
             return Err("llama_model_vfs_finish failed — model may be invalid".to_string());
+        }
+        Ok(id)
+    }
+}
+
+/// Load a model from an existing VFS path (HeapFS zero-copy path).
+pub fn load_context_from_path(path: &str, params_json: &str) -> Result<i64, String> {
+    let path_cstr = CString::new(path).map_err(|e| format!("Invalid VFS path: {}", e))?;
+    let params_cstr = CString::new(params_json)
+        .map_err(|e| format!("Invalid params JSON: {}", e))?;
+    unsafe {
+        let id = llama_load_context_from_path(path_cstr.as_ptr(), params_cstr.as_ptr());
+        if id <= 0 {
+            return Err("llama_load_context_from_path failed — check VFS path and model".to_string());
         }
         Ok(id)
     }
@@ -229,37 +254,24 @@ pub fn embedding(context_id: i64, text: &str, params_json: &str) -> Result<Vec<f
     }
 }
 
-/// Safe wrapper for tokenization
-pub fn tokenize(context_id: i64, text: &str) -> Result<Vec<i32>, String> {
+/// Safe wrapper for tokenization.
+/// Calls `llama_cap_tokenize` with an empty image-paths array (text-only).
+/// Returns the raw JSON string produced by the C bridge so callers can parse
+/// the full result (`tokens`, `has_media`, etc.) without an extra allocation.
+pub fn tokenize(context_id: i64, text: &str) -> Result<String, String> {
     let text_cstr = CString::new(text)
         .map_err(|e| format!("Invalid text: {}", e))?;
+    let empty_paths = CString::new("[]").unwrap();
 
     unsafe {
-        let result_ptr = llama_tokenize(context_id, text_cstr.as_ptr());
+        let result_ptr = llama_cap_tokenize(context_id, text_cstr.as_ptr(), empty_paths.as_ptr());
         if result_ptr.is_null() {
-            return Err("Tokenize returned null".to_string());
+            return Err("llama_cap_tokenize returned null".to_string());
         }
-
-        let result_cstr = CStr::from_ptr(result_ptr);
-        let result_str = result_cstr
+        CStr::from_ptr(result_ptr)
             .to_str()
-            .map_err(|e| format!("Invalid UTF-8 in tokenize result: {}", e))?;
-
-        // Parse JSON response: {"tokens": [i32, i32, ...]}
-        let json_result: serde_json::Value = serde_json::from_str(result_str)
-            .map_err(|e| format!("Invalid JSON response: {}", e))?;
-
-        let tokens_arr = json_result
-            .get("tokens")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| "Missing 'tokens' array in response".to_string())?;
-
-        let tokens: Vec<i32> = tokens_arr
-            .iter()
-            .map(|v| v.as_i64().unwrap_or(0) as i32)
-            .collect();
-
-        Ok(tokens)
+            .map(|s| s.to_string())
+            .map_err(|e| format!("Invalid UTF-8 in tokenize result: {}", e))
     }
 }
 
@@ -315,7 +327,8 @@ where
     }
 }
 
-/// Safe wrapper for detokenization
+/// Safe wrapper for detokenization.
+/// Accepts a JSON array of token IDs and returns the decoded text string.
 pub fn detokenize(context_id: i64, tokens: &[i32]) -> Result<String, String> {
     let tokens_json = serde_json::to_string(&tokens)
         .map_err(|e| format!("Failed to serialize tokens: {}", e))?;
@@ -324,17 +337,31 @@ pub fn detokenize(context_id: i64, tokens: &[i32]) -> Result<String, String> {
         .map_err(|e| format!("Invalid tokens JSON: {}", e))?;
 
     unsafe {
-        let result_ptr = llama_detokenize(context_id, tokens_cstr.as_ptr());
+        let result_ptr = llama_cap_detokenize(context_id, tokens_cstr.as_ptr());
         if result_ptr.is_null() {
-            return Err("Detokenize returned null".to_string());
+            return Err("llama_cap_detokenize returned null".to_string());
         }
-
-        let result_cstr = CStr::from_ptr(result_ptr);
-        let result_str = result_cstr
+        CStr::from_ptr(result_ptr)
             .to_str()
-            .map_err(|e| format!("Invalid UTF-8 in detokenize result: {}", e))?
-            .to_string();
+            .map(|s| s.to_string())
+            .map_err(|e| format!("Invalid UTF-8 in detokenize result: {}", e))
+    }
+}
 
-        Ok(result_str)
+/// Safe wrapper for JSON Schema → GBNF grammar conversion.
+/// This is context-free and does not require a loaded model.
+pub fn convert_json_schema_to_grammar(schema_json: &str) -> Result<String, String> {
+    let schema_cstr = CString::new(schema_json)
+        .map_err(|e| format!("Invalid schema JSON: {}", e))?;
+
+    unsafe {
+        let result_ptr = llama_convert_json_schema_to_grammar(schema_cstr.as_ptr());
+        if result_ptr.is_null() {
+            return Err("llama_convert_json_schema_to_grammar returned null".to_string());
+        }
+        CStr::from_ptr(result_ptr)
+            .to_str()
+            .map(|s| s.to_string())
+            .map_err(|e| format!("Invalid UTF-8 in grammar result: {}", e))
     }
 }

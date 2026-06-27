@@ -8,6 +8,7 @@ import type {
   MemorySnapshot,
   TokenEvent,
 } from './provider.interface';
+import type { DetokenizeResult, TokenizeResult } from '../workers/wasm.engine';
 import { LlmError } from './errors';
 import { DefaultModelScheduler } from './model.scheduler';
 import {
@@ -71,6 +72,7 @@ type PendingRequest = {
   resolve: (value: any) => void;
   reject: (reason?: unknown) => void;
   onToken?: (event: TokenEvent) => void;
+  onProgress?: (downloaded: number, total: number) => void;
 };
 
 const toError = (code: string, message: string, meta?: Record<string, unknown>): LlmError => {
@@ -187,9 +189,7 @@ export class WebProvider implements LlmProvider {
       }
 
       if (message.type === 'PROGRESS') {
-        // Progress events are handled by the caller via onProgress (#6).
-        // Here they're surfaced in the pending map as token events with
-        // a discriminant so callers can distinguish download vs token progress.
+        request.onProgress?.(message.downloaded, message.total);
         return;
       }
 
@@ -219,12 +219,13 @@ export class WebProvider implements LlmProvider {
   private sendRequest<T>(
     request: WorkerRequestWithoutId,
     onToken?: (event: TokenEvent) => void,
+    onProgress?: (downloaded: number, total: number) => void,
   ): Promise<T> {
     const worker = this.ensureWorker();
     const id = `req_${Date.now()}_${this.reqCounter++}`;
     const message = { ...request, id } as WorkerRequest;
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, onToken });
+      this.pending.set(id, { resolve, reject, onToken, onProgress });
       try {
         // Fix #9: no Transferable[] needed — the ArrayBuffer lives in the worker
         worker.postMessage(message);
@@ -289,17 +290,21 @@ export class WebProvider implements LlmProvider {
     this.scheduler.ensureCapacity(opts.modelId, modelBytes, memory);
 
     // Fix #9: send modelId only — the worker reads from OPFS internally.
-    await this.sendRequest<{ ok: boolean }>({
-      type: 'LOAD_MODEL',
-      modelId: opts.modelId,
-      opts: {
-        modelPath: (opts as any).modelPath ?? (opts as any).model_path ?? manifestEntry?.path,
-        modelBytes,
-        n_ctx: opts.n_ctx,
-        n_threads: opts.n_threads,
-        embedding: opts.embedding,
+    await this.sendRequest<{ ok: boolean }>(
+      {
+        type: 'LOAD_MODEL',
+        modelId: opts.modelId,
+        opts: {
+          modelPath: (opts as any).modelPath ?? (opts as any).model_path ?? manifestEntry?.path,
+          modelBytes,
+          n_ctx: opts.n_ctx,
+          n_threads: opts.n_threads,
+          embedding: opts.embedding,
+        },
       },
-    });
+      undefined,
+      opts.onProgress,
+    );
     this.loadedModelIds.add(opts.modelId);
     this.scheduler.markLoaded(opts.modelId);
   }
@@ -366,6 +371,52 @@ export class WebProvider implements LlmProvider {
     return getMemorySnapshotCrossBrowser();
   }
 
+  async tokenize(modelId: string, text: string): Promise<TokenizeResult> {
+    if (!this.loadedModelIds.has(modelId)) {
+      throw new LlmError('MODEL_NOT_LOADED', `Model '${modelId}' is not loaded`);
+    }
+    return this.sendRequest<TokenizeResult>({ type: 'TOKENIZE', modelId, text });
+  }
+
+  async detokenize(modelId: string, tokens: number[]): Promise<DetokenizeResult> {
+    if (!this.loadedModelIds.has(modelId)) {
+      throw new LlmError('MODEL_NOT_LOADED', `Model '${modelId}' is not loaded`);
+    }
+    return this.sendRequest<DetokenizeResult>({ type: 'DETOKENIZE', modelId, tokens });
+  }
+
+  async convertJsonSchemaToGrammar(schemaJson: string): Promise<string> {
+    // CONVERT_GRAMMAR is context-free — no model needs to be loaded.
+    // The worker must be initialised (INIT sent), but that happens on first use.
+    const result = await this.sendRequest<{ grammar: string }>({
+      type: 'CONVERT_GRAMMAR',
+      schemaJson,
+    });
+    return result.grammar;
+  }
+
+  /**
+   * Terminate the worker mid-inference. WASM is single-threaded, so posting
+   * an abort message cannot be received while generate() is running. Worker
+   * termination is the only reliable interrupt. The model will need to be
+   * reloaded on the next generate() call.
+   */
+  stopGeneration(): void {
+    if (!this.worker) return;
+    this.worker.terminate();
+    this.worker = null;
+    const interrupted = toError('INFERENCE_FAILED', 'Generation stopped by caller.');
+    for (const [id, req] of this.pending.entries()) {
+      this.pending.delete(id);
+      req.reject(interrupted);
+    }
+    // Worker is gone, so all previously tracked model IDs are invalid.
+    this.loadedModelIds.clear();
+    for (const id of this.scheduler.listLoaded()) {
+      this.scheduler.markUnloaded(id);
+    }
+  }
+
   async health(): Promise<{ ok: boolean; details?: Record<string, unknown> }> {
     const usage = await getOpfsUsage().catch(() => ({
       usedBytes: 0 as number,
@@ -385,6 +436,8 @@ export class WebProvider implements LlmProvider {
         opfsQuotaBytes: usage.quotaBytes,
         worker: workerHealth,
         crossOriginIsolated: checkCrossOriginIsolation(),
+        wasmJspi: (workerHealth?.details as Record<string, unknown> | undefined)?.wasmJspi,
+        wasmPthread: (workerHealth?.details as Record<string, unknown> | undefined)?.wasmPthread,
       },
     };
   }

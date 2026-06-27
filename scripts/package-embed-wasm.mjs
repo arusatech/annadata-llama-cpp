@@ -30,6 +30,8 @@ import { resolve } from 'node:path';
 const root        = resolve(process.cwd());
 const engineName  = 'llama_engine';
 const wasmPkgDir  = resolve(root, 'src-rust', 'pkg');
+const BUILD_JSPI  = process.env.LLAMA_WASM_JSPI === '1';
+const BUILD_PTHREAD = process.env.LLAMA_WASM_PTHREAD === '1';
 
 // ── Inputs (produced by Stage 4 emcc MAIN_MODULE link) ─────────────────────
 const emscriptenMjs  = resolve(wasmPkgDir, `${engineName}_emscripten.mjs`);
@@ -57,7 +59,8 @@ const requireFile = async (path, label) => {
 await requireFile(emscriptenMjs,  'emcc ESM runtime (llama_engine_emscripten.mjs)');
 await requireFile(emscriptenWasm, 'emcc wasm binary (llama_engine_emscripten.wasm)');
 
-const emscriptenWasmBytes = (await readFile(emscriptenWasm)).byteLength;
+const emscriptenWasmBuf   = await readFile(emscriptenWasm);
+const emscriptenWasmBytes = emscriptenWasmBuf.byteLength;
 const MIN_EMBEDDED_BYTES  = 1_000_000;
 if (emscriptenWasmBytes < MIN_EMBEDDED_BYTES) {
   fail(
@@ -65,6 +68,51 @@ if (emscriptenWasmBytes < MIN_EMBEDDED_BYTES) {
     `expected at least ${MIN_EMBEDDED_BYTES} for a build with embedded llama.cpp. ` +
     `Ensure Stage 4 (emcc MAIN_MODULE re-link) succeeded.`,
   );
+}
+
+// ── 1c. Verify WASM memory section: initial pages must cover 832 MB ──────────
+// INITIAL_MEMORY=872415232 / 65536 bytes/page = 13312 pages.
+// A binary compiled without the flag defaults to 256 pages (16 MB) and will
+// abort with "unreachable" when loading a 700+ MB GGUF model.
+{
+  const MIN_WASM_PAGES = 13312; // 872_415_232 / 65_536
+  const wasmBytes = new Uint8Array(emscriptenWasmBuf.buffer);
+  // Scan for the Memory section (id = 5) in the WASM binary.
+  // Layout: magic(4) + version(4) + sections...
+  // Each section: [id:u8][size:uleb128][...payload]
+  // Memory section payload: [count:uleb128][{flags:u8, initial:uleb128, ...}]
+  let foundPages = null;
+  let pos = 8; // skip magic + version
+  while (pos < wasmBytes.length) {
+    const sectionId = wasmBytes[pos++];
+    let sectionSize = 0, shift = 0, b;
+    do { b = wasmBytes[pos++]; sectionSize |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
+    if (sectionId === 5) { // Memory section
+      let p = pos;
+      // count (uleb128) — number of memory definitions
+      let count = 0; shift = 0;
+      do { b = wasmBytes[p++]; count |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
+      if (count > 0) {
+        const flags = wasmBytes[p++]; // 0=no max, 1=has max, 2=shared+max, 4=memory64
+        let initial = 0; shift = 0;
+        do { b = wasmBytes[p++]; initial |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
+        foundPages = initial;
+      }
+      break;
+    }
+    pos += sectionSize;
+  }
+  if (foundPages === null) {
+    fail('Could not find WASM Memory section in llama_engine_emscripten.wasm — binary may be malformed.');
+  }
+  if (foundPages < MIN_WASM_PAGES) {
+    fail(
+      `WASM Memory section has only ${foundPages} initial pages (${(foundPages * 65536 / 1024 / 1024).toFixed(0)} MB). ` +
+      `Expected at least ${MIN_WASM_PAGES} pages (832 MB) for 700+ MB model support. ` +
+      `Rebuild with: -sINITIAL_MEMORY=872415232 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2147483648`,
+    );
+  }
+  console.log(`[package-embed-wasm] WASM memory: ${foundPages} initial pages (${(foundPages * 65536 / 1024 / 1024).toFixed(0)} MB) ✓`);
 }
 
 // ── 1b. Patch emcc ESM runtime: optional-chain __wbindgen_start ──────────────
@@ -107,6 +155,36 @@ const shimSrc = `/* @ts-self-types="./llama_engine.d.ts" */
 import createLlamaModule from './${engineName}_emscripten.mjs';
 
 let _mod = null;
+const LLAMA_WASM_JSPI = ${BUILD_JSPI};
+const LLAMA_WASM_PTHREAD = ${BUILD_PTHREAD};
+
+/** Shared WASM memory for pthread builds (wllama-style). Requires COOP/COEP. */
+function trySharedWasmMemory() {
+  if (!LLAMA_WASM_PTHREAD) return null;
+  if (globalThis.crossOriginIsolated !== true || typeof SharedArrayBuffer === 'undefined') {
+    return null;
+  }
+  const minBytes = 872415232;
+  let maxBytes = 4096 * 1024 * 1024;
+  const stepBytes = 128 * 1024 * 1024;
+  while (maxBytes >= minBytes) {
+    try {
+      return new WebAssembly.Memory({
+        initial: minBytes / 65536,
+        maximum: maxBytes / 65536,
+        shared: true,
+      });
+    } catch {
+      maxBytes -= stepBytes;
+    }
+  }
+  return null;
+}
+
+/** Raw Emscripten Module — used by HeapFS helpers in wasm.engine.ts. */
+export function getEmscriptenModule() {
+  return _mod;
+}
 
 // ── Default export: loads and instantiates the WebAssembly module ─────────────
 // wasm.engine.ts calls: await mod.default()
@@ -123,7 +201,13 @@ export default async function initWasm(_pathHint) {
     rejectWasmInstantiate = reject;
   });
 
+  const sharedMem = trySharedWasmMemory();
+  const pthreadPoolSize = sharedMem && navigator.hardwareConcurrency
+    ? Math.max(2, Math.floor(navigator.hardwareConcurrency / 2))
+    : 4;
+
   const modulePromise = createLlamaModule({
+    ...(sharedMem ? { wasmMemory: sharedMem, pthreadPoolSize } : {}),
     // Resolve assets relative to this JS file so the module works regardless
     // of where the dist/wasm/ directory is served from.
     // Emscripten requests 'llama_engine_emscripten.wasm' but we ship the
@@ -279,6 +363,8 @@ export default async function initWasm(_pathHint) {
   });
 
   _mod = await Promise.race([modulePromise, wasmInstantiateFailed]);
+  _mod.__llamaWasmJspi = LLAMA_WASM_JSPI;
+  _mod.__llamaWasmPthread = LLAMA_WASM_PTHREAD && !!sharedMem;
   return _mod;
 }
 
@@ -354,6 +440,12 @@ export function load_model_from_vfs(model_id, vfs_path, opts_json) {
   if (!_mod) throw new Error('llama_engine not ready — await init() first');
   return _mod.load_model_from_vfs(model_id, vfs_path, opts_json);
 }
+
+/** Load from an existing VFS path (HeapFS — zero-copy mmap). */
+export function load_model_from_path(model_id, vfs_path, opts_json) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  return _mod.load_model_from_path(model_id, vfs_path, opts_json);
+}
 `;
 await writeFile(jsOutPath, shimSrc);
 
@@ -396,6 +488,10 @@ export function model_vfs_write(vfs_path: string, chunk: Uint8Array): void;
 export function model_vfs_abort(vfs_path: string): void;
 /** Finish a streamed VFS write and load the model (deletes the VFS file). */
 export function load_model_from_vfs(model_id: string, vfs_path: string, opts_json: string): void;
+/** Load from an existing VFS path (HeapFS zero-copy mmap). */
+export function load_model_from_path(model_id: string, vfs_path: string, opts_json: string): void;
+/** Raw Emscripten module (for HeapFS helpers). */
+export function getEmscriptenModule(): unknown;
 
 /**
  * Default export — loads and instantiates the WebAssembly module.

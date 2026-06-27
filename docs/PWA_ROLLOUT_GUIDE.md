@@ -15,7 +15,7 @@ Expected result:
 - all checks pass
 - wasm artifacts are present in `dist/wasm`
 
-## Artifact expectations
+## Artifact expectations¬
 
 The web runtime consumes:
 
