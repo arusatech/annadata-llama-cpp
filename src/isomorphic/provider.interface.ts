@@ -7,6 +7,10 @@ export interface InitializeOptions {
   n_ctx?: number;
   n_threads?: number;
   embedding?: boolean;
+  /** WASM: force VFS streaming instead of HeapFS (default: auto for models >500 MB). */
+  preferVfsStreaming?: boolean;
+  /** WASM: use mmap when loading from VFS (default false — safer for large GGUF). */
+  use_mmap?: boolean;
   /** Called during OPFS model download with running byte counts (#6). */
   onProgress?: (downloaded: number, total: number) => void;
   [key: string]: unknown;

@@ -73,6 +73,7 @@ fn main() {
         "ggml-opt.cpp",
         "ggml-threading.cpp",
         "ggml-quants.c",
+        "gguf.cpp",
         "llama-impl.cpp",
         "llama-grammar.cpp",
         "llama-sampling.cpp",
@@ -101,12 +102,16 @@ fn main() {
         "json-partial.cpp",
         "json-schema-to-grammar.cpp",
         "sampling.cpp",
+        "unicode-data.cpp",
         "unicode.cpp",
+        "log.cpp",
+        "common.cpp",
         "cap-llama.cpp",
         "cap-completion.cpp",
         "cap-embedding.cpp",
         "cap-ios-bridge.cpp",
         "cap-wasm-jspi.cpp",
+        "cap-wasm-vfs.cpp",
         // cap-ios-bridge.cpp now contains WASM-specific code gated by CAPLLAMA_BUILD_WASM
     ];
 
@@ -143,7 +148,7 @@ fn main() {
         .flag("-fPIC")
         .include(&cpp_dir)
         .include(cpp_dir.join("ggml-cpu"))
-        .define("GGML_USE_CPU", None)
+        .define("LM_GGML_USE_CPU", None)
         .define("GGML_USE_K_QUANTS", None)
         .define("GGML_USE_WASM", None)
         .define("CAPLLAMA_BUILD_WASM", None)
@@ -161,7 +166,7 @@ fn main() {
         .flag("-fPIC")
         .include(&cpp_dir)
         .include(cpp_dir.join("ggml-cpu"))
-        .define("GGML_USE_CPU", None)
+        .define("LM_GGML_USE_CPU", None)
         .define("GGML_USE_K_QUANTS", None)
         .define("GGML_USE_WASM", None)
         .define("CAPLLAMA_BUILD_WASM", None)

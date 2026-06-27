@@ -168,7 +168,10 @@ pub fn load_context_from_path(path: &str, params_json: &str) -> Result<i64, Stri
     unsafe {
         let id = llama_load_context_from_path(path_cstr.as_ptr(), params_cstr.as_ptr());
         if id <= 0 {
-            return Err("llama_load_context_from_path failed — check VFS path and model".to_string());
+            return Err(format!(
+                "llama_load_context_from_path failed for '{}' — check model validity, VFS path, and WASM heap headroom",
+                path
+            ));
         }
         Ok(id)
     }

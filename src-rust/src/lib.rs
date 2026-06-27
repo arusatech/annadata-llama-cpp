@@ -32,6 +32,17 @@ fn global_state() -> &'static Mutex<EngineState> {
     STATE.get_or_init(|| Mutex::new(EngineState::new()))
 }
 
+/// JSPI + wasm-bindgen describe can swap the 2nd/3rd string args (vfs_path ↔ opts_json).
+fn normalize_vfs_and_opts(vfs_path: String, opts_json: String) -> (String, String) {
+    let vfs_looks_like_json = vfs_path.trim_start().starts_with('{');
+    let opts_looks_like_path = opts_json.starts_with('/');
+    if vfs_looks_like_json && opts_looks_like_path {
+        (opts_json, vfs_path)
+    } else {
+        (vfs_path, opts_json)
+    }
+}
+
 /// Initialize the Wasm engine. Must be called before any other operations.
 #[wasm_bindgen]
 pub fn init() -> Result<(), JsValue> {
@@ -149,6 +160,7 @@ pub fn load_model_from_vfs(model_id: String, vfs_path: String, opts_json: String
             return Err(JsValue::from_str("Engine not initialized"));
         }
 
+        let (vfs_path, opts_json) = normalize_vfs_and_opts(vfs_path, opts_json);
         let context_id = ffi::model_vfs_finish(&vfs_path, &opts_json)
             .map_err(|e| JsValue::from_str(&e))?;
         state.set_context(&model_id, context_id);
@@ -174,6 +186,7 @@ pub fn load_model_from_path(model_id: String, vfs_path: String, opts_json: Strin
             return Err(JsValue::from_str("Engine not initialized"));
         }
 
+        let (vfs_path, opts_json) = normalize_vfs_and_opts(vfs_path, opts_json);
         let context_id = ffi::load_context_from_path(&vfs_path, &opts_json)
             .map_err(|e| JsValue::from_str(&e))?;
         state.set_context(&model_id, context_id);
@@ -183,6 +196,31 @@ pub fn load_model_from_path(model_id: String, vfs_path: String, opts_json: Strin
     #[cfg(not(llama_embed_cpp))]
     {
         let _ = (model_id, vfs_path, opts_json);
+        Err(embedded_unavailable())
+    }
+}
+
+/// Register a context id returned by `llama_load_context_from_path` (JS cwrap path).
+#[wasm_bindgen]
+pub fn register_model_context(model_id: String, context_id: i64) -> Result<(), JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        if context_id <= 0 {
+            return Err(JsValue::from_str("Invalid context id"));
+        }
+        let lock = global_state();
+        let mut state = lock
+            .lock()
+            .map_err(|_| JsValue::from_str("Failed to acquire engine state lock"))?;
+        if !state.initialized {
+            return Err(JsValue::from_str("Engine not initialized"));
+        }
+        state.set_context(&model_id, context_id);
+        Ok(())
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = (model_id, context_id);
         Err(embedded_unavailable())
     }
 }

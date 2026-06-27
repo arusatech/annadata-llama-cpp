@@ -446,7 +446,8 @@ void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 
-#if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
+#if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32) || defined(__EMSCRIPTEN__)
+// Emscripten: mmap() works on MEMFS/HeapFS-backed files when HeapFS patches stream_ops.mmap.
 const bool llama_mmap::SUPPORTED  = true;
 #else
 const bool llama_mmap::SUPPORTED  = false;

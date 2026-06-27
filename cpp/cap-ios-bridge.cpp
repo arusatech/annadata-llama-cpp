@@ -5,8 +5,13 @@
 #include "json-schema-to-grammar.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <filesystem>
+#ifdef __EMSCRIPTEN__
+#include <unistd.h>
+#endif
 #include <fstream>
 #include <map>
 #include <memory>
@@ -75,6 +80,20 @@ void apply_params_json(common_params & cparams, const json * j) {
     }
 }
 
+static bool vfs_path_exists(const std::string & path) {
+    if (path.empty()) {
+        return false;
+    }
+#ifdef __EMSCRIPTEN__
+    // Files written via Emscripten FS.open/write are visible to fopen/access but
+    // std::filesystem::exists can return false for MEMFS paths in some builds.
+    if (path[0] == '/') {
+        return access(path.c_str(), F_OK) == 0;
+    }
+#endif
+    return std::filesystem::exists(path);
+}
+
 std::string resolve_model_path(const std::string & primary, const json * params_j) {
     std::vector<std::string> candidates;
     candidates.push_back(primary);
@@ -86,10 +105,7 @@ std::string resolve_model_path(const std::string & primary, const json * params_
         }
     }
     for (const auto & path : candidates) {
-        if (path.empty()) {
-            continue;
-        }
-        if (std::filesystem::exists(path)) {
+        if (vfs_path_exists(path)) {
             return path;
         }
     }
@@ -97,19 +113,25 @@ std::string resolve_model_path(const std::string & primary, const json * params_
 }
 
 bool load_with_fallback(std::unique_ptr<capllama::llama_cap_context> & context, common_params cparams) {
-    if (context->loadModel(cparams)) {
-        return true;
+    try {
+        if (context->loadModel(cparams)) {
+            return true;
+        }
+    } catch (const std::exception & e) {
+        fprintf(stderr, "loadModel exception: %s\n", e.what());
+        return false;
+    } catch (...) {
+        fprintf(stderr, "loadModel unknown exception\n");
+        return false;
     }
     common_params minimal;
     minimal.model.path = cparams.model.path;
-    minimal.n_ctx = 256;
     minimal.n_batch = 128;
     minimal.n_gpu_layers = 0;
-    minimal.use_mmap = false;
     minimal.use_mlock = false;
     minimal.numa = LM_GGML_NUMA_STRATEGY_DISABLED;
     minimal.ctx_shift = false;
-    minimal.chat_template = "";
+    minimal.chat_template = cparams.chat_template;
     minimal.embedding = cparams.embedding;
     minimal.cont_batching = false;
     minimal.n_parallel = 1;
@@ -126,6 +148,15 @@ bool load_with_fallback(std::unique_ptr<capllama::llama_cap_context> & context, 
     minimal.n_chunks = -1;
     minimal.n_sequences = 1;
     minimal.model_alias = "unknown";
+#ifdef __EMSCRIPTEN__
+    // Never fall back to use_mmap=false on WASM — copying a 700 MB GGUF OOMs.
+    minimal.use_mmap = cparams.use_mmap;
+    minimal.n_ctx = std::min(cparams.n_ctx, 512);
+    minimal.n_batch = std::min(cparams.n_batch, 128);
+#else
+    minimal.n_ctx = 256;
+    minimal.use_mmap = false;
+#endif
     return context->loadModel(minimal);
 }
 
@@ -210,6 +241,7 @@ int64_t llama_init_context(const char * model_path, const char * params_json) {
         const json * pj = params_j.is_object() ? &params_j : nullptr;
         std::string full_model_path = resolve_model_path(primary, pj);
         if (full_model_path.empty()) {
+            fprintf(stderr, "llama_init_context: VFS path not found: %s\n", primary.c_str());
             return -1;
         }
 
@@ -217,7 +249,11 @@ int64_t llama_init_context(const char * model_path, const char * params_json) {
         common_params cparams;
         cparams.model.path = full_model_path;
         cparams.n_ctx = 2048;
+#ifdef __EMSCRIPTEN__
+        cparams.n_batch = 128;
+#else
         cparams.n_batch = 512;
+#endif
         cparams.n_gpu_layers = 0;
         cparams.rope_freq_base = 10000.0f;
         cparams.rope_freq_scale = 1.0f;
@@ -246,6 +282,9 @@ int64_t llama_init_context(const char * model_path, const char * params_json) {
         apply_params_json(cparams, pj);
 
         if (!load_with_fallback(context, cparams)) {
+            fprintf(stderr,
+                "llama_init_context: load failed for %s (n_ctx=%d n_batch=%d use_mmap=%d)\n",
+                full_model_path.c_str(), cparams.n_ctx, cparams.n_batch, cparams.use_mmap ? 1 : 0);
             return -1;
         }
 
@@ -260,7 +299,11 @@ int64_t llama_init_context(const char * model_path, const char * params_json) {
             llama_embedding_register_context(id, raw);
         }
         return id;
+    } catch (const std::exception & e) {
+        fprintf(stderr, "llama_init_context exception: %s\n", e.what());
+        return -1;
     } catch (...) {
+        fprintf(stderr, "llama_init_context: unknown exception\n");
         return -1;
     }
 }
@@ -457,8 +500,18 @@ bool llama_toggle_native_log(bool enabled) {
 #ifdef CAPLLAMA_BUILD_WASM
 
 #include "cap-wasm-jspi.h"
+#include <errno.h>
+#include <sys/stat.h>
+
+extern "C" void cap_wasm_ensure_tmp_dir(void);
 
 static std::string g_wasm_tmp_path;
+
+static void ensure_wasm_tmp_dir() {
+    cap_wasm_ensure_tmp_dir();
+    if (mkdir("/tmp", 0777) != 0 && errno != EEXIST) {
+    }
+}
 
 // Forward-declared to avoid duplicating all of llama_init_context's setup.
 static int64_t init_context_with_cparams(common_params cparams);
@@ -474,6 +527,7 @@ int64_t llama_init_context_from_buffer(
 
     // Choose a unique temporary path so concurrent loads don't clash.
     static int g_tmp_counter = 0;
+    ensure_wasm_tmp_dir();
     std::string tmp_path = std::string("/tmp/wasm_model_") + std::to_string(g_tmp_counter++) + ".gguf";
 
     // Write bytes to the in-process virtual filesystem (Emscripten MEMFS or
@@ -505,6 +559,7 @@ static std::map<std::string, FILE *> g_model_vfs_writes;
 static int g_vfs_stream_counter = 0;
 
 const char * llama_model_vfs_begin() {
+    ensure_wasm_tmp_dir();
     std::string path = std::string("/tmp/wasm_stream_") + std::to_string(g_vfs_stream_counter++) + ".gguf";
     FILE * f = fopen(path.c_str(), "wb");
     if (!f) {
@@ -560,7 +615,15 @@ int64_t llama_load_context_from_path(const char * path, const char * params_json
     if (!path) {
         return -1;
     }
-    return llama_init_context(path, params_json);
+    try {
+        return llama_init_context(path, params_json);
+    } catch (const std::exception & e) {
+        fprintf(stderr, "llama_load_context_from_path exception: %s\n", e.what());
+        return -1;
+    } catch (...) {
+        fprintf(stderr, "llama_load_context_from_path: unknown exception\n");
+        return -1;
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -878,6 +878,8 @@ std::string fs_get_cache_directory() {
         cache_directory = std::getenv("HOME") + std::string("/Library/Caches/");
 #elif defined(_WIN32)
         cache_directory = std::getenv("LOCALAPPDATA");
+#elif defined(__EMSCRIPTEN__)
+        cache_directory = "/tmp/";
 #else
 #  error Unknown architecture
 #endif
@@ -1617,3 +1619,19 @@ float lr_opt::get_lr(float epoch) const {
     LOG_INF("epoch %.2g lr=%.2g\n", epoch, r);
     return r;
 }
+
+#if defined(CAPLLAMA_BUILD_WASM) && defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+
+// JSPI dylink stub for _Z23common_init_from_paramsR13common_params must call a wasm
+// export wired in asyncifyStubs. Must live in this TU so the call is direct (not via
+// env import), otherwise stub → bridge → import → stub recurses infinitely.
+extern "C" {
+
+EMSCRIPTEN_KEEPALIVE
+struct common_init_result cap_wasm_dylink_common_init_from_params(common_params * params) {
+    return common_init_from_params(*params);
+}
+
+} // extern "C"
+#endif

@@ -21,6 +21,7 @@ export type TokenizeResult = { tokens: number[]; has_media?: boolean };
 export type DetokenizeResult = { text: string };
 
 import {
+  ensureWasmTmpDir,
   heapfsAlloc,
   heapfsModelPath,
   heapfsWrite,
@@ -93,6 +94,37 @@ const safeJsonParse = <T>(raw: string, fallback: T): T => {
   }
 };
 
+/** Models above this use VFS streaming first (HeapFS/mmap can overflow JS stack). */
+const LARGE_MODEL_BYTES = 500 * 1024 * 1024;
+
+/** WASM loads default to read() I/O — mmap + HeapFS can recurse through MEMFS JS glue. */
+const wasmLoadOptsJson = (
+  opts: Record<string, unknown> | undefined,
+  overrides?: Record<string, unknown>,
+): string => JSON.stringify({ use_mmap: false, ...(opts ?? {}), ...overrides });
+
+const isStackOverflowError = (err: unknown): boolean => {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /maximum call stack size exceeded/i.test(msg);
+};
+
+const wasmMemoryDiagnostics = (em: EmscriptenModule | null): Record<string, unknown> => {
+  if (!em) {
+    return { wasmMemoryAccessible: false };
+  }
+  const wasmMem = (em as { wasmMemory?: WebAssembly.Memory }).wasmMemory;
+  const buffer = wasmMem?.buffer ?? em.HEAPU8?.buffer;
+  if (!buffer) {
+    return { wasmMemoryAccessible: false };
+  }
+  return {
+    wasmMemoryAccessible: true,
+    wasmLinearBytes: buffer.byteLength,
+    wasmLinearMb: +(buffer.byteLength / 1024 / 1024).toFixed(1),
+    wasmMemoryShared: wasmMem?.buffer instanceof SharedArrayBuffer,
+  };
+};
+
 // Fix #15: worker URL resolution is now explicit and bundler-friendly.
 // - First try the global escape hatch (__LLAMA_WORKER_URL__) set by the app.
 // - Then try the canonical package-relative path using import.meta.url so
@@ -160,12 +192,20 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
     return em;
   };
 
+  const ensureVfsReady = (): void => {
+    const em = emscripten();
+    if (em && supportsHeapFS(em)) {
+      ensureWasmTmpDir(em);
+    }
+  };
+
   return {
     init: async () => {
       (mod.init_engine ?? mod.init)?.();
       const em = emscripten();
       if (em && supportsHeapFS(em)) {
         patchHeapFS(em);
+        ensureWasmTmpDir(em);
       }
     },
 
@@ -181,12 +221,13 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
       const abort = mod.model_vfs_abort;
 
       if (begin && write && finish) {
-        const vfsPath = begin();
+        ensureVfsReady();
+        const bytes = new Uint8Array(modelBuffer);
+        const optsJson = wasmLoadOptsJson(opts);
+        const vfsPath = begin(bytes.length, optsJson);
         if (!vfsPath) throw new Error('model_vfs_begin returned empty path');
-        const optsJson = JSON.stringify(opts ?? {});
         try {
           const CHUNK = 32 * 1024 * 1024; // 32 MB — keeps per-iteration WASM alloc small
-          const bytes = new Uint8Array(modelBuffer);
           for (let offset = 0; offset < bytes.length; offset += CHUNK) {
             // subarray is a zero-copy view; wasm-bindgen copies only 32 MB per call
             write(vfsPath, bytes.subarray(offset, offset + CHUNK));
@@ -207,44 +248,22 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
 
     loadModelFromOpfsReader: async (modelId, reader, opts) => {
       const loadFromPath = mod.load_model_from_path;
-      const optsJson = JSON.stringify({ ...(opts ?? {}), use_mmap: true });
+      const begin = mod.model_vfs_begin;
+      const write = mod.model_vfs_write;
+      const finish = mod.load_model_from_vfs;
+      const abort = mod.model_vfs_abort;
       const chunkSize = 4 * 1024 * 1024;
 
-      try {
-        // HeapFS path (wllama-style): allocate model directly in WASM linear memory.
-        if (loadFromPath) {
-          try {
-            const em = ensureHeapFS();
-            const basename = `${modelId.replace(/[^\w.-]/g, '_')}.gguf`;
-            const vfsPath = heapfsModelPath(basename);
-            em.FS.createDataFile('/models', basename, new ArrayBuffer(0), true, true, true);
-            const fileId = heapfsAlloc(em, basename, reader.sizeBytes, true);
-            for (let offset = 0; offset < reader.sizeBytes; ) {
-              const chunk = reader.readChunk(offset, chunkSize);
-              if (chunk.byteLength === 0) break;
-              heapfsWrite(em, fileId, chunk, offset);
-              offset += chunk.byteLength;
-            }
-            loadFromPath(modelId, vfsPath, optsJson);
-            return;
-          } catch (heapErr) {
-            console.warn('[llama-cpp] HeapFS load failed; falling back to VFS streaming:', heapErr);
-          }
-        }
-
-        const begin = mod.model_vfs_begin;
-        const write = mod.model_vfs_write;
-        const finish = mod.load_model_from_vfs;
-        const abort = mod.model_vfs_abort;
+      const streamOpfsToVfs = (useMmap: boolean): void => {
         if (!begin || !write || !finish) {
           throw new Error('Wasm module missing OPFS streaming exports (model_vfs_* / load_model_from_path)');
         }
-
-        const vfsPath = begin();
+        ensureVfsReady();
+        const vfsPath = begin(reader.sizeBytes, wasmLoadOptsJson(opts, { use_mmap: useMmap }));
         if (!vfsPath) {
           throw new Error('model_vfs_begin returned empty path');
         }
-
+        const optsJson = wasmLoadOptsJson(opts, { use_mmap: useMmap });
         try {
           for (let offset = 0; offset < reader.sizeBytes; ) {
             const chunk = reader.readChunk(offset, chunkSize);
@@ -259,6 +278,48 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
           abort?.(vfsPath);
           throw error;
         }
+      };
+
+      const tryHeapFSLoad = (): void => {
+        if (!loadFromPath) {
+          throw new Error('Wasm module missing load_model_from_path');
+        }
+        const em = ensureHeapFS();
+        const basename = `${modelId.replace(/[^\w.-]/g, '_')}.gguf`;
+        const vfsPath = heapfsModelPath(basename);
+        em.FS.createDataFile('/models', basename, new ArrayBuffer(0), true, true, true);
+        const fileId = heapfsAlloc(em, basename, reader.sizeBytes, true);
+        for (let offset = 0; offset < reader.sizeBytes; ) {
+          const chunk = reader.readChunk(offset, chunkSize);
+          if (chunk.byteLength === 0) break;
+          heapfsWrite(em, fileId, chunk, offset);
+          offset += chunk.byteLength;
+        }
+        loadFromPath(modelId, vfsPath, wasmLoadOptsJson(opts, { use_mmap: true }));
+      };
+
+      const preferVfs =
+        reader.sizeBytes >= LARGE_MODEL_BYTES || opts?.preferVfsStreaming === true;
+
+      try {
+        if (preferVfs) {
+          streamOpfsToVfs(false);
+          return;
+        }
+
+        if (loadFromPath) {
+          try {
+            tryHeapFSLoad();
+            return;
+          } catch (heapErr) {
+            const reason = isStackOverflowError(heapErr)
+              ? 'HeapFS/mmap caused stack overflow'
+              : 'HeapFS load failed';
+            console.warn(`[llama-cpp] ${reason}; falling back to VFS streaming:`, heapErr);
+          }
+        }
+
+        streamOpfsToVfs(false);
       } finally {
         reader.close();
       }
@@ -351,13 +412,27 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
     },
 
     health: async () => {
-      if (!mod.health) return {};
-      return safeJsonParse<Record<string, unknown>>(mod.health(), {});
+      const base = mod.health
+        ? safeJsonParse<Record<string, unknown>>(mod.health(), {})
+        : {};
+      const em = emscripten() as (EmscriptenModule & {
+        __llamaWasmJspi?: boolean;
+        __llamaWasmPthread?: boolean;
+      }) | null;
+      return {
+        ...base,
+        ...wasmMemoryDiagnostics(em),
+        wasmJspi: em?.__llamaWasmJspi ?? false,
+        wasmPthread: em?.__llamaWasmPthread ?? false,
+      };
     },
 
     memory: async () => {
-      if (!mod.memory_snapshot) return { pressure: 'unknown' };
-      return safeJsonParse<Record<string, unknown>>(mod.memory_snapshot(), { pressure: 'unknown' });
+      const em = emscripten();
+      const snap = mod.memory_snapshot
+        ? safeJsonParse<Record<string, unknown>>(mod.memory_snapshot(), { pressure: 'unknown' })
+        : { pressure: 'unknown' };
+      return { ...snap, ...wasmMemoryDiagnostics(em) };
     },
   };
 };

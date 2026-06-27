@@ -216,8 +216,14 @@ done
 # wllama-inspired link flags (HeapFS runtime, optional JSPI / pthreads).
 WLLAMA_LINK_FLAGS=(
   -sFORCE_FILESYSTEM=1
-  -sEXPORTED_RUNTIME_METHODS=['FS','MEMFS','HEAPU8','mmapAlloc','wasmMemory','ENV']
+  -sEXPORTED_RUNTIME_METHODS=['FS','MEMFS','HEAPU8','mmapAlloc','wasmMemory','ENV','cwrap','growMemory']
+  -sEXPORTED_FUNCTIONS=['_malloc','_free','_llama_load_context_from_path']
 )
+# wllama: single-thread uses Emscripten-owned memory (grow via mmapAlloc/malloc).
+# Pthread builds import shared memory from JS (getWasmMemory in the shim).
+if [[ "$LLAMA_WASM_PTHREAD" == "1" ]]; then
+  WLLAMA_LINK_FLAGS+=(-sIMPORTED_MEMORY=1)
+fi
 
 if [[ "$LLAMA_WASM_JSPI" == "1" ]]; then
   WLLAMA_LINK_FLAGS+=(
@@ -232,7 +238,6 @@ if [[ "$LLAMA_WASM_PTHREAD" == "1" ]]; then
     -pthread
     -sUSE_PTHREADS=1
     -sPTHREAD_POOL_SIZE='Module["pthreadPoolSize"]||4'
-    -sIMPORTED_MEMORY=1
   )
 fi
 
@@ -244,7 +249,7 @@ emcc "${NEW_ARGS[@]}" \
   -sALLOW_MEMORY_GROWTH=1 \
   -sINITIAL_MEMORY=872415232 \
   -sMAXIMUM_MEMORY=2147483648 \
-  -sSTACK_SIZE=5242880 \
+  -sSTACK_SIZE=16777216 \
   "${WLLAMA_LINK_FLAGS[@]}" \
   2>&1 | grep -v "^warning:" | grep -v "^emcc: warning:" || true
 

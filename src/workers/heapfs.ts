@@ -28,6 +28,8 @@ export type EmscriptenModule = {
   };
   FS: {
     mkdir: (path: string) => void;
+    analyzePath: (path: string) => { exists: boolean };
+    createPath?: (parent: string, path: string, canRead: boolean, canWrite: boolean) => void;
     mount: (type: unknown, opts: unknown, mountpoint: string) => void;
     createDataFile: (
       parent: string,
@@ -54,8 +56,9 @@ let currFileId = 0;
 let patched = false;
 
 const getHeapU8 = (mod: EmscriptenModule): Uint8Array => {
-  const buffer = (mod as { wasmMemory?: WebAssembly.Memory }).wasmMemory?.buffer ?? mod.HEAPU8.buffer;
-  return new Uint8Array(buffer);
+  const buf = (mod as { wasmMemory?: WebAssembly.Memory }).wasmMemory?.buffer ?? mod.HEAPU8?.buffer;
+  if (!buf) throw new Error('HeapFS requires WASM linear memory');
+  return new Uint8Array(buf);
 };
 
 const patchStream = (mod: EmscriptenModule, stream: { node: { name: string; contents?: Uint8Array; usedBytes?: number } }) => {
@@ -63,7 +66,7 @@ const patchStream = (mod: EmscriptenModule, stream: { node: { name: string; cont
   const f = fsNameToFile[name];
   if (!f) return;
   const heap = getHeapU8(mod);
-  const ptr = f.ptr;
+  const ptr = Number(f.ptr);
   stream.node.contents = heap.subarray(ptr, ptr + f.size);
   stream.node.usedBytes = f.size;
 };
@@ -93,15 +96,14 @@ export const patchHeapFS = (mod: EmscriptenModule): void => {
   };
   mod.MEMFS.ops_table.file.stream.llseek = ops.llseek;
 
-  ops.mmap = function (this: unknown, stream: unknown, ...rest: unknown[]) {
+  ops.mmap = function (this: unknown, stream: unknown, length: unknown, position: unknown, prot: unknown, flags: unknown) {
     patchStream(mod, stream as Parameters<typeof patchStream>[1]);
     const name = (stream as { node: { name: string } }).node.name;
     const f = fsNameToFile[name];
     if (f) {
-      const position = rest[1] as number;
-      return { ptr: f.ptr + position, allocated: false };
+      return { ptr: Number(f.ptr) + Number(position), allocated: false };
     }
-    return (ops._mmap as (...a: unknown[]) => unknown).call(this, stream, ...rest);
+    return (ops._mmap as (...a: unknown[]) => unknown).call(this, stream, length, position, prot, flags);
   };
   mod.MEMFS.ops_table.file.stream.mmap = ops.mmap;
 
@@ -109,10 +111,27 @@ export const patchHeapFS = (mod: EmscriptenModule): void => {
   mod.FS.mount(mod.MEMFS, { root: '.' }, '/models');
 };
 
+/** Ensure MEMFS /tmp exists for VFS model streaming (fopen fails without it). */
+export const ensureWasmTmpDir = (mod: EmscriptenModule): void => {
+  const fs = mod.FS;
+  if (fs.analyzePath('/tmp').exists) return;
+  try {
+    if (typeof fs.createPath === 'function') {
+      fs.createPath('/', 'tmp', true, true);
+    } else {
+      fs.mkdir('/tmp');
+    }
+  } catch {
+    if (!fs.analyzePath('/tmp').exists) {
+      throw new Error('Failed to create MEMFS /tmp for model VFS streaming');
+    }
+  }
+};
+
 /** Allocate `size` bytes in WASM heap for a model file; returns file id. */
 export const heapfsAlloc = (mod: EmscriptenModule, name: string, size: number, allocBuffer = true): number => {
   if (size < 1) throw new Error('HeapFS file size must be > 0');
-  const ptr = allocBuffer ? mod.mmapAlloc(size) : 0;
+  const ptr = allocBuffer ? Number(mod.mmapAlloc(size)) : 0;
   const file: HeapFile = { ptr, size, id: currFileId++ };
   fsIdToFile[file.id] = file;
   fsNameToFile[name] = file;
@@ -127,7 +146,7 @@ export const heapfsWrite = (mod: EmscriptenModule, id: number, buffer: Uint8Arra
   if (after > f.size) {
     throw new Error(`HeapFS write out of bounds: ${after} > ${f.size}`);
   }
-  getHeapU8(mod).set(buffer, f.ptr + offset);
+  getHeapU8(mod).set(buffer, Number(f.ptr) + offset);
   return buffer.byteLength;
 };
 

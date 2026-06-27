@@ -70,55 +70,14 @@ if (emscriptenWasmBytes < MIN_EMBEDDED_BYTES) {
   );
 }
 
-// ── 1c. Verify WASM memory section: initial pages must cover 832 MB ──────────
-// INITIAL_MEMORY=872415232 / 65536 bytes/page = 13312 pages.
-// Pthread builds use IMPORTED_MEMORY=1 — memory is supplied by the JS shim via
-// SharedArrayBuffer, so there is no Memory section in the wasm binary.
+// ── 1c. WASM memory mode ─────────────────────────────────────────────────────
+// wllama: single-thread → Emscripten-owned memory (grow via mmapAlloc/malloc).
+// Pthread builds import shared WebAssembly.Memory from JS (getWasmMemory).
 {
-  const MIN_WASM_PAGES = 13312; // 872_415_232 / 65_536
   if (BUILD_PTHREAD) {
-    console.log(
-      '[package-embed-wasm] WASM memory: pthread build uses IMPORTED_MEMORY ' +
-      `(832 MB SharedArrayBuffer from shim, min ${MIN_WASM_PAGES} pages) ✓`,
-    );
+    console.log('[package-embed-wasm] WASM memory: IMPORTED_MEMORY (pthread shared, wllama getWasmMemory) ✓');
   } else {
-  const wasmBytes = new Uint8Array(emscriptenWasmBuf.buffer);
-  // Scan for the Memory section (id = 5) in the WASM binary.
-  // Layout: magic(4) + version(4) + sections...
-  // Each section: [id:u8][size:uleb128][...payload]
-  // Memory section payload: [count:uleb128][{flags:u8, initial:uleb128, ...}]
-  let foundPages = null;
-  let pos = 8; // skip magic + version
-  while (pos < wasmBytes.length) {
-    const sectionId = wasmBytes[pos++];
-    let sectionSize = 0, shift = 0, b;
-    do { b = wasmBytes[pos++]; sectionSize |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
-    if (sectionId === 5) { // Memory section
-      let p = pos;
-      // count (uleb128) — number of memory definitions
-      let count = 0; shift = 0;
-      do { b = wasmBytes[p++]; count |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
-      if (count > 0) {
-        const flags = wasmBytes[p++]; // 0=no max, 1=has max, 2=shared+max, 4=memory64
-        let initial = 0; shift = 0;
-        do { b = wasmBytes[p++]; initial |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
-        foundPages = initial;
-      }
-      break;
-    }
-    pos += sectionSize;
-  }
-  if (foundPages === null) {
-    fail('Could not find WASM Memory section in llama_engine_emscripten.wasm — binary may be malformed.');
-  }
-  if (foundPages < MIN_WASM_PAGES) {
-    fail(
-      `WASM Memory section has only ${foundPages} initial pages (${(foundPages * 65536 / 1024 / 1024).toFixed(0)} MB). ` +
-      `Expected at least ${MIN_WASM_PAGES} pages (832 MB) for 700+ MB model support. ` +
-      `Rebuild with: -sINITIAL_MEMORY=872415232 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2147483648`,
-    );
-  }
-  console.log(`[package-embed-wasm] WASM memory: ${foundPages} initial pages (${(foundPages * 65536 / 1024 / 1024).toFixed(0)} MB) ✓`);
+    console.log('[package-embed-wasm] WASM memory: Emscripten-owned (832 MB initial, grow via mmapAlloc) ✓');
   }
 }
 
@@ -134,6 +93,70 @@ if (emscriptenWasmBytes < MIN_EMBEDDED_BYTES) {
     mjsSrc = mjsSrc.replace(ORIG, PATCHED);
     await writeFile(emscriptenMjs, mjsSrc);
     console.log('[package-embed-wasm] Patched __wbindgen_start → optional chain');
+  }
+  // JSPI: Asyncify.instrumentWasmExports copies exports via Object.entries and drops
+  // Proxy-only shims. Inject wasm-bindgen ABI helpers onto wasmExports after
+  // instrumentation (origExports retains real WASM exports for updateGOT).
+  const ASYNCIFY_INSTR = 'wasmExports=Asyncify.instrumentWasmExports(wasmExports);';
+  const WBGEN_SHIM = `${ASYNCIFY_INSTR}{const __sp=origExports.__stack_pointer;if(__sp){Object.assign(wasmExports,{__wbindgen_add_to_stack_pointer:(d)=>{const v=(__sp.value+d)|0;__sp.value=v;return v},__wbindgen_export2:origExports.__wbindgen_malloc,__wbindgen_export3:origExports.__wbindgen_realloc,__wbindgen_export4:origExports.__wbindgen_free,__wbindgen_export:origExports.__wbindgen_exn_store})}}`;
+  if (mjsSrc.includes(ASYNCIFY_INSTR) && !mjsSrc.includes('__wbindgen_add_to_stack_pointer:(d)=>')) {
+    mjsSrc = mjsSrc.replace(ASYNCIFY_INSTR, WBGEN_SHIM);
+    await writeFile(emscriptenMjs, mjsSrc);
+    console.log('[package-embed-wasm] Patched wasm-bindgen shims after Asyncify.instrumentWasmExports');
+  }
+  // wasm-bindgen finally blocks call __wbindgen_export3 even when the try body
+  // threw before deferredN_0 was set (e.g. fopen("/tmp/...") failed). Passing
+  // undefined ptr/len into realloc aborts the whole module with "unreachable".
+  const FINALLY_DEALLOC_RE = /wasm\.__wbindgen_export3\(deferred(\d)_0,deferred\1_1,1\)/g;
+  if (FINALLY_DEALLOC_RE.test(mjsSrc) && !mjsSrc.includes('deferred2_0!=null&&deferred2_0!==0')) {
+    mjsSrc = mjsSrc.replace(
+      FINALLY_DEALLOC_RE,
+      '(deferred$1_0!=null&&deferred$1_0!==0&&wasm.__wbindgen_export3(deferred$1_0,deferred$1_1,1))',
+    );
+    await writeFile(emscriptenMjs, mjsSrc);
+    console.log('[package-embed-wasm] Patched wasm-bindgen finally dealloc guards');
+  }
+  // JSPI asyncifyStubs leave most wasm exports undefined; sync calls from cwrap /
+  // bindgen (e.g. llama_load_context_from_path → common_init_from_params) fail
+  // with "asyncifyStubs._Z… is not a function". Mirror all origExports into stubs.
+  const ASSIGN_WASM = 'assignWasmExports(wasmExports);updateGOT(origExports)';
+  const ASYNCIFY_STUB_MARKER = 'asyncifyStubs[__k]=origExports[__k]';
+  const MERGE_ORIG_MARKER = 'mergeLibSymbols(origExports,"main")';
+  const ASYNCIFY_STUBS =
+    'assignWasmExports(wasmExports);mergeLibSymbols(origExports,"main");if(typeof asyncifyStubs!=="undefined"){for(const __k in origExports){if(typeof origExports[__k]==="function"){asyncifyStubs[__k]=origExports[__k]}}const __capCi=origExports["cap_wasm_dylink_common_init_from_params"];if(typeof __capCi==="function"){asyncifyStubs["_Z23common_init_from_paramsR13common_params"]=__capCi}const __desc=origExports["__wbindgen_describe"];asyncifyStubs["__wbindgen_describe"]=function(ptr){return __desc?__desc(ptr):0};const __descCast=origExports["__wbindgen_describe_cast"];asyncifyStubs["__wbindgen_describe_cast"]=function(ptr){return __descCast?__descCast(ptr):0}}updateGOT(origExports)';
+  const OLD_DESCRIBE_LOOP = 'if(__k.startsWith("__wbindgen_describe_")&&typeof origExports[__k]==="function")';
+  if (mjsSrc.includes(ASYNCIFY_STUB_MARKER) && !mjsSrc.includes('cap_wasm_dylink_common_init_from_params')) {
+    mjsSrc = mjsSrc.replace(
+      'for(const __k in origExports){if(typeof origExports[__k]==="function"){asyncifyStubs[__k]=origExports[__k]}}const __desc=origExports',
+      'for(const __k in origExports){if(typeof origExports[__k]==="function"){asyncifyStubs[__k]=origExports[__k]}}const __capCi=origExports["cap_wasm_dylink_common_init_from_params"];if(typeof __capCi==="function"){asyncifyStubs["_Z23common_init_from_paramsR13common_params"]=__capCi}const __desc=origExports',
+    );
+    await writeFile(emscriptenMjs, mjsSrc);
+    console.log('[package-embed-wasm] Added cap_wasm_dylink common_init asyncifyStub wire');
+  } else if (mjsSrc.includes(ASYNCIFY_STUB_MARKER) && !mjsSrc.includes(MERGE_ORIG_MARKER)) {
+    mjsSrc = mjsSrc.replace(
+      'assignWasmExports(wasmExports);if(typeof asyncifyStubs',
+      'assignWasmExports(wasmExports);mergeLibSymbols(origExports,"main");if(typeof asyncifyStubs',
+    );
+    await writeFile(emscriptenMjs, mjsSrc);
+    console.log('[package-embed-wasm] Added mergeLibSymbols(origExports) before asyncifyStubs fill');
+  } else if (mjsSrc.includes(OLD_DESCRIBE_LOOP) && !mjsSrc.includes(ASYNCIFY_STUB_MARKER)) {
+    mjsSrc = mjsSrc.replace(
+      'for(const __k in origExports){if(__k.startsWith("__wbindgen_describe_")&&typeof origExports[__k]==="function"){asyncifyStubs[__k]=origExports[__k]}}',
+      'for(const __k in origExports){if(typeof origExports[__k]==="function"){asyncifyStubs[__k]=origExports[__k]}}',
+    );
+    await writeFile(emscriptenMjs, mjsSrc);
+    console.log('[package-embed-wasm] Upgraded asyncifyStubs to mirror all origExports');
+  } else if (mjsSrc.includes(ASSIGN_WASM) && !mjsSrc.includes(ASYNCIFY_STUB_MARKER)) {
+    mjsSrc = mjsSrc.replace(ASSIGN_WASM, ASYNCIFY_STUBS);
+    await writeFile(emscriptenMjs, mjsSrc);
+    console.log('[package-embed-wasm] Patched asyncifyStubs to mirror all origExports');
+  }
+  // Remove recursive lazy-fallback patch (wasmExports[sym] === stub → stack overflow).
+  const LAZY_STUB = /\{var _f=asyncifyStubs\["([^"]+)"\];if\(typeof _f!=="function"&&typeof wasmExports!=="undefined"&&typeof wasmExports\["\1"\]==="function"\)\{_f=asyncifyStubs\["\1"\]=wasmExports\["\1"\]\}return _f\((\.\.\.args)\)\}/g;
+  if (mjsSrc.includes('_f=asyncifyStubs[')) {
+    mjsSrc = mjsSrc.replace(LAZY_STUB, 'return asyncifyStubs["$1"]($2)');
+    await writeFile(emscriptenMjs, mjsSrc);
+    console.log('[package-embed-wasm] Removed recursive dylink stub lazy fallback');
   }
 }
 
@@ -162,16 +185,18 @@ const shimSrc = `/* @ts-self-types="./llama_engine.d.ts" */
 import createLlamaModule from './${engineName}_emscripten.mjs';
 
 let _mod = null;
+let _lastWasmStderr = '';
 const LLAMA_WASM_JSPI = ${BUILD_JSPI};
 const LLAMA_WASM_PTHREAD = ${BUILD_PTHREAD};
 
-/** Shared WASM memory for pthread builds (wllama-style). Requires COOP/COEP. */
+/** Shared WASM memory for pthread builds (wllama getWasmMemory). Requires COOP/COEP. */
 function trySharedWasmMemory() {
   if (!LLAMA_WASM_PTHREAD) return null;
   if (globalThis.crossOriginIsolated !== true || typeof SharedArrayBuffer === 'undefined') {
     return null;
   }
-  const minBytes = 872415232;
+  // wllama: 128 MB initial, step down max (4096 → 128 MB) on iOS OOM
+  const minBytes = 128 * 1024 * 1024;
   let maxBytes = 4096 * 1024 * 1024;
   const stepBytes = 128 * 1024 * 1024;
   while (maxBytes >= minBytes) {
@@ -185,6 +210,11 @@ function trySharedWasmMemory() {
       maxBytes -= stepBytes;
     }
   }
+  return null;
+}
+
+/** Single-thread: Emscripten owns memory (wllama passes wasmMemory: null). */
+function tryWasmMemory() {
   return null;
 }
 
@@ -209,15 +239,32 @@ export default async function initWasm(_pathHint) {
   });
 
   const sharedMem = trySharedWasmMemory();
+  if (LLAMA_WASM_PTHREAD && !sharedMem) {
+    throw new Error(
+      'Cannot allocate shared WebAssembly.Memory for llama pthread build. ' +
+        'Ensure COOP/COEP headers (crossOriginIsolated) or disable pthreads.',
+    );
+  }
+  const importedMem = sharedMem;
   const pthreadPoolSize = sharedMem && navigator.hardwareConcurrency
     ? Math.max(2, Math.floor(navigator.hardwareConcurrency / 2))
     : 4;
 
   const modulePromise = createLlamaModule({
+    printErr: (text) => {
+      const line = String(text);
+      _lastWasmStderr = (_lastWasmStderr ? _lastWasmStderr + '\\n' : '') + line;
+      if (_lastWasmStderr.length > 4096) _lastWasmStderr = _lastWasmStderr.slice(-4096);
+      if (typeof console !== 'undefined') console.error('[llama.cpp]', line);
+    },
+    onAbort: (reason) => {
+      _lastWasmStderr = 'Aborted: ' + String(reason);
+      if (typeof console !== 'undefined') console.error('[llama.cpp]', _lastWasmStderr);
+    },
+    ...(importedMem ? { wasmMemory: importedMem } : {}),
     ...(sharedMem ? {
-      wasmMemory: sharedMem,
       pthreadPoolSize,
-      mainScriptUrlOrBlob: new URL('./${engineName}_emscripten.mjs', import.meta.url),
+      mainScriptUrlOrBlob: new URL('./${engineName}_emscripten.mjs', import.meta.url).href,
     } : {}),
     // Resolve assets relative to this JS file so the module works regardless
     // of where the dist/wasm/ directory is served from.
@@ -310,46 +357,10 @@ export default async function initWasm(_pathHint) {
           }
         }
 
-        // instance.exports is a sealed object — we cannot add properties to it.
-        // The emscripten MAIN_MODULE does not export the wasm-bindgen ABI shims
-        // that library_bindgen.js expects under these names.  Proxy the instance
-        // so that wasmExports = instance.exports inside receiveInstance picks
-        // up a patched view that adds the missing symbols transparently.
-        const sp = exports.__stack_pointer; // mutable i32 global (shadow stack)
-        let cachedExportsProxy = null;
-        const patchedInstance = new Proxy(result.instance, {
-          get(target, prop) {
-            if (prop !== 'exports') return target[prop];
-            if (!cachedExportsProxy) {
-              cachedExportsProxy = new Proxy(target.exports, {
-                get(ex, p) {
-                  switch (p) {
-                    // Shadow-stack allocator used by wasm-bindgen ABI
-                    case '__wbindgen_add_to_stack_pointer':
-                      return (delta) => {
-                        const v = (sp.value + delta) | 0;
-                        sp.value = v;
-                        return v;
-                      };
-                    // wasm-bindgen canonical export aliases → actual WASM exports
-                    case '__wbindgen_export2': return ex.__wbindgen_malloc;
-                    case '__wbindgen_export3': return ex.__wbindgen_realloc;
-                    case '__wbindgen_export4': return ex.__wbindgen_free;
-                    // handleError in wasm-bindgen emscripten glue calls
-                    // wasm.__wbindgen_export(heapIdx) to store a caught JS
-                    // exception so Rust can retrieve it via the error out-ptr.
-                    // The actual WASM export is __wbindgen_exn_store.
-                    case '__wbindgen_export': return ex.__wbindgen_exn_store;
-                    default: return ex[p];
-                  }
-                },
-              });
-            }
-            return cachedExportsProxy;
-          },
-        });
-
-        successCallback(patchedInstance, result.module);
+        // Pass the real Instance — updateGOT(origExports) requires authentic WASM
+        // export objects. wasm-bindgen shims are injected in llama_engine_emscripten.mjs
+        // after Asyncify.instrumentWasmExports (see package-embed-wasm Stage 1b).
+        successCallback(result.instance, result.module);
       };
 
       const reportInstantiateFailure = (err) => {
@@ -374,9 +385,21 @@ export default async function initWasm(_pathHint) {
   });
 
   _mod = await Promise.race([modulePromise, wasmInstantiateFailed]);
+  ensureMemfsTmp();
+  patchHeapFS();
   _mod.__llamaWasmJspi = LLAMA_WASM_JSPI;
   _mod.__llamaWasmPthread = LLAMA_WASM_PTHREAD && !!sharedMem;
   return _mod;
+}
+
+/**
+ * wasm-bindgen + JSPI: Rust load_model_from_path reads wasm ptr2 as vfs_path (not ptr1).
+ * JS glue still maps arg2→ptr1, arg3→ptr2 — pass (model_id, opts_json, vfs_path).
+ */
+function wasmBindgenLoadModelFromPath(model_id, vfs_path, opts_json) {
+  const fn = _mod?.load_model_from_path;
+  if (!fn) throw new Error('load_model_from_path not on Emscripten module');
+  fn(model_id, opts_json, vfs_path);
 }
 
 // ── Named exports (synchronous; safe to call after await initWasm()) ─────────
@@ -397,7 +420,12 @@ export function load_model(model_id, bytes, opts_json) {
 /** Unload a loaded model and release resources. */
 export function unload_model(model_id) {
   if (!_mod) throw new Error('llama_engine not ready — await init() first');
-  return _mod.unload_model(model_id);
+  _mod.unload_model(model_id);
+  const kept = _loadedHeapfsModels.get(model_id);
+  if (kept) {
+    heapfsReleaseEntry(kept.path, { mode: 'heapfs', basename: kept.basename, heapId: kept.heapId });
+    _loadedHeapfsModels.delete(model_id);
+  }
 }
 
 /** Run text generation. Returns JSON GenerateResponse. */
@@ -424,38 +452,499 @@ export function memory_snapshot() {
   return _mod.memory_snapshot();
 }
 
-// ── VFS streaming API (preferred over load_model for large models) ────────────
-// These allow writing the GGUF in chunks via Emscripten MEMFS, which keeps
-// peak WASM heap usage at ~1.4 GB instead of ~2.1 GB for a 697 MB model.
+// ── VFS streaming API (wllama HeapFS pattern) ─────────────────────────────────
+// Ref: ref-code/wllama/src/workers-code/llama-cpp.js
+// - mmapAlloc places GGUF bytes in WASM linear memory (not JS heap MEMFS)
+// - patchHeapFS redirects MEMFS mmap/read to those bytes (zero-copy for llama)
+// - Targeted mem.grow() before model init reserves headroom for vocab/KV (after HeapFS stream)
 
-/** Begin streaming a model into MEMFS. Returns the temp VFS path. */
-export function model_vfs_begin() {
+let _heapfsPatched = false;
+const _heapfsNameToFile = {};
+const _heapfsIdToFile = {};
+let _heapfsFileId = 0;
+
+/** Fresh HEAP view after mmapAlloc growth (wllama getHeapU8). */
+function getHeapU8() {
+  const buf = _mod.wasmMemory?.buffer ?? _mod.HEAPU8?.buffer;
+  if (!buf) throw new Error('WASM heap not ready');
+  return new Uint8Array(buf);
+}
+
+function supportsHeapFS() {
+  return typeof _mod?.mmapAlloc === 'function' && _mod?.MEMFS && _mod?.FS;
+}
+
+function patchHeapFS() {
+  if (_heapfsPatched || !supportsHeapFS()) return;
+  _heapfsPatched = true;
+  const m = _mod;
+  const ops = m.MEMFS.stream_ops;
+  ops._read = ops._read ?? ops.read;
+  ops._write = ops._write ?? ops.write;
+  ops._llseek = ops._llseek ?? ops.llseek;
+  ops._allocate = ops._allocate ?? ops.allocate;
+  ops._mmap = ops._mmap ?? ops.mmap;
+  ops._msync = ops._msync ?? ops.msync;
+
+  const patchStream = (stream) => {
+    const name = stream.node.name;
+    const f = _heapfsNameToFile[name];
+    if (!f) return;
+    const ptr = Number(f.ptr);
+    stream.node.contents = getHeapU8().subarray(ptr, ptr + f.size);
+    stream.node.usedBytes = f.size;
+  };
+
+  ops.read = function (stream, buffer, offset, length, position) {
+    patchStream(stream);
+    return ops._read(stream, buffer, offset, length, position);
+  };
+  m.MEMFS.ops_table.file.stream.read = ops.read;
+
+  ops.llseek = function (stream, off, whence) {
+    patchStream(stream);
+    return ops._llseek(stream, off, whence);
+  };
+  m.MEMFS.ops_table.file.stream.llseek = ops.llseek;
+
+  ops.mmap = function (stream, length, position, prot, flags) {
+    patchStream(stream);
+    const name = stream.node.name;
+    const f = _heapfsNameToFile[name];
+    if (f) {
+      return { ptr: Number(f.ptr) + Number(position), allocated: false };
+    }
+    return ops._mmap(stream, length, position, prot, flags);
+  };
+  m.MEMFS.ops_table.file.stream.mmap = ops.mmap;
+
+  try {
+    if (!m.FS.analyzePath('/models').exists) {
+      if (m.FS.createPath) {
+        m.FS.createPath('/', 'models', true, true);
+      } else {
+        m.FS.mkdir('/models');
+      }
+    }
+    m.FS.mount(m.MEMFS, { root: '.' }, '/models');
+  } catch (_) {}
+}
+
+function heapfsAlloc(name, size) {
+  const ptr = _mod.mmapAlloc(size);
+  const file = { ptr: Number(ptr), size, id: _heapfsFileId++ };
+  _heapfsIdToFile[file.id] = file;
+  _heapfsNameToFile[name] = file;
+  return file.id;
+}
+
+function heapfsWrite(id, buffer, offset) {
+  const f = _heapfsIdToFile[id];
+  if (!f) throw new Error('HeapFS file id ' + id + ' not found');
+  const after = offset + buffer.byteLength;
+  if (after > f.size) {
+    throw new Error('HeapFS write out of bounds: ' + after + ' > ' + f.size);
+  }
+  getHeapU8().set(buffer, Number(f.ptr) + offset);
+  return buffer.byteLength;
+}
+
+/** Ensure MEMFS /tmp exists (legacy fallback path). */
+function ensureMemfsTmp() {
+  const fs = _mod?.FS;
+  if (!fs) {
+    throw new Error('Emscripten FS not ready — cannot create /tmp for model streaming');
+  }
+  if (!fs.analyzePath('/tmp').exists) {
+    if (typeof fs.createPath === 'function') {
+      fs.createPath('/', 'tmp', true, true);
+    } else {
+      fs.mkdir('/tmp');
+    }
+  }
+  if (!fs.analyzePath('/tmp').exists) {
+    throw new Error('Failed to create MEMFS /tmp for model VFS streaming');
+  }
+}
+
+const _jsVfsStreams = new Map();
+/** Keep HeapFS mmap alive for loaded models (wllama never unlinks until exit). */
+const _loadedHeapfsModels = new Map();
+let _jsVfsCounter = 0;
+
+function effectiveNctx(modelBytes, opts_json) {
+  let n_ctx = 1024;
+  try {
+    const opts = JSON.parse(opts_json || '{}');
+    if (typeof opts.n_ctx === 'number' && opts.n_ctx > 0) n_ctx = opts.n_ctx;
+  } catch (_) {}
+  if (modelBytes > 500 * 1024 * 1024) {
+    n_ctx = Math.min(n_ctx, 512);
+  }
+  if (modelBytes > 600 * 1024 * 1024) {
+    n_ctx = Math.min(n_ctx, 128);
+  } else if (modelBytes > 500 * 1024 * 1024) {
+    n_ctx = Math.min(n_ctx, 256);
+  }
+  return n_ctx;
+}
+
+function heapfsReleaseEntry(vfs_path, entry) {
+  if (!entry || entry.mode !== 'heapfs') return;
+  if (entry.basename) {
+    delete _heapfsNameToFile[entry.basename];
+    if (entry.heapId != null) delete _heapfsIdToFile[entry.heapId];
+  }
+  try {
+    _mod.FS.unlink(vfs_path);
+  } catch (_) {}
+}
+
+/** Re-attach MEMFS node views after wasmMemory.grow() (old TypedArrays are detached). */
+function heapfsResyncViews() {
+  if (!supportsHeapFS()) return;
+  patchHeapFS();
+  const heap = getHeapU8();
+  for (const name in _heapfsNameToFile) {
+    const f = _heapfsNameToFile[name];
+    if (!f) continue;
+    const ptr = Number(f.ptr);
+    const slice = heap.subarray(ptr, ptr + f.size);
+    try {
+      const node = _mod.FS.lookupPath('/models/' + name).node;
+      node.contents = slice;
+      node.usedBytes = f.size;
+    } catch (_) {}
+  }
+}
+
+/** Sync MEMFS node size + verify GGUF magic before C++ fopen/mmap (wllama pattern). */
+function heapfsFinalizeForLoad(vfs_path, basename, expectedBytes) {
+  const f = _heapfsNameToFile[basename];
+  if (!f) {
+    throw new Error('heapfs finalize: missing entry for ' + basename);
+  }
+  patchHeapFS();
+  const ptr = Number(f.ptr);
+  const heap = getHeapU8();
+  if (heap.byteLength < ptr + 4) {
+    throw new Error('heapfs finalize: ptr out of heap bounds ' + ptr);
+  }
+  const magic = String.fromCharCode(heap[ptr], heap[ptr + 1], heap[ptr + 2], heap[ptr + 3]);
+  if (magic !== 'GGUF') {
+    throw new Error('heapfs GGUF magic mismatch at ' + vfs_path + ': ' + JSON.stringify(magic));
+  }
+  const node = _mod.FS.lookupPath(vfs_path).node;
+  node.contents = heap.subarray(ptr, ptr + f.size);
+  node.usedBytes = f.size;
+  const st = _mod.FS.stat(vfs_path);
+  const fd = _mod.FS.open(vfs_path, 'r');
+  const endPos = _mod.FS.llseek(fd, 0, 2);
+  _mod.FS.close(fd);
+  if (typeof console !== 'undefined') {
+    console.error(
+      '[llama-wasm] heapfs finalize: path=' + vfs_path +
+      ' stat=' + st.size + ' llseek=' + endPos +
+      ' expected=' + expectedBytes,
+    );
+  }
+  if (endPos !== expectedBytes) {
+    throw new Error(
+      'heapfs file size mismatch at ' + vfs_path + ': llseek=' + endPos + ' expected=' + expectedBytes,
+    );
+  }
+}
+
+let _cwrapLoadContextFromPath = null;
+
+function resolveLoadContextFromPathFn() {
+  if (_cwrapLoadContextFromPath) return _cwrapLoadContextFromPath;
+  const name = 'llama_load_context_from_path';
+  const tryFns = [];
+  if (typeof _mod.cwrap === 'function') {
+    tryFns.push(() => _mod.cwrap(name, 'number', ['string', 'string']));
+  }
+  if (_mod.wasmExports?.[name]) {
+    tryFns.push(() => _mod.wasmExports[name]);
+  }
+  if (typeof _mod['_' + name] === 'function') {
+    tryFns.push(() => _mod['_' + name]);
+  }
+  for (const get of tryFns) {
+    try {
+      const raw = get();
+      if (typeof raw === 'function') {
+        _cwrapLoadContextFromPath = (path, opts) => raw(path, opts);
+        return _cwrapLoadContextFromPath;
+      }
+    } catch (_) {}
+  }
+  throw new Error('llama_load_context_from_path not exported (cwrap/wasmExports)');
+}
+
+/** Load via C bridge (avoids bindgen throw on trap) + register context in Rust. */
+function wasmLoadContextFromPath(model_id, vfs_path, opts_json) {
+  const loadFn = resolveLoadContextFromPathFn();
+  if (typeof console !== 'undefined') {
+    console.error('[llama-wasm] cwrap load: path=' + vfs_path + ' wasmMB=' + wasmLinearMb());
+  }
+  const ctxId = loadFn(vfs_path, opts_json);
+  if (typeof console !== 'undefined') {
+    console.error('[llama-wasm] cwrap load result: ctxId=' + ctxId);
+  }
+  if (ctxId <= 0) {
+    throw new Error(
+      'llama_load_context_from_path returned ' + ctxId + ' for ' + vfs_path +
+      (_lastWasmStderr ? ' | llama: ' + _lastWasmStderr.slice(-500) : ''),
+    );
+  }
+  const reg = _mod.register_model_context;
+  if (typeof reg === 'function') {
+    reg(model_id, ctxId);
+    return;
+  }
+  wasmBindgenLoadModelFromPath(model_id, vfs_path, opts_json);
+}
+
+function wasmThrowToError(err, context) {
+  const WasmException = typeof WebAssembly !== 'undefined' && WebAssembly.Exception;
+  if (WasmException && err instanceof WasmException) {
+    let msg = 'WebAssembly.Exception (likely OOM during model/context init — try closing other tabs)';
+    try {
+      if (err.message) msg = String(err.message);
+    } catch (_) {}
+    if (_lastWasmStderr) msg += ' | llama: ' + _lastWasmStderr.slice(0, 500);
+    return new Error(context + ': ' + msg);
+  }
+  if (err instanceof WebAssembly.RuntimeError) {
+    const msg = err.message || 'WebAssembly runtime error (likely OOM during model load)';
+    let suffix = msg;
+    if (_lastWasmStderr) suffix += ' | llama: ' + _lastWasmStderr.slice(0, 500);
+    return new Error(context + ': ' + suffix);
+  }
+  if (err instanceof Error && err.message && err.message !== 'undefined') {
+    if (_lastWasmStderr) err.message += ' | llama: ' + _lastWasmStderr.slice(0, 500);
+    return err;
+  }
+  const detail =
+    typeof err === 'string' ? err :
+    err instanceof Error ? err.message :
+    err == null ? '' : String(err);
+  let suffix = detail && detail !== 'undefined' ? detail : 'no error detail from WASM bindgen';
+  if (_lastWasmStderr) suffix += ' | llama: ' + _lastWasmStderr.slice(0, 500);
+  return new Error(context + ': ' + suffix);
+}
+
+function vfsStatBytes(path) {
+  try {
+    const st = _mod.FS.stat(path);
+    return typeof st.size === 'number' ? st.size : 0;
+  } catch (_) {
+    return -1;
+  }
+}
+
+function wasmLinearMb() {
+  try {
+    const buf = _mod.wasmMemory?.buffer ?? _mod.HEAPU8?.buffer;
+    return buf ? +(buf.byteLength / 1024 / 1024).toFixed(1) : 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
+const WASM_MAX_BYTES = 2147483648;
+
+function wasmMemoryTarget(modelBytes) {
+  // Large GGUF: grow to the 2GB cap so load_tensors has peak headroom (697MB file + mmap metadata + KV).
+  if (modelBytes > 600 * 1024 * 1024) {
+    return WASM_MAX_BYTES;
+  }
+  if (modelBytes > 400 * 1024 * 1024) {
+    return Math.min(modelBytes + 1024 * 1024 * 1024, WASM_MAX_BYTES);
+  }
+  return Math.min(modelBytes + 512 * 1024 * 1024, WASM_MAX_BYTES);
+}
+
+/** Reserve headroom for vocab, BPE ranks, and KV cache after HeapFS stream (avoids OOB on malloc). */
+function ensureWasmMemoryHeadroom(modelBytes) {
+  if (!_mod || !(modelBytes > 0)) return;
+  const current = _mod.HEAPU8?.length ?? _mod.wasmMemory?.buffer?.byteLength ?? 0;
+  const target = wasmMemoryTarget(modelBytes);
+  if (current >= target) return;
+
+  let grown = false;
+  if (typeof _mod.growMemory === 'function') {
+    grown = _mod.growMemory(target) === 1;
+  } else if (typeof _mod.emscripten_resize_heap === 'function') {
+    grown = !!_mod.emscripten_resize_heap(target);
+  }
+  if (!grown) {
+    throw new Error('[llama-wasm] failed to grow wasm memory to ' + target + ' bytes (have ' + current + ')');
+  }
+  heapfsResyncViews();
+  const after = _mod.HEAPU8?.length ?? _mod.wasmMemory?.buffer?.byteLength ?? 0;
+  if (typeof console !== 'undefined') {
+    console.error(
+      '[llama-wasm] memory grow: ' + (current / 1048576).toFixed(0) + 'MB -> ' +
+      (after / 1048576).toFixed(0) + 'MB (model=' + (modelBytes / 1048576).toFixed(0) + 'MB)',
+    );
+  }
+}
+
+/** Begin HeapFS stream — mmapAlloc grows Emscripten memory (wllama fs.alloc). */
+function heapfsStreamBegin(totalBytes, opts_json) {
+  patchHeapFS();
+  if (typeof console !== 'undefined') {
+    console.error(
+      '[llama-wasm] HeapFS begin: modelMB=' + (totalBytes / 1048576).toFixed(1) +
+      ' wasmMB=' + wasmLinearMb() + ' (mmapAlloc will grow as needed)',
+    );
+  }
+  const basename = 'wasm_stream_' + (_jsVfsCounter++) + '.gguf';
+  _mod.FS.createDataFile('/models', basename, new ArrayBuffer(0), true, true, true);
+  const heapId = heapfsAlloc(basename, totalBytes);
+  const path = '/models/' + basename;
+  _jsVfsStreams.set(path, { mode: 'heapfs', heapId, basename, offset: 0, size: totalBytes });
+  return path;
+}
+
+function jsModelVfsBegin(totalBytes, opts_json) {
+  if (typeof totalBytes === 'number' && totalBytes > 0 && supportsHeapFS()) {
+    return heapfsStreamBegin(totalBytes, opts_json);
+  }
+  ensureMemfsTmp();
+  const path = '/tmp/wasm_stream_' + (_jsVfsCounter++) + '.gguf';
+  const stream = _mod.FS.open(path, 'w');
+  _jsVfsStreams.set(path, { mode: 'memfs', stream, offset: 0 });
+  return path;
+}
+
+function jsModelVfsWrite(path, chunk) {
+  const entry = _jsVfsStreams.get(path);
+  if (!entry) {
+    throw new Error('model_vfs_write: no open stream for ' + path);
+  }
+  if (!chunk || chunk.byteLength === 0) return;
+  const buf = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+  try {
+    if (entry.mode === 'heapfs') {
+      heapfsWrite(entry.heapId, buf, entry.offset);
+    } else {
+      _mod.FS.write(entry.stream, buf, 0, buf.byteLength, entry.offset);
+    }
+    entry.offset += buf.byteLength;
+  } catch (err) {
+    throw wasmThrowToError(err, 'VFS write failed at offset ' + entry.offset + ' for ' + path);
+  }
+}
+
+function jsModelVfsClose(path) {
+  const entry = _jsVfsStreams.get(path);
+  if (!entry) return;
+  if (entry.mode === 'memfs' && entry.stream) {
+    _mod.FS.close(entry.stream);
+  }
+}
+
+function jsModelVfsAbort(path) {
+  const entry = _jsVfsStreams.get(path);
+  jsModelVfsClose(path);
+  _jsVfsStreams.delete(path);
+  if (entry?.mode === 'heapfs' && entry.basename) {
+    delete _heapfsNameToFile[entry.basename];
+    if (entry.heapId != null) delete _heapfsIdToFile[entry.heapId];
+  }
+  try {
+    _mod.FS.unlink(path);
+  } catch (_) {}
+}
+
+function vfsLoadOptsJson(opts_json, heapfs, modelBytes) {
+  let opts = {};
+  try {
+    opts = JSON.parse(opts_json || '{}');
+  } catch (_) {}
+  if (heapfs) {
+    opts.use_mmap = true;
+    opts.n_ctx = effectiveNctx(modelBytes, opts_json);
+    if (opts.n_batch == null || opts.n_batch > 128) {
+      opts.n_batch = 128;
+    }
+    if (modelBytes > 600 * 1024 * 1024 && (opts.n_batch == null || opts.n_batch > 64)) {
+      opts.n_batch = 64;
+    }
+  } else if (opts.use_mmap == null) {
+    opts.use_mmap = false;
+  }
+  return JSON.stringify(opts);
+}
+
+/** Begin streaming a model into WASM VFS. Pass total_bytes + opts_json for HeapFS pre-grow. */
+export function model_vfs_begin(total_bytes, opts_json) {
   if (!_mod) throw new Error('llama_engine not ready — await init() first');
-  return _mod.model_vfs_begin();
+  return jsModelVfsBegin(total_bytes, opts_json);
 }
 
 /** Append a chunk to an in-progress VFS model write. */
 export function model_vfs_write(vfs_path, chunk) {
   if (!_mod) throw new Error('llama_engine not ready — await init() first');
-  return _mod.model_vfs_write(vfs_path, chunk);
+  jsModelVfsWrite(vfs_path, chunk);
 }
 
 /** Abort a partial VFS write and remove the temp file. */
 export function model_vfs_abort(vfs_path) {
   if (!_mod) throw new Error('llama_engine not ready — await init() first');
-  return _mod.model_vfs_abort(vfs_path);
+  jsModelVfsAbort(vfs_path);
 }
 
-/** Finish a streamed VFS write and load the model (deletes the VFS file). */
+/** Finish a streamed VFS write and load the model. HeapFS mmap stays alive until unload. */
 export function load_model_from_vfs(model_id, vfs_path, opts_json) {
   if (!_mod) throw new Error('llama_engine not ready — await init() first');
-  return _mod.load_model_from_vfs(model_id, vfs_path, opts_json);
+  const entry = _jsVfsStreams.get(vfs_path);
+  const heapfs = entry?.mode === 'heapfs';
+  jsModelVfsClose(vfs_path);
+  const bytes = heapfs ? (entry?.size ?? 0) : vfsStatBytes(vfs_path);
+  if (bytes <= 0) {
+    throw new Error('VFS model file missing or empty after stream: ' + vfs_path + ' (bytes=' + bytes + ')');
+  }
+  const loadOpts = vfsLoadOptsJson(opts_json, heapfs, bytes);
+  if (typeof console !== 'undefined') {
+    console.error('[llama-wasm] load_model_from_vfs: wasmMB=' + wasmLinearMb() + ' opts=' + loadOpts);
+  }
+  _jsVfsStreams.delete(vfs_path);
+  try {
+    if (heapfs) {
+      ensureWasmMemoryHeadroom(bytes);
+      heapfsFinalizeForLoad(vfs_path, entry.basename, bytes);
+    }
+    wasmLoadContextFromPath(model_id, vfs_path, loadOpts);
+    if (heapfs && entry?.basename) {
+      _loadedHeapfsModels.set(model_id, {
+        path: vfs_path,
+        basename: entry.basename,
+        heapId: entry.heapId,
+      });
+    }
+  } catch (err) {
+    if (heapfs) {
+      heapfsReleaseEntry(vfs_path, entry);
+    } else {
+      try {
+        _mod.FS.unlink(vfs_path);
+      } catch (_) {}
+    }
+    throw wasmThrowToError(
+      err,
+      'load_model_from_vfs failed for ' + vfs_path + ' (' + bytes + ' bytes, heapfs=' + heapfs + ', wasmMb=' + wasmLinearMb() + ')',
+    );
+  }
 }
 
 /** Load from an existing VFS path (HeapFS — zero-copy mmap). */
 export function load_model_from_path(model_id, vfs_path, opts_json) {
   if (!_mod) throw new Error('llama_engine not ready — await init() first');
-  return _mod.load_model_from_path(model_id, vfs_path, opts_json);
+  wasmBindgenLoadModelFromPath(model_id, vfs_path, opts_json);
 }
 `;
 await writeFile(jsOutPath, shimSrc);
@@ -492,7 +981,7 @@ export function health(): string;
 export function memory_snapshot(): string;
 
 /** Begin streaming a model into MEMFS. Returns the temp VFS path. */
-export function model_vfs_begin(): string;
+export function model_vfs_begin(total_bytes?: number, opts_json?: string): string;
 /** Append a chunk to an in-progress VFS model write. */
 export function model_vfs_write(vfs_path: string, chunk: Uint8Array): void;
 /** Abort a partial VFS write and remove the temp file. */
@@ -558,6 +1047,21 @@ if (!finalJs.includes('export default') || !finalJs.includes('export function in
 }
 if (!finalJs.includes(`${engineName}_emscripten.mjs`)) {
   fail(`Generated JS does not import ${engineName}_emscripten.mjs`);
+}
+{
+  const mjsCheck = await readFile(emscriptenMjs, 'utf8');
+  if (!mjsCheck.includes('__wbindgen_add_to_stack_pointer:(d)=>')) {
+    fail('Emscripten mjs missing wasm-bindgen shim patch after Asyncify.instrumentWasmExports');
+  }
+  if (!mjsCheck.includes('deferred2_0!=null&&deferred2_0!==0')) {
+    fail('Emscripten mjs missing wasm-bindgen finally dealloc guards');
+  }
+  if (!mjsCheck.includes('cap_wasm_dylink_common_init_from_params')) {
+    fail('Emscripten mjs missing cap_wasm_dylink common_init stub wire');
+  }
+  if (mjsCheck.includes('_f=asyncifyStubs[')) {
+    fail('Emscripten mjs must not use recursive dylink stub lazy fallback');
+  }
 }
 
 console.log('[package-embed-wasm] Wasm package ready:');
