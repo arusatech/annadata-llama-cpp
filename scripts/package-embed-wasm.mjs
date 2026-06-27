@@ -571,6 +571,7 @@ function wasmGenerateViaCwrap(model_id, req_json) {
   if (!ctxId || ctxId <= 0) {
     throw new Error('Model not loaded (no WASM context id for ' + model_id + ')');
   }
+  const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
   if (typeof console !== 'undefined') {
     console.error(
       '[llama-wasm] cwrap generate: model=' + model_id + ' ctxId=' + ctxId +
@@ -579,6 +580,9 @@ function wasmGenerateViaCwrap(model_id, req_json) {
   }
   const compJson = buildCompletionParamsJson(req_json);
   const raw = resolveCompletionFn()(ctxId, compJson);
+  const elapsedMs = Math.round(
+    (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0,
+  );
   if (typeof raw !== 'string') {
     throw new TypeError('llama_completion returned ' + typeof raw + ' (' + String(raw) + ')');
   }
@@ -592,7 +596,10 @@ function wasmGenerateViaCwrap(model_id, req_json) {
     throw new Error(parsed.error);
   }
   if (typeof console !== 'undefined') {
-    console.error('[llama-wasm] cwrap generate ok chars=' + (parsed.text?.length ?? 0));
+    console.error(
+      '[llama-wasm] cwrap generate ok chars=' + (parsed.text?.length ?? 0) +
+      ' ms=' + elapsedMs + ' tokens=' + (parsed.tokens_predicted ?? '?'),
+    );
   }
   return raw;
 }
@@ -1211,8 +1218,8 @@ function vfsLoadOptsJson(opts_json, mode, modelBytes) {
     opts.n_ctx = effectiveNctx(modelBytes, opts_json);
     if (modelBytes > 600 * 1024 * 1024) {
       // 65536 vocab × n_batch logits buffer — keep small at 2GB heap after full weight copy.
-      if (opts.n_batch == null || opts.n_batch > 8) {
-        opts.n_batch = 8;
+      if (opts.n_batch == null || opts.n_batch > 16) {
+        opts.n_batch = 16;
       }
     } else if (opts.n_batch == null || opts.n_batch > 128) {
       opts.n_batch = 128;

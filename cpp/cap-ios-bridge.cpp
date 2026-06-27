@@ -4,6 +4,7 @@
 #include "cap-completion.h"
 #include "json-schema-to-grammar.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -263,6 +264,101 @@ void parse_completion_params(capllama::llama_cap_context * ctx, const char * par
     n_predict_out = n_predict;
 }
 
+void apply_completion_stops(capllama::llama_cap_context * ctx, const char * params_json) {
+    ctx->params.antiprompt.clear();
+    if (!params_json || !ctx) {
+        return;
+    }
+    try {
+        json p = json::parse(params_json);
+        if (p.contains("stop") && p["stop"].is_array()) {
+            for (const auto & el : p["stop"]) {
+                if (el.is_string()) {
+                    const std::string s = el.get<std::string>();
+                    if (!s.empty()) {
+                        ctx->params.antiprompt.push_back(s);
+                    }
+                }
+            }
+        }
+    } catch (...) {
+    }
+}
+
+bool ensure_completion(capllama::llama_cap_context * ctx) {
+    if (!ctx || !ctx->ctx || !ctx->model) {
+        return false;
+    }
+    if (!ctx->completion) {
+        try {
+            ctx->completion = new capllama::llama_cap_context_completion(ctx);
+        } catch (...) {
+            return false;
+        }
+    }
+    return ctx->completion != nullptr;
+}
+
+/** Rewind, apply stops, re-init sampler (must run after every parse_completion_params). */
+bool prepare_completion_run(capllama::llama_cap_context * ctx, const char * params_json) {
+    if (!ensure_completion(ctx)) {
+        return false;
+    }
+    ctx->completion->rewind();
+    apply_completion_stops(ctx, params_json);
+    if (!ctx->completion->initSampling() || !ctx->completion->ctx_sampling) {
+        return false;
+    }
+    return true;
+}
+
+int run_completion_loop(
+    capllama::llama_cap_context * ctx,
+    int n_predict,
+    bool & hit_eos_out,
+    std::string & generated_text_out)
+{
+    generated_text_out.clear();
+    hit_eos_out = false;
+    if (!ctx || !ctx->completion || !ctx->model) {
+        return 0;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(ctx->model);
+    int tokens_generated = 0;
+
+    ctx->completion->beginCompletion();
+
+    while (tokens_generated < n_predict &&
+           ctx->completion->has_next_token &&
+           !ctx->completion->is_interrupted) {
+        capllama::completion_token_output token_output = ctx->completion->doCompletion();
+        if (token_output.tok < 0) {
+            hit_eos_out = ctx->completion->stopped_eos;
+#ifdef __EMSCRIPTEN__
+            fprintf(stderr, "@@WASM_GEN@@ token_break tok=%d eos=%d n=%d\n",
+                token_output.tok, hit_eos_out ? 1 : 0, tokens_generated);
+#endif
+            break;
+        }
+        if (llama_vocab_is_eog(vocab, token_output.tok)) {
+            hit_eos_out = true;
+#ifdef __EMSCRIPTEN__
+            fprintf(stderr, "@@WASM_GEN@@ eos_at=%d\n", tokens_generated);
+#endif
+            break;
+        }
+        if (ctx->completion->stopped_word || ctx->completion->stopped_limit) {
+            break;
+        }
+        tokens_generated++;
+    }
+
+    generated_text_out = ctx->completion->generated_text;
+    ctx->completion->endCompletion();
+    return tokens_generated;
+}
+
 } // namespace
 
 extern "C" {
@@ -333,8 +429,8 @@ int64_t llama_init_context(const char * model_path, const char * params_json) {
         // Non-pthread WASM: ggml-cpu lm_ggml_thread_create fails when n_threads > 1.
         cparams.cpuparams.n_threads = 1;
         cparams.cpuparams_batch.n_threads = 1;
-        if (cparams.n_batch > 8) {
-            cparams.n_batch = 8;
+        if (cparams.n_batch > 16) {
+            cparams.n_batch = 16;
         }
         if (cparams.n_ctx > 512) {
             cparams.n_ctx = 512;
@@ -421,29 +517,8 @@ const char * llama_completion(int64_t context_id, const char * params_json) {
         capllama::llama_cap_tokenize_result tokenize_result = ctx->tokenize(prompt_str, {});
         std::vector<llama_token> prompt_tokens = tokenize_result.tokens;
 
-        if (!ctx->completion) {
-            if (!ctx->ctx || !ctx->model) {
-                return tls_cstr("{\"error\":\"invalid context\"}");
-            }
-            try {
-                ctx->completion = new capllama::llama_cap_context_completion(ctx);
-                if (!ctx->completion->initSampling() || !ctx->completion->ctx_sampling) {
-                    delete ctx->completion;
-                    ctx->completion = nullptr;
-                    return tls_cstr("{\"error\":\"sampling init failed\"}");
-                }
-            } catch (const std::exception & e) {
-                if (ctx->completion) {
-                    delete ctx->completion;
-                    ctx->completion = nullptr;
-                }
-                json err = {{"error", std::string("completion init: ") + e.what()}};
-                return tls_cstr(err.dump());
-            }
-        } else if (!ctx->completion->ctx_sampling) {
-            if (!ctx->completion->initSampling() || !ctx->completion->ctx_sampling) {
-                return tls_cstr("{\"error\":\"sampling re-init failed\"}");
-            }
+        if (!prepare_completion_run(ctx, params_json)) {
+            return tls_cstr("{\"error\":\"completion prepare failed\"}");
         }
 
         std::string generated_text;
@@ -451,35 +526,34 @@ const char * llama_completion(int64_t context_id, const char * params_json) {
         bool hit_eos = false;
 
         try {
-            ctx->completion->rewind();
             ctx->completion->loadPrompt({});
             if (ctx->completion->context_full) {
                 return tls_cstr("{\"error\":\"prompt exceeds n_ctx — reload with larger n_ctx or shorten prompt\"}");
             }
 #ifdef __EMSCRIPTEN__
-            fprintf(stderr, "@@WASM_GEN@@ prompt_ok tokens=%zu n_predict=%d\n",
-                prompt_tokens.size(), n_predict);
+            const auto t0 = std::chrono::steady_clock::now();
+            fprintf(stderr, "@@WASM_GEN@@ prompt_ok tokens=%zu n_predict=%d n_past=%d\n",
+                prompt_tokens.size(), n_predict, ctx->completion->n_past);
 #endif
-            ctx->completion->beginCompletion();
+            tokens_generated = run_completion_loop(ctx, n_predict, hit_eos, generated_text);
 
-            const llama_vocab * vocab = llama_model_get_vocab(ctx->model);
-
-            while (tokens_generated < n_predict && !ctx->completion->is_interrupted) {
-                capllama::completion_token_output token_output = ctx->completion->nextToken();
-                if (token_output.tok < 0) {
-                    break;
-                }
-                if (llama_vocab_is_eog(vocab, token_output.tok)) {
-                    hit_eos = true;
-                    break;
-                }
-                std::string token_text = capllama::tokens_to_output_formatted_string(ctx->ctx, token_output.tok);
-                generated_text += token_text;
-                tokens_generated++;
-            }
-            ctx->completion->endCompletion();
 #ifdef __EMSCRIPTEN__
-            fprintf(stderr, "@@WASM_GEN@@ done predicted=%d\n", tokens_generated);
+            if (tokens_generated == 0 && !ctx->completion->context_full) {
+                fprintf(stderr, "@@WASM_GEN@@ retry empty (eos=%d tok_break=%d)\n",
+                    hit_eos ? 1 : 0, ctx->completion->stopped_word ? 1 : 0);
+                llama_memory_clear(llama_get_memory(ctx->ctx), true);
+                if (prepare_completion_run(ctx, params_json)) {
+                    ctx->completion->loadPrompt({});
+                    if (!ctx->completion->context_full) {
+                        hit_eos = false;
+                        tokens_generated = run_completion_loop(ctx, n_predict, hit_eos, generated_text);
+                    }
+                }
+            }
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            fprintf(stderr, "@@WASM_GEN@@ done predicted=%d ms=%lld\n",
+                tokens_generated, (long long) ms);
 #endif
         } catch (const std::exception & e) {
             try {
@@ -731,25 +805,8 @@ const char * llama_completion_stream(
         capllama::llama_cap_tokenize_result tokenize_result = ctx->tokenize(prompt_str, {});
         std::vector<llama_token> prompt_tokens = tokenize_result.tokens;
 
-        if (!ctx->completion) {
-            if (!ctx->ctx || !ctx->model) {
-                return tls_cstr("{\"error\":\"invalid context\"}");
-            }
-            try {
-                ctx->completion = new capllama::llama_cap_context_completion(ctx);
-                if (!ctx->completion->initSampling() || !ctx->completion->ctx_sampling) {
-                    delete ctx->completion;
-                    ctx->completion = nullptr;
-                    return tls_cstr("{\"error\":\"sampling init failed\"}");
-                }
-            } catch (const std::exception & e) {
-                if (ctx->completion) {
-                    delete ctx->completion;
-                    ctx->completion = nullptr;
-                }
-                json err = {{"error", std::string("completion init: ") + e.what()}};
-                return tls_cstr(err.dump());
-            }
+        if (!prepare_completion_run(ctx, params_json)) {
+            return tls_cstr("{\"error\":\"completion prepare failed\"}");
         }
 
         std::string generated_text;
@@ -758,15 +815,16 @@ const char * llama_completion_stream(
         const llama_vocab * vocab = llama_model_get_vocab(ctx->model);
 
         try {
-            ctx->completion->rewind();
             ctx->completion->loadPrompt({});
             if (ctx->completion->context_full) {
                 return tls_cstr("{\"error\":\"prompt exceeds n_ctx — reload with larger n_ctx or shorten prompt\"}");
             }
             ctx->completion->beginCompletion();
 
-            while (tokens_generated < n_predict && !ctx->completion->is_interrupted) {
-                capllama::completion_token_output token_output = ctx->completion->nextToken();
+            while (tokens_generated < n_predict &&
+                   ctx->completion->has_next_token &&
+                   !ctx->completion->is_interrupted) {
+                capllama::completion_token_output token_output = ctx->completion->doCompletion();
                 if (token_output.tok < 0) {
                     break;
                 }
@@ -774,7 +832,11 @@ const char * llama_completion_stream(
                     hit_eos = true;
                     break;
                 }
-                std::string token_text = capllama::tokens_to_output_formatted_string(ctx->ctx, token_output.tok);
+                if (ctx->completion->stopped_word || ctx->completion->stopped_limit) {
+                    break;
+                }
+                std::string token_text = capllama::tokens_to_output_formatted_string(
+                    ctx->ctx, token_output.tok);
                 generated_text += token_text;
 
                 if (token_callback) {
@@ -786,6 +848,7 @@ const char * llama_completion_stream(
                 }
                 tokens_generated++;
             }
+            generated_text = ctx->completion->generated_text;
             ctx->completion->endCompletion();
         } catch (const std::exception & e) {
             try {

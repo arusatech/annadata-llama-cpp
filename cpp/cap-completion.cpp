@@ -98,6 +98,7 @@ void llama_cap_context_completion::rewind() {
     incomplete = false;
     n_remain = 0;
     n_past = 0;
+    embd.clear();
     parent_ctx->params.sampling.n_prev = parent_ctx->n_ctx;
     if (parent_ctx->isVocoderEnabled()) {
         parent_ctx->tts_wrapper->audio_tokens.clear();
@@ -408,6 +409,13 @@ completion_token_output llama_cap_context_completion::doCompletion()
     if (parent_ctx->params.sampling.n_probs > 0)
     {
         generated_token_probs.push_back(token_with_probs);
+    }
+
+    if (!parent_ctx->params.antiprompt.empty() && token_with_probs.tok >= 0) {
+        const size_t stop_pos = findStoppingStrings(generated_text, token_text.size(), STOP_FULL);
+        if (stop_pos != std::string::npos) {
+            generated_text = generated_text.substr(0, stop_pos);
+        }
     }
 
     // check if there is incomplete UTF-8 character at the end
