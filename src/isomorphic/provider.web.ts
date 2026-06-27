@@ -428,6 +428,8 @@ export class WebProvider implements LlmProvider {
         message: error instanceof Error ? error.message : String(error),
       }),
     );
+    const workerRecord = workerHealth as Record<string, unknown>;
+    const workerDetails = workerRecord.details as Record<string, unknown> | undefined;
     return {
       ok: !!workerHealth?.ok,
       details: {
@@ -436,8 +438,8 @@ export class WebProvider implements LlmProvider {
         opfsQuotaBytes: usage.quotaBytes,
         worker: workerHealth,
         crossOriginIsolated: checkCrossOriginIsolation(),
-        wasmJspi: (workerHealth?.details as Record<string, unknown> | undefined)?.wasmJspi,
-        wasmPthread: (workerHealth?.details as Record<string, unknown> | undefined)?.wasmPthread,
+        wasmJspi: workerDetails?.wasmJspi,
+        wasmPthread: workerDetails?.wasmPthread,
       },
     };
   }

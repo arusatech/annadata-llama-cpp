@@ -72,10 +72,16 @@ if (emscriptenWasmBytes < MIN_EMBEDDED_BYTES) {
 
 // ── 1c. Verify WASM memory section: initial pages must cover 832 MB ──────────
 // INITIAL_MEMORY=872415232 / 65536 bytes/page = 13312 pages.
-// A binary compiled without the flag defaults to 256 pages (16 MB) and will
-// abort with "unreachable" when loading a 700+ MB GGUF model.
+// Pthread builds use IMPORTED_MEMORY=1 — memory is supplied by the JS shim via
+// SharedArrayBuffer, so there is no Memory section in the wasm binary.
 {
   const MIN_WASM_PAGES = 13312; // 872_415_232 / 65_536
+  if (BUILD_PTHREAD) {
+    console.log(
+      '[package-embed-wasm] WASM memory: pthread build uses IMPORTED_MEMORY ' +
+      `(832 MB SharedArrayBuffer from shim, min ${MIN_WASM_PAGES} pages) ✓`,
+    );
+  } else {
   const wasmBytes = new Uint8Array(emscriptenWasmBuf.buffer);
   // Scan for the Memory section (id = 5) in the WASM binary.
   // Layout: magic(4) + version(4) + sections...
@@ -113,6 +119,7 @@ if (emscriptenWasmBytes < MIN_EMBEDDED_BYTES) {
     );
   }
   console.log(`[package-embed-wasm] WASM memory: ${foundPages} initial pages (${(foundPages * 65536 / 1024 / 1024).toFixed(0)} MB) ✓`);
+  }
 }
 
 // ── 1b. Patch emcc ESM runtime: optional-chain __wbindgen_start ──────────────
@@ -207,7 +214,11 @@ export default async function initWasm(_pathHint) {
     : 4;
 
   const modulePromise = createLlamaModule({
-    ...(sharedMem ? { wasmMemory: sharedMem, pthreadPoolSize } : {}),
+    ...(sharedMem ? {
+      wasmMemory: sharedMem,
+      pthreadPoolSize,
+      mainScriptUrlOrBlob: new URL('./${engineName}_emscripten.mjs', import.meta.url),
+    } : {}),
     // Resolve assets relative to this JS file so the module works regardless
     // of where the dist/wasm/ directory is served from.
     // Emscripten requests 'llama_engine_emscripten.wasm' but we ship the

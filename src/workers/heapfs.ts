@@ -93,14 +93,15 @@ export const patchHeapFS = (mod: EmscriptenModule): void => {
   };
   mod.MEMFS.ops_table.file.stream.llseek = ops.llseek;
 
-  ops.mmap = function (this: unknown, stream: { node: { name: string } }, length: number, position: number, prot: unknown, flags: unknown) {
+  ops.mmap = function (this: unknown, stream: unknown, ...rest: unknown[]) {
     patchStream(mod, stream as Parameters<typeof patchStream>[1]);
-    const name = stream.node.name;
+    const name = (stream as { node: { name: string } }).node.name;
     const f = fsNameToFile[name];
     if (f) {
+      const position = rest[1] as number;
       return { ptr: f.ptr + position, allocated: false };
     }
-    return (ops._mmap as (...a: unknown[]) => unknown).call(this, stream, length, position, prot, flags);
+    return (ops._mmap as (...a: unknown[]) => unknown).call(this, stream, ...rest);
   };
   mod.MEMFS.ops_table.file.stream.mmap = ops.mmap;
 

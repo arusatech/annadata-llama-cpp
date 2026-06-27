@@ -79,10 +79,40 @@ echo "  - LLAMA_WASM_SYSROOT=$LLAMA_WASM_SYSROOT"
 echo "  - LLAMA_WASM_JSPI=$LLAMA_WASM_JSPI"
 echo "  - LLAMA_WASM_PTHREAD=$LLAMA_WASM_PTHREAD"
 
+# Pthreads require atomics-enabled std (prebuilt rustup std lacks bulk-memory/atomics).
+# Rebuild std via nightly build-std; compile Rust/C++ with atomics but do NOT pass
+# -pthread at the Stage 1 SIDE_MODULE link (Stage 4 MAIN_MODULE relink adds pthread).
+CARGO_CMD=(cargo)
+BUILD_STD_ARGS=()
+if [[ "$LLAMA_WASM_PTHREAD" == "1" ]]; then
+  if ! rustup toolchain list | grep -q '^nightly'; then
+    echo "Stage 0: installing nightly toolchain (required for pthread build-std) ..."
+    rustup toolchain install nightly
+  fi
+  if ! rustup component list --toolchain nightly 2>/dev/null | grep -q 'rust-src (installed)'; then
+    echo "Stage 0: installing rust-src for nightly (required for build-std) ..."
+    rustup component add rust-src --toolchain nightly
+  fi
+  CARGO_CMD=(cargo +nightly)
+  BUILD_STD_ARGS=(-Z build-std=panic_abort,std)
+  export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+atomics,+bulk-memory,+mutable-globals"
+  echo "  - cargo=${CARGO_CMD[*]}"
+  echo "  - build-std=panic_abort,std (atomics-enabled std for pthread)"
+  echo "  - RUSTFLAGS (pthread compile)=${RUSTFLAGS}"
+fi
+
 if ! command -v wasm-bindgen >/dev/null 2>&1; then
   echo "Error: wasm-bindgen CLI not found. Install with: cargo install wasm-bindgen-cli"
   exit 1
 fi
+
+run_cargo_wasm_build() {
+  if ((${#BUILD_STD_ARGS[@]} > 0)); then
+    CARGO_TARGET_DIR="$TARGET_DIR" "${CARGO_CMD[@]}" build --release --target wasm32-unknown-emscripten "${BUILD_STD_ARGS[@]}"
+  else
+    CARGO_TARGET_DIR="$TARGET_DIR" "${CARGO_CMD[@]}" build --release --target wasm32-unknown-emscripten
+  fi
+}
 
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
@@ -93,8 +123,12 @@ mkdir -p "$OUT_DIR"
 export EMCC_ARGS_FILE="$OUT_DIR/emcc-link-args.sh"
 rustup target add wasm32-unknown-emscripten >/dev/null 2>&1 || true
 cd "$RUST_DIR"
+if [[ "$LLAMA_WASM_PTHREAD" == "1" ]]; then
+  echo "Stage 0: cleaning stale wasm32-emscripten artifacts (pthread requires atomics rebuild) ..."
+  CARGO_TARGET_DIR="$TARGET_DIR" "${CARGO_CMD[@]}" clean --target wasm32-unknown-emscripten -p llama_engine
+fi
 echo "Stage 1: cargo build (wasm32-unknown-emscripten, SIDE_MODULE) ..."
-CARGO_TARGET_DIR="$TARGET_DIR" cargo build --release --target wasm32-unknown-emscripten
+run_cargo_wasm_build
 
 # When all artifacts are already up-to-date, cargo skips the final link step and
 # never calls the linker wrapper.  Detect this by checking whether the capture file
@@ -103,7 +137,7 @@ CARGO_TARGET_DIR="$TARGET_DIR" cargo build --release --target wasm32-unknown-ems
 if [[ ! -f "$EMCC_ARGS_FILE" ]]; then
   echo "Stage 1b: build was up-to-date (no re-link); forcing linker invocation..."
   touch "$RUST_DIR/src/lib.rs"
-  CARGO_TARGET_DIR="$TARGET_DIR" cargo build --release --target wasm32-unknown-emscripten
+  run_cargo_wasm_build
 fi
 
 CARGO_WASM_PATH="$TARGET_DIR/wasm32-unknown-emscripten/release/${ENGINE_NAME}.wasm"

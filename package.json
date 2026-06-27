@@ -87,7 +87,7 @@
     "build": "npm run clean && npm run docgen && tsc && rollup -c rollup.config.mjs",
     "build:wasm": "./scripts/build-wasm.sh",
     "build:wasm:jspi": "LLAMA_WASM_JSPI=1 ./scripts/build-wasm.sh",
-    "build:wasm:pthreads": "LLAMA_WASM_PTHREAD=1 ./scripts/build-wasm.sh",
+    "build:wasm:pthreads": "LLAMA_WASM_JSPI=1 LLAMA_WASM_PTHREAD=1 ./scripts/build-wasm.sh",
     "build:wasm:full": "LLAMA_WASM_JSPI=1 LLAMA_WASM_PTHREAD=1 ./scripts/build-wasm.sh",
     "build:worker": "node ./scripts/build-worker.mjs",
     "build:wasm:assets": "node ./scripts/copy-wasm-assets.mjs",

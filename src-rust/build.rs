@@ -12,6 +12,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-check-cfg=cfg(llama_embed_cpp)");
     println!("cargo:rustc-check-cfg=cfg(capllama_wasm_jspi)");
+    println!("cargo:rustc-check-cfg=cfg(capllama_wasm_pthread)");
     println!("cargo:rerun-if-env-changed=LLAMA_WASM_EMBED_CPP");
     println!("cargo:rerun-if-env-changed=LLAMA_WASM_SYSROOT");
     println!("cargo:rerun-if-env-changed=LLAMA_WASM_JSPI");
@@ -183,10 +184,12 @@ fn main() {
         println!("cargo:rustc-cfg=capllama_wasm_jspi");
         println!("cargo:warning=Building embedded llama.cpp with WASM JSPI token streaming");
     }
+
     if pthread {
         c_build.flag("-pthread");
         cxx_build.flag("-pthread");
-        println!("cargo:warning=Building embedded llama.cpp with pthread support");
+        println!("cargo:rustc-cfg=capllama_wasm_pthread");
+        println!("cargo:warning=Building embedded llama.cpp with pthread support (compile only; link at Stage 4)");
     }
 
     if let Ok(sysroot) = env::var("LLAMA_WASM_SYSROOT") {
