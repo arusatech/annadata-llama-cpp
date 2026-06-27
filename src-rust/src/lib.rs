@@ -300,6 +300,19 @@ pub fn generate(model_id: String, req_json: String) -> Result<String, JsValue> {
         let completion_json: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| JsValue::from_str(&format!("Invalid completion response JSON: {}", e)))?;
 
+        if completion_json.is_number() {
+            return Err(JsValue::from_str(&format!(
+                "Invalid completion: bare number in C++ response ({}) — reload model after wasm update",
+                raw.chars().take(64).collect::<String>()
+            )));
+        }
+        if !completion_json.is_object() {
+            return Err(JsValue::from_str(&format!(
+                "Invalid completion JSON type (expected object): {}",
+                raw.chars().take(120).collect::<String>()
+            )));
+        }
+
         if let Some(error) = completion_json.get("error").and_then(|v| v.as_str()) {
             return Err(JsValue::from_str(error));
         }

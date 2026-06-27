@@ -189,6 +189,30 @@ let _lastWasmStderr = '';
 const LLAMA_WASM_JSPI = ${BUILD_JSPI};
 const LLAMA_WASM_PTHREAD = ${BUILD_PTHREAD};
 
+// JSPI polyfill for token streaming only (generate_stream). Model load uses sync EM_JS fread.
+if (LLAMA_WASM_JSPI && typeof WebAssembly !== 'undefined' && !WebAssembly.Suspending) {
+  WebAssembly.Suspending = function (fn) { return fn; };
+  WebAssembly.promising = function (fn) {
+    return function (...args) {
+      try { return Promise.resolve(fn(...args)); }
+      catch (e) { return Promise.reject(e); }
+    };
+  };
+}
+
+/** External file read (OPFS/JS handler → sync fread hook). Does not require native JSPI. */
+export function can_use_async_file() {
+  return LLAMA_WASM_JSPI;
+}
+
+/** Most recent llama stderr (error messages must use tail — head is stale load_tensors lines). */
+function tailWasmStderr(maxLen = 1200) {
+  if (!_lastWasmStderr) return '';
+  return _lastWasmStderr.length > maxLen
+    ? _lastWasmStderr.slice(-maxLen)
+    : _lastWasmStderr;
+}
+
 /** Shared WASM memory for pthread builds (wllama getWasmMemory). Requires COOP/COEP. */
 function trySharedWasmMemory() {
   if (!LLAMA_WASM_PTHREAD) return null;
@@ -251,11 +275,25 @@ export default async function initWasm(_pathHint) {
     : 4;
 
   const modulePromise = createLlamaModule({
+    preRun: [() => {
+      if (can_use_async_file()) {
+        if (typeof Module !== 'undefined') {
+          Module.ENV = Module.ENV || {};
+          Module.ENV['USE_ASYNC_FILE'] = '1';
+        }
+      }
+    }],
     printErr: (text) => {
       const line = String(text);
       _lastWasmStderr = (_lastWasmStderr ? _lastWasmStderr + '\\n' : '') + line;
       if (_lastWasmStderr.length > 4096) _lastWasmStderr = _lastWasmStderr.slice(-4096);
-      if (typeof console !== 'undefined') console.error('[llama.cpp]', line);
+      if (typeof console !== 'undefined') {
+        if (line.includes('@@WASM_LOAD@@') || line.includes('@@WASM_GEN@@')) {
+          console.error('[llama-wasm-load]', line);
+        } else {
+          console.error('[llama.cpp]', line);
+        }
+      }
     },
     onAbort: (reason) => {
       _lastWasmStderr = 'Aborted: ' + String(reason);
@@ -385,9 +423,11 @@ export default async function initWasm(_pathHint) {
   });
 
   _mod = await Promise.race([modulePromise, wasmInstantiateFailed]);
+  installAsyncFileBridge(_mod);
   ensureMemfsTmp();
   patchHeapFS();
   _mod.__llamaWasmJspi = LLAMA_WASM_JSPI;
+  _mod.__llamaWasmAsyncFile = can_use_async_file();
   _mod.__llamaWasmPthread = LLAMA_WASM_PTHREAD && !!sharedMem;
   return _mod;
 }
@@ -420,18 +460,165 @@ export function load_model(model_id, bytes, opts_json) {
 /** Unload a loaded model and release resources. */
 export function unload_model(model_id) {
   if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  _modelContextIds.delete(String(model_id));
   _mod.unload_model(model_id);
   const kept = _loadedHeapfsModels.get(model_id);
   if (kept) {
     heapfsReleaseEntry(kept.path, { mode: 'heapfs', basename: kept.basename, heapId: kept.heapId });
     _loadedHeapfsModels.delete(model_id);
   }
+  const asyncPath = _loadedAsyncModels.get(model_id);
+  if (asyncPath) {
+    asyncFileRelease(asyncPath);
+    _loadedAsyncModels.delete(model_id);
+  }
+}
+
+/** model_id → C++ context id (cwrap path — same pattern as llama_load_context_from_path). */
+const _modelContextIds = new Map();
+let _cwrapCompletion = null;
+
+/** Emscripten 3.x / WASM i64 — cwrap and wasm-bindgen expect bigint for int64_t. */
+function wasmI64Arg(value) {
+  const n = typeof value === 'bigint' ? value : BigInt(Math.trunc(Number(value)));
+  return n;
+}
+
+function wasmI64ToNumber(value) {
+  if (typeof value === 'bigint') return Number(value);
+  return Number(value);
+}
+
+function registerModelContext(model_id, context_id) {
+  const id = wasmI64ToNumber(context_id);
+  if (model_id && id > 0) {
+    _modelContextIds.set(String(model_id), id);
+  }
+  const reg = _mod?.register_model_context;
+  if (typeof reg === 'function') {
+    try {
+      try {
+        reg(model_id, wasmI64Arg(id));
+      } catch (_) {
+        reg(model_id, id);
+      }
+    } catch (err) {
+      if (typeof console !== 'undefined') {
+        console.error('[llama-wasm] register_model_context failed (JS context map still set):', err);
+      }
+    }
+  }
+}
+
+function buildCompletionParamsJson(req_json) {
+  let req = {};
+  try {
+    req = JSON.parse(req_json || '{}');
+  } catch (e) {
+    throw new Error('Invalid generate request JSON: ' + (e && e.message ? e.message : String(e)));
+  }
+  const prompt = req.prompt != null
+    ? String(req.prompt)
+    : Array.isArray(req.messages)
+      ? req.messages.map((m) => m.role + ': ' + m.content).join('\\n')
+      : '';
+  if (!prompt.trim()) {
+    throw new Error('No prompt or messages provided');
+  }
+  return JSON.stringify({
+    prompt,
+    n_predict: req.max_tokens ?? req.n_predict ?? 128,
+    temperature: req.temperature ?? 0.7,
+    top_p: req.top_p ?? 0.95,
+    top_k: req.top_k ?? 40,
+    stop: req.stop ?? [],
+  });
+}
+
+function resolveCompletionFn() {
+  if (_cwrapCompletion) return _cwrapCompletion;
+  const name = 'llama_completion';
+  const wrapCall = (raw, useBigintArg) => (ctxId, paramsJson) =>
+    raw(useBigintArg ? wasmI64Arg(ctxId) : Number(ctxId), paramsJson);
+  if (typeof _mod.cwrap === 'function') {
+    for (const argType of ['bigint', 'number']) {
+      try {
+        const raw = _mod.cwrap(name, 'string', [argType, 'string']);
+        if (typeof raw === 'function') {
+          _cwrapCompletion = wrapCall(raw, argType === 'bigint');
+          return _cwrapCompletion;
+        }
+      } catch (_) {}
+    }
+  }
+  const rawFn = _mod['_' + name] ?? _mod.wasmExports?.[name];
+  if (typeof rawFn === 'function') {
+    _cwrapCompletion = (ctxId, paramsJson) => {
+      try {
+        return rawFn(wasmI64Arg(ctxId), paramsJson);
+      } catch (e1) {
+        return rawFn(Number(ctxId), paramsJson);
+      }
+    };
+    return _cwrapCompletion;
+  }
+  throw new Error('llama_completion not exported — rebuild wasm (EXPORTED_FUNCTIONS)');
+}
+
+/** Inference via C cwrap (avoids wasm-bindgen trap/undefined throw on llama_decode). */
+function wasmGenerateViaCwrap(model_id, req_json) {
+  const ctxId = _modelContextIds.get(String(model_id));
+  if (!ctxId || ctxId <= 0) {
+    throw new Error('Model not loaded (no WASM context id for ' + model_id + ')');
+  }
+  if (typeof console !== 'undefined') {
+    console.error(
+      '[llama-wasm] cwrap generate: model=' + model_id + ' ctxId=' + ctxId +
+      ' wasmMB=' + wasmLinearMb(),
+    );
+  }
+  const compJson = buildCompletionParamsJson(req_json);
+  const raw = resolveCompletionFn()(ctxId, compJson);
+  if (typeof raw !== 'string') {
+    throw new TypeError('llama_completion returned ' + typeof raw + ' (' + String(raw) + ')');
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (_) {
+    throw new Error('llama_completion returned non-JSON: ' + raw.slice(0, 160));
+  }
+  if (parsed && typeof parsed.error === 'string' && parsed.error.length > 0) {
+    throw new Error(parsed.error);
+  }
+  if (typeof console !== 'undefined') {
+    console.error('[llama-wasm] cwrap generate ok chars=' + (parsed.text?.length ?? 0));
+  }
+  return raw;
 }
 
 /** Run text generation. Returns JSON GenerateResponse. */
 export function generate(model_id, req_json) {
   if (!_mod) throw new Error('llama_engine not ready — await init() first');
-  return _mod.generate(model_id, req_json);
+  try {
+    return wasmGenerateViaCwrap(model_id, req_json);
+  } catch (err) {
+    throw wasmThrowToError(err, 'generate failed');
+  }
+}
+
+/** Streaming generation — calls on_token(token, index) per token (JSPI when available). */
+export function generate_stream(model_id, req_json, on_token) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  const fn = _mod.generate_stream;
+  if (typeof fn !== 'function') {
+    throw new Error('generate_stream not exported — rebuild with LLAMA_WASM_JSPI=1');
+  }
+  try {
+    return fn(model_id, req_json, on_token);
+  } catch (err) {
+    throw wasmThrowToError(err, 'generate_stream failed');
+  }
 }
 
 /** Generate embeddings. Returns JSON EmbedResponse. */
@@ -450,6 +637,116 @@ export function health() {
 export function memory_snapshot() {
   if (!_mod) throw new Error('llama_engine not ready — await init() first');
   return _mod.memory_snapshot();
+}
+
+// ── JSPI async file read (wllama USE_ASYNC_FILE / cap-wasm-fs.cpp) ───────────
+// Model bytes stay in JS (Blob / OPFS reader). C++ fread → _cap_js_file_read.
+const _asyncFileHandlers = new Map();
+const _loadedAsyncModels = new Map();
+
+function stripModelsPrefix(path) {
+  return String(path).replace(/^\\/?models\\//, '');
+}
+
+function enableAsyncFileEnv() {
+  if (!_mod) return;
+  _mod.ENV = _mod.ENV || {};
+  _mod.ENV['USE_ASYNC_FILE'] = '1';
+  try {
+    if (typeof _mod._cap_wasm_set_use_async_file === 'function') {
+      _mod._cap_wasm_set_use_async_file(1);
+    } else if (typeof _mod.cwrap === 'function') {
+      const setFn = _mod.cwrap('cap_wasm_set_use_async_file', null, ['number']);
+      if (typeof setFn === 'function') setFn(1);
+    }
+  } catch (_) {}
+}
+
+function installAsyncFileBridge(mod) {
+  const bridge = (path, offset, req_size, out_ptr) => {
+    const name = stripModelsPrefix(path);
+    const handler = _asyncFileHandlers.get(name);
+    if (!handler) {
+      throw new Error('async file handler missing for ' + name);
+    }
+    const off = Number(offset);
+    const req = Number(req_size);
+    const raw = handler.readSync(off, req);
+    if (raw != null && typeof raw.then === 'function') {
+      throw new Error(
+        'async file readFn returned a Promise — use synchronous OPFS SyncAccessHandle reads',
+      );
+    }
+    const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+    getHeapU8().set(bytes.subarray(0, Math.min(bytes.byteLength, req)), Number(out_ptr));
+    return bytes.byteLength;
+  };
+  globalThis._cap_js_file_read = bridge;
+  if (mod) mod._cap_js_file_read = bridge;
+}
+
+function asyncFilePlaceholder(vfs_path, sizeBytes) {
+  patchHeapFS();
+  enableAsyncFileEnv();
+  const basename = stripModelsPrefix(vfs_path);
+  if (!_mod.FS.analyzePath(vfs_path).exists) {
+    _mod.FS.createDataFile('/models', basename, new ArrayBuffer(0), true, true, true);
+  }
+  try {
+    const node = _mod.FS.lookupPath(vfs_path).node;
+    node.usedBytes = sizeBytes;
+  } catch (_) {}
+}
+
+function asyncFileRegister(vfs_path, sizeBytes, readFn) {
+  const basename = stripModelsPrefix(vfs_path);
+  asyncFilePlaceholder(vfs_path, sizeBytes);
+  _asyncFileHandlers.set(basename, {
+    size: sizeBytes,
+    readSync: (offset, len) => readFn(Number(offset), Number(len)),
+  });
+}
+
+function asyncFileRelease(vfs_path) {
+  const basename = stripModelsPrefix(vfs_path);
+  _asyncFileHandlers.delete(basename);
+  try { _mod.FS.unlink(vfs_path); } catch (_) {}
+}
+
+/**
+ * Bind a JS-side reader for an async VFS path (no WASM heap copy of the full GGUF).
+ * readFn(offset, length) must return Uint8Array (may be shorter at EOF).
+ */
+export function async_model_bind(vfs_path, size_bytes, readFn) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  if (!can_use_async_file()) {
+    throw new Error('async_model_bind requires JSPI build + crossOriginIsolated (COOP/COEP)');
+  }
+  if (typeof size_bytes === 'number' && size_bytes > 0) {
+    ensureWasmMemoryHeadroom(size_bytes);
+  }
+  asyncFileRegister(vfs_path, size_bytes, readFn);
+  try {
+    const probe = readFn(0, 4);
+    if (probe != null && typeof probe.then === 'function') {
+      throw new Error('async_model_bind readFn must be synchronous (use OPFS SyncAccessHandle)');
+    }
+    const b = probe instanceof Uint8Array ? probe : new Uint8Array(probe);
+    const magic = b.byteLength >= 4
+      ? String.fromCharCode(b[0], b[1], b[2], b[3])
+      : '';
+    if (magic !== 'GGUF' && typeof console !== 'undefined') {
+      console.error(
+        '[llama-wasm] async_model_bind: GGUF magic mismatch at offset 0 for ' +
+        vfs_path + ': ' + JSON.stringify(magic) + ' (check OPFS reader)',
+      );
+    }
+  } catch (err) {
+    if (typeof console !== 'undefined') {
+      console.error('[llama-wasm] async_model_bind: probe read failed for ' + vfs_path, err);
+    }
+    throw err;
+  }
 }
 
 // ── VFS streaming API (wllama HeapFS pattern) ─────────────────────────────────
@@ -582,7 +879,8 @@ function effectiveNctx(modelBytes, opts_json) {
     n_ctx = Math.min(n_ctx, 512);
   }
   if (modelBytes > 600 * 1024 * 1024) {
-    n_ctx = Math.min(n_ctx, 128);
+    // Recurrent/hybrid models (e.g. LFM2) use tiny KV — keep n_ctx high enough for chat templates.
+    n_ctx = Math.min(n_ctx, 512);
   } else if (modelBytes > 500 * 1024 * 1024) {
     n_ctx = Math.min(n_ctx, 256);
   }
@@ -662,6 +960,7 @@ function resolveLoadContextFromPathFn() {
   const name = 'llama_load_context_from_path';
   const tryFns = [];
   if (typeof _mod.cwrap === 'function') {
+    tryFns.push(() => _mod.cwrap(name, 'bigint', ['string', 'string']));
     tryFns.push(() => _mod.cwrap(name, 'number', ['string', 'string']));
   }
   if (_mod.wasmExports?.[name]) {
@@ -674,7 +973,7 @@ function resolveLoadContextFromPathFn() {
     try {
       const raw = get();
       if (typeof raw === 'function') {
-        _cwrapLoadContextFromPath = (path, opts) => raw(path, opts);
+        _cwrapLoadContextFromPath = (path, opts) => wasmI64ToNumber(raw(path, opts));
         return _cwrapLoadContextFromPath;
       }
     } catch (_) {}
@@ -684,55 +983,57 @@ function resolveLoadContextFromPathFn() {
 
 /** Load via C bridge (avoids bindgen throw on trap) + register context in Rust. */
 function wasmLoadContextFromPath(model_id, vfs_path, opts_json) {
+  enableAsyncFileEnv();
   const loadFn = resolveLoadContextFromPathFn();
   if (typeof console !== 'undefined') {
     console.error('[llama-wasm] cwrap load: path=' + vfs_path + ' wasmMB=' + wasmLinearMb());
   }
   const ctxId = loadFn(vfs_path, opts_json);
   if (typeof console !== 'undefined') {
-    console.error('[llama-wasm] cwrap load result: ctxId=' + ctxId);
+    console.error('[llama-wasm] cwrap load result: ctxId=' + ctxId + ' wasmMB=' + wasmLinearMb());
   }
   if (ctxId <= 0) {
     throw new Error(
       'llama_load_context_from_path returned ' + ctxId + ' for ' + vfs_path +
-      (_lastWasmStderr ? ' | llama: ' + _lastWasmStderr.slice(-500) : ''),
+      ' wasmMB=' + wasmLinearMb() +
+      (tailWasmStderr() ? ' | llama: ' + tailWasmStderr() : ''),
     );
   }
-  const reg = _mod.register_model_context;
-  if (typeof reg === 'function') {
-    reg(model_id, ctxId);
-    return;
-  }
-  wasmBindgenLoadModelFromPath(model_id, vfs_path, opts_json);
+  registerModelContext(model_id, ctxId);
+  return;
 }
 
 function wasmThrowToError(err, context) {
   const WasmException = typeof WebAssembly !== 'undefined' && WebAssembly.Exception;
+  const stderrTail = tailWasmStderr();
+  const memNote = ' wasmMB=' + wasmLinearMb();
   if (WasmException && err instanceof WasmException) {
     let msg = 'WebAssembly.Exception (likely OOM during model/context init — try closing other tabs)';
     try {
       if (err.message) msg = String(err.message);
     } catch (_) {}
-    if (_lastWasmStderr) msg += ' | llama: ' + _lastWasmStderr.slice(0, 500);
-    return new Error(context + ': ' + msg);
+    if (stderrTail) msg += ' | llama: ' + stderrTail;
+    return new Error(context + ': ' + msg + memNote);
   }
   if (err instanceof WebAssembly.RuntimeError) {
     const msg = err.message || 'WebAssembly runtime error (likely OOM during model load)';
     let suffix = msg;
-    if (_lastWasmStderr) suffix += ' | llama: ' + _lastWasmStderr.slice(0, 500);
-    return new Error(context + ': ' + suffix);
+    if (stderrTail) suffix += ' | llama: ' + stderrTail;
+    return new Error(context + ': ' + suffix + memNote);
   }
   if (err instanceof Error && err.message && err.message !== 'undefined') {
-    if (_lastWasmStderr) err.message += ' | llama: ' + _lastWasmStderr.slice(0, 500);
+    if (stderrTail) err.message += ' | llama: ' + stderrTail;
+    err.message += memNote;
     return err;
   }
   const detail =
     typeof err === 'string' ? err :
     err instanceof Error ? err.message :
     err == null ? '' : String(err);
-  let suffix = detail && detail !== 'undefined' ? detail : 'no error detail from WASM bindgen';
-  if (_lastWasmStderr) suffix += ' | llama: ' + _lastWasmStderr.slice(0, 500);
-  return new Error(context + ': ' + suffix);
+  let suffix = detail && detail !== 'undefined' ? detail :
+    'WASM trap during inference (OOM/stack in llama_decode — close other tabs and reload model)';
+  if (stderrTail) suffix += ' | llama: ' + stderrTail;
+  return new Error(context + ': ' + suffix + memNote);
 }
 
 function vfsStatBytes(path) {
@@ -809,7 +1110,30 @@ function heapfsStreamBegin(totalBytes, opts_json) {
   return path;
 }
 
+/** Begin streaming a model into WASM VFS. Pass total_bytes + opts_json for HeapFS pre-grow. */
+function asyncFileStreamBegin(totalBytes) {
+  patchHeapFS();
+  enableAsyncFileEnv();
+  if (typeof totalBytes === 'number' && totalBytes > 0) {
+    ensureWasmMemoryHeadroom(totalBytes);
+  }
+  const basename = 'wasm_async_' + (_jsVfsCounter++) + '.gguf';
+  const path = '/models/' + basename;
+  asyncFilePlaceholder(path, totalBytes);
+  _jsVfsStreams.set(path, { mode: 'async', basename, size: totalBytes, bound: false });
+  if (typeof console !== 'undefined') {
+    console.error(
+      '[llama-wasm] JSPI async begin: modelMB=' + (totalBytes / 1048576).toFixed(1) +
+      ' wasmMB=' + wasmLinearMb() + ' (no full-model heap copy)',
+    );
+  }
+  return path;
+}
+
 function jsModelVfsBegin(totalBytes, opts_json) {
+  if (can_use_async_file() && typeof totalBytes === 'number' && totalBytes > 0) {
+    return asyncFileStreamBegin(totalBytes);
+  }
   if (typeof totalBytes === 'number' && totalBytes > 0 && supportsHeapFS()) {
     return heapfsStreamBegin(totalBytes, opts_json);
   }
@@ -827,6 +1151,11 @@ function jsModelVfsWrite(path, chunk) {
   }
   if (!chunk || chunk.byteLength === 0) return;
   const buf = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+  if (entry.mode === 'async') {
+    throw new Error(
+      'model_vfs_write on async path: use async_model_bind() instead of streaming into WASM heap',
+    );
+  }
   try {
     if (entry.mode === 'heapfs') {
       heapfsWrite(entry.heapId, buf, entry.offset);
@@ -854,24 +1183,42 @@ function jsModelVfsAbort(path) {
   if (entry?.mode === 'heapfs' && entry.basename) {
     delete _heapfsNameToFile[entry.basename];
     if (entry.heapId != null) delete _heapfsIdToFile[entry.heapId];
+  } else if (entry?.mode === 'async') {
+    asyncFileRelease(path);
   }
   try {
     _mod.FS.unlink(path);
   } catch (_) {}
 }
 
-function vfsLoadOptsJson(opts_json, heapfs, modelBytes) {
+function vfsLoadOptsJson(opts_json, mode, modelBytes) {
   let opts = {};
   try {
     opts = JSON.parse(opts_json || '{}');
   } catch (_) {}
-  if (heapfs) {
+  opts.n_threads = 1;
+  if (mode === 'heapfs') {
     opts.use_mmap = true;
     opts.n_ctx = effectiveNctx(modelBytes, opts_json);
     if (opts.n_batch == null || opts.n_batch > 128) {
       opts.n_batch = 128;
     }
     if (modelBytes > 600 * 1024 * 1024 && (opts.n_batch == null || opts.n_batch > 64)) {
+      opts.n_batch = 64;
+    }
+  } else if (mode === 'async') {
+    opts.use_mmap = false;
+    opts.n_ctx = effectiveNctx(modelBytes, opts_json);
+    if (modelBytes > 600 * 1024 * 1024) {
+      // 65536 vocab × n_batch logits buffer — keep small at 2GB heap after full weight copy.
+      if (opts.n_batch == null || opts.n_batch > 8) {
+        opts.n_batch = 8;
+      }
+    } else if (opts.n_batch == null || opts.n_batch > 128) {
+      opts.n_batch = 128;
+    }
+    if (modelBytes > 500 * 1024 * 1024 && modelBytes <= 600 * 1024 * 1024 &&
+        (opts.n_batch == null || opts.n_batch > 64)) {
       opts.n_batch = 64;
     }
   } else if (opts.use_mmap == null) {
@@ -902,33 +1249,53 @@ export function model_vfs_abort(vfs_path) {
 export function load_model_from_vfs(model_id, vfs_path, opts_json) {
   if (!_mod) throw new Error('llama_engine not ready — await init() first');
   const entry = _jsVfsStreams.get(vfs_path);
-  const heapfs = entry?.mode === 'heapfs';
+  const mode = entry?.mode ?? 'memfs';
   jsModelVfsClose(vfs_path);
-  const bytes = heapfs ? (entry?.size ?? 0) : vfsStatBytes(vfs_path);
+  const bytes = mode === 'heapfs' || mode === 'async'
+    ? (entry?.size ?? 0)
+    : vfsStatBytes(vfs_path);
   if (bytes <= 0) {
     throw new Error('VFS model file missing or empty after stream: ' + vfs_path + ' (bytes=' + bytes + ')');
   }
-  const loadOpts = vfsLoadOptsJson(opts_json, heapfs, bytes);
+  if (mode === 'async') {
+    const basename = entry?.basename ?? stripModelsPrefix(vfs_path);
+    if (!_asyncFileHandlers.has(basename)) {
+      throw new Error(
+        'async VFS path not bound — call async_model_bind() before load_model_from_vfs: ' + vfs_path,
+      );
+    }
+  }
+  const loadOpts = vfsLoadOptsJson(opts_json, mode, bytes);
   if (typeof console !== 'undefined') {
-    console.error('[llama-wasm] load_model_from_vfs: wasmMB=' + wasmLinearMb() + ' opts=' + loadOpts);
+    console.error(
+      '[llama-wasm] load_model_from_vfs: mode=' + mode +
+      ' wasmMB=' + wasmLinearMb() + ' opts=' + loadOpts,
+    );
   }
   _jsVfsStreams.delete(vfs_path);
   try {
-    if (heapfs) {
+    if (mode === 'heapfs') {
       ensureWasmMemoryHeadroom(bytes);
       heapfsFinalizeForLoad(vfs_path, entry.basename, bytes);
+    } else if (mode === 'async') {
+      enableAsyncFileEnv();
+      ensureWasmMemoryHeadroom(bytes);
     }
     wasmLoadContextFromPath(model_id, vfs_path, loadOpts);
-    if (heapfs && entry?.basename) {
+    if (mode === 'heapfs' && entry?.basename) {
       _loadedHeapfsModels.set(model_id, {
         path: vfs_path,
         basename: entry.basename,
         heapId: entry.heapId,
       });
+    } else if (mode === 'async') {
+      _loadedAsyncModels.set(model_id, vfs_path);
     }
   } catch (err) {
-    if (heapfs) {
+    if (mode === 'heapfs') {
       heapfsReleaseEntry(vfs_path, entry);
+    } else if (mode === 'async') {
+      asyncFileRelease(vfs_path);
     } else {
       try {
         _mod.FS.unlink(vfs_path);
@@ -936,7 +1303,7 @@ export function load_model_from_vfs(model_id, vfs_path, opts_json) {
     }
     throw wasmThrowToError(
       err,
-      'load_model_from_vfs failed for ' + vfs_path + ' (' + bytes + ' bytes, heapfs=' + heapfs + ', wasmMb=' + wasmLinearMb() + ')',
+      'load_model_from_vfs failed for ' + vfs_path + ' (' + bytes + ' bytes, mode=' + mode + ', wasmMb=' + wasmLinearMb() + ')',
     );
   }
 }
@@ -971,6 +1338,13 @@ export function unload_model(model_id: string): void;
 /** Run text generation. Returns JSON-serialised GenerateResponse. */
 export function generate(model_id: string, req_json: string): string;
 
+/** Streaming generation with per-token callback (JSPI build). */
+export function generate_stream(
+  model_id: string,
+  req_json: string,
+  on_token: (token: string, index: number) => void,
+): string;
+
 /** Generate text embeddings. Returns JSON-serialised EmbedResponse. */
 export function embed(model_id: string, req_json: string): string;
 
@@ -990,6 +1364,14 @@ export function model_vfs_abort(vfs_path: string): void;
 export function load_model_from_vfs(model_id: string, vfs_path: string, opts_json: string): void;
 /** Load from an existing VFS path (HeapFS zero-copy mmap). */
 export function load_model_from_path(model_id: string, vfs_path: string, opts_json: string): void;
+/** Bind JS-side reader for JSPI async load (no full-model WASM heap copy). */
+export function async_model_bind(
+  vfs_path: string,
+  size_bytes: number,
+  readFn: (offset: number, length: number) => Uint8Array,
+): void;
+/** True when this build includes sync external fread (cap-wasm-fs). Does not require native JSPI. */
+export function can_use_async_file(): boolean;
 /** Raw Emscripten module (for HeapFS helpers). */
 export function getEmscriptenModule(): unknown;
 

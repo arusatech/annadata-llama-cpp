@@ -136,6 +136,9 @@ llama_cap_context::~llama_cap_context() {
 bool llama_cap_context::loadModel(common_params &params_)
 {
     params = params_;
+#ifdef __EMSCRIPTEN__
+    fprintf(stderr, "@@WASM_LOAD@@ loadModel: common_init_from_params begin\n");
+#endif
     llama_init = common_init_from_params(params);
     model = llama_init.model.get();
     ctx = llama_init.context.get();
@@ -144,7 +147,13 @@ bool llama_cap_context::loadModel(common_params &params_)
         LOG_ERROR("unable to load model: %s", params_.model.path.c_str());
         return false;
     }
+#ifdef __EMSCRIPTEN__
+    fprintf(stderr, "@@WASM_LOAD@@ loadModel: common_init_from_params ok, chat templates begin\n");
+#endif
     templates = common_chat_templates_init(model, params.chat_template);
+#ifdef __EMSCRIPTEN__
+    fprintf(stderr, "@@WASM_LOAD@@ loadModel: chat templates ok, completion init begin\n");
+#endif
     n_ctx = llama_n_ctx(ctx);
 
     // Initialize completion context
@@ -152,6 +161,10 @@ bool llama_cap_context::loadModel(common_params &params_)
         delete completion;
     }
     completion = new llama_cap_context_completion(this);
+
+#ifdef __EMSCRIPTEN__
+    fprintf(stderr, "@@WASM_LOAD@@ loadModel: completion ok\n");
+#endif
 
     // Initialize context shift flag
     LOG_INFO("ctx_shift: %s", params.ctx_shift ? "enabled" : "disabled");

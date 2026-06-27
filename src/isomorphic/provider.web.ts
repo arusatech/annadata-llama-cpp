@@ -90,7 +90,13 @@ const toError = (code: string, message: string, meta?: Record<string, unknown>):
     'INVALID_REQUEST',
   ];
   const normalizedCode = knownCodes.includes(code) ? (code as any) : 'INFERENCE_FAILED';
-  return new LlmError(normalizedCode, message, meta);
+  const text =
+    message == null || message === ''
+      ? 'Unknown inference error'
+      : typeof message === 'string'
+        ? message
+        : String(message);
+  return new LlmError(normalizedCode, text, meta);
 };
 
 // ---------------------------------------------------------------------------

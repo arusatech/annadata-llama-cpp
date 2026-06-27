@@ -64,6 +64,10 @@ void apply_params_json(common_params & cparams, const json * j) {
         if (p.contains("n_batch") && p["n_batch"].is_number_integer()) {
             cparams.n_batch = p["n_batch"].get<int>();
         }
+        if (p.contains("n_threads") && p["n_threads"].is_number_integer()) {
+            cparams.cpuparams.n_threads = p["n_threads"].get<int>();
+            cparams.cpuparams_batch.n_threads = p["n_threads"].get<int>();
+        }
         if (p.contains("n_gpu_layers") && p["n_gpu_layers"].is_number_integer()) {
             cparams.n_gpu_layers = p["n_gpu_layers"].get<int>();
         }
@@ -113,17 +117,47 @@ std::string resolve_model_path(const std::string & primary, const json * params_
 }
 
 bool load_with_fallback(std::unique_ptr<capllama::llama_cap_context> & context, common_params cparams) {
+#ifdef __EMSCRIPTEN__
+    fprintf(stderr,
+        "@@WASM_LOAD@@ phase=primary begin path=%s n_ctx=%d n_batch=%d n_threads=%d use_mmap=%d\n",
+        cparams.model.path.c_str(), cparams.n_ctx, cparams.n_batch,
+        cparams.cpuparams.n_threads, cparams.use_mmap ? 1 : 0);
+#endif
     try {
         if (context->loadModel(cparams)) {
+#ifdef __EMSCRIPTEN__
+            fprintf(stderr, "@@WASM_LOAD@@ phase=primary ok\n");
+#endif
             return true;
         }
+#ifdef __EMSCRIPTEN__
+        fprintf(stderr, "@@WASM_LOAD@@ phase=primary failed (loadModel returned false)\n");
+#endif
     } catch (const std::exception & e) {
         fprintf(stderr, "loadModel exception: %s\n", e.what());
+#ifdef __EMSCRIPTEN__
+        fprintf(stderr, "@@WASM_LOAD@@ phase=primary failed (C++ exception — no fallback, WASM trap may follow)\n");
+#endif
         return false;
     } catch (...) {
         fprintf(stderr, "loadModel unknown exception\n");
+#ifdef __EMSCRIPTEN__
+        fprintf(stderr, "@@WASM_LOAD@@ phase=primary failed (unknown exception — no fallback)\n");
+#endif
         return false;
     }
+
+#ifdef __EMSCRIPTEN__
+    // Primary already uses effectiveNctx clamps (n_ctx<=512, n_batch<=8 for large async models).
+    // A second loadModel() on the same context wastes heap and confuses stderr ordering.
+    if (cparams.n_ctx <= 512 && cparams.n_batch <= 8) {
+        fprintf(stderr,
+            "@@WASM_LOAD@@ skip fallback: params already at WASM minimum (n_ctx=%d n_batch=%d use_mmap=%d)\n",
+            cparams.n_ctx, cparams.n_batch, cparams.use_mmap ? 1 : 0);
+        return false;
+    }
+#endif
+
     common_params minimal;
     minimal.model.path = cparams.model.path;
     minimal.n_batch = 128;
@@ -151,13 +185,20 @@ bool load_with_fallback(std::unique_ptr<capllama::llama_cap_context> & context, 
 #ifdef __EMSCRIPTEN__
     // Never fall back to use_mmap=false on WASM — copying a 700 MB GGUF OOMs.
     minimal.use_mmap = cparams.use_mmap;
-    minimal.n_ctx = std::min(cparams.n_ctx, 512);
-    minimal.n_batch = std::min(cparams.n_batch, 128);
+    minimal.n_ctx = 64;
+    minimal.n_batch = 32;
+    fprintf(stderr,
+        "@@WASM_LOAD@@ phase=fallback begin n_ctx=%d n_batch=%d use_mmap=%d\n",
+        minimal.n_ctx, minimal.n_batch, minimal.use_mmap ? 1 : 0);
 #else
     minimal.n_ctx = 256;
     minimal.use_mmap = false;
 #endif
-    return context->loadModel(minimal);
+    const bool ok = context->loadModel(minimal);
+#ifdef __EMSCRIPTEN__
+    fprintf(stderr, "@@WASM_LOAD@@ phase=fallback %s\n", ok ? "ok" : "failed");
+#endif
+    return ok;
 }
 
 json default_chat_templates_json() {
@@ -190,6 +231,9 @@ void parse_completion_params(capllama::llama_cap_context * ctx, const char * par
             }
             if (p.contains("n_predict") && p["n_predict"].is_number_integer()) {
                 n_predict = p["n_predict"].get<int>();
+            }
+            if (p.contains("max_tokens") && p["max_tokens"].is_number_integer()) {
+                n_predict = p["max_tokens"].get<int>();
             }
             if (p.contains("temperature") && p["temperature"].is_number()) {
                 temperature = p["temperature"].get<double>();
@@ -281,6 +325,22 @@ int64_t llama_init_context(const char * model_path, const char * params_json) {
 
         apply_params_json(cparams, pj);
 
+#ifdef __EMSCRIPTEN__
+        // Warmup runs llama_decode during load; skip on WASM to avoid post-init trap/OOM at 2GB heap.
+        cparams.warmup = false;
+        // Long chat templates exceed small n_ctx without shifting (LFM2 PWA loads n_ctx<=512).
+        cparams.ctx_shift = true;
+        // Non-pthread WASM: ggml-cpu lm_ggml_thread_create fails when n_threads > 1.
+        cparams.cpuparams.n_threads = 1;
+        cparams.cpuparams_batch.n_threads = 1;
+        if (cparams.n_batch > 8) {
+            cparams.n_batch = 8;
+        }
+        if (cparams.n_ctx > 512) {
+            cparams.n_ctx = 512;
+        }
+#endif
+
         if (!load_with_fallback(context, cparams)) {
             fprintf(stderr,
                 "llama_init_context: load failed for %s (n_ctx=%d n_batch=%d use_mmap=%d)\n",
@@ -345,6 +405,9 @@ const char * llama_get_context_model_json(int64_t context_id) {
 
 const char * llama_completion(int64_t context_id, const char * params_json) {
     try {
+#ifdef __EMSCRIPTEN__
+        fprintf(stderr, "@@WASM_GEN@@ begin ctx=%lld\n", (long long) context_id);
+#endif
         std::lock_guard<std::mutex> lock(g_mutex);
         auto * ctx = get_ctx(context_id);
         if (!ctx || !ctx->ctx) {
@@ -377,6 +440,10 @@ const char * llama_completion(int64_t context_id, const char * params_json) {
                 json err = {{"error", std::string("completion init: ") + e.what()}};
                 return tls_cstr(err.dump());
             }
+        } else if (!ctx->completion->ctx_sampling) {
+            if (!ctx->completion->initSampling() || !ctx->completion->ctx_sampling) {
+                return tls_cstr("{\"error\":\"sampling re-init failed\"}");
+            }
         }
 
         std::string generated_text;
@@ -386,12 +453,22 @@ const char * llama_completion(int64_t context_id, const char * params_json) {
         try {
             ctx->completion->rewind();
             ctx->completion->loadPrompt({});
+            if (ctx->completion->context_full) {
+                return tls_cstr("{\"error\":\"prompt exceeds n_ctx — reload with larger n_ctx or shorten prompt\"}");
+            }
+#ifdef __EMSCRIPTEN__
+            fprintf(stderr, "@@WASM_GEN@@ prompt_ok tokens=%zu n_predict=%d\n",
+                prompt_tokens.size(), n_predict);
+#endif
             ctx->completion->beginCompletion();
 
             const llama_vocab * vocab = llama_model_get_vocab(ctx->model);
 
             while (tokens_generated < n_predict && !ctx->completion->is_interrupted) {
                 capllama::completion_token_output token_output = ctx->completion->nextToken();
+                if (token_output.tok < 0) {
+                    break;
+                }
                 if (llama_vocab_is_eog(vocab, token_output.tok)) {
                     hit_eos = true;
                     break;
@@ -401,6 +478,9 @@ const char * llama_completion(int64_t context_id, const char * params_json) {
                 tokens_generated++;
             }
             ctx->completion->endCompletion();
+#ifdef __EMSCRIPTEN__
+            fprintf(stderr, "@@WASM_GEN@@ done predicted=%d\n", tokens_generated);
+#endif
         } catch (const std::exception & e) {
             try {
                 if (ctx->completion) {
@@ -680,10 +760,16 @@ const char * llama_completion_stream(
         try {
             ctx->completion->rewind();
             ctx->completion->loadPrompt({});
+            if (ctx->completion->context_full) {
+                return tls_cstr("{\"error\":\"prompt exceeds n_ctx — reload with larger n_ctx or shorten prompt\"}");
+            }
             ctx->completion->beginCompletion();
 
             while (tokens_generated < n_predict && !ctx->completion->is_interrupted) {
                 capllama::completion_token_output token_output = ctx->completion->nextToken();
+                if (token_output.tok < 0) {
+                    break;
+                }
                 if (llama_vocab_is_eog(vocab, token_output.tok)) {
                     hit_eos = true;
                     break;

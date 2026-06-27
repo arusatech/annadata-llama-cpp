@@ -21,6 +21,10 @@ export type TokenizeResult = { tokens: number[]; has_media?: boolean };
 export type DetokenizeResult = { text: string };
 
 import {
+  canUseAsyncFileRead,
+  asyncReaderFromBytes,
+} from './async-file';
+import {
   ensureWasmTmpDir,
   heapfsAlloc,
   heapfsModelPath,
@@ -69,11 +73,17 @@ type WasmModule = {
   /** @deprecated use init_engine — kept for backwards compat with older builds */
   init?: () => void;
   load_model?: (modelId: string, bytes: Uint8Array, optsJson: string) => void;
-  model_vfs_begin?: () => string;
+  model_vfs_begin?: (totalBytes?: number, optsJson?: string) => string;
   model_vfs_write?: (vfsPath: string, chunk: Uint8Array) => void;
   model_vfs_abort?: (vfsPath: string) => void;
   load_model_from_vfs?: (modelId: string, vfsPath: string, optsJson: string) => void;
   load_model_from_path?: (modelId: string, vfsPath: string, optsJson: string) => void;
+  async_model_bind?: (
+    vfsPath: string,
+    sizeBytes: number,
+    readFn: (offset: number, length: number) => Uint8Array | Promise<Uint8Array>,
+  ) => void;
+  can_use_async_file?: () => boolean;
   unload_model?: (modelId: string) => void;
   generate?: (modelId: string, reqJson: string) => string;
   // generate_stream is the real streaming export from Rust/wasm-bindgen (#3).
@@ -97,11 +107,43 @@ const safeJsonParse = <T>(raw: string, fallback: T): T => {
 /** Models above this use VFS streaming first (HeapFS/mmap can overflow JS stack). */
 const LARGE_MODEL_BYTES = 500 * 1024 * 1024;
 
-/** WASM loads default to read() I/O — mmap + HeapFS can recurse through MEMFS JS glue. */
+/** Legacy MEMFS streaming — use_mmap=false (full file copied into WASM VFS). */
 const wasmLoadOptsJson = (
   opts: Record<string, unknown> | undefined,
   overrides?: Record<string, unknown>,
 ): string => JSON.stringify({ use_mmap: false, ...(opts ?? {}), ...overrides });
+
+/** JSPI async fread — model stays in JS; C++ reads on demand (use_mmap=false). */
+const wasmAsyncLoadOptsJson = (
+  opts: Record<string, unknown> | undefined,
+  overrides?: Record<string, unknown>,
+): string => JSON.stringify({ use_mmap: false, ...(opts ?? {}), ...overrides });
+
+const loadViaAsyncFile = (
+  mod: WasmModule,
+  modelId: string,
+  sizeBytes: number,
+  readChunk: (offset: number, length: number) => Uint8Array,
+  opts?: Record<string, unknown>,
+): void => {
+  const begin = mod.model_vfs_begin;
+  const bind = mod.async_model_bind;
+  const finish = mod.load_model_from_vfs;
+  const abort = mod.model_vfs_abort;
+  if (!begin || !bind || !finish) {
+    throw new Error('Wasm module missing JSPI async file exports — rebuild with: npm run build:wasm:jspi');
+  }
+  const optsJson = wasmAsyncLoadOptsJson(opts);
+  const vfsPath = begin(sizeBytes, optsJson);
+  if (!vfsPath) throw new Error('model_vfs_begin returned empty path');
+  try {
+    bind(vfsPath, sizeBytes, (offset, length) => readChunk(offset, length));
+    finish(modelId, vfsPath, optsJson);
+  } catch (err) {
+    abort?.(vfsPath);
+    throw err;
+  }
+};
 
 const isStackOverflowError = (err: unknown): boolean => {
   const msg = err instanceof Error ? err.message : String(err);
@@ -210,11 +252,21 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
     },
 
     loadModel: async (modelId, modelBuffer, opts) => {
-      // Prefer VFS chunked write to keep peak WASM heap at ~1.4 GB instead
-      // of ~2.1 GB.  load_model(bytes) causes: wasm-bindgen copy (697 MB) +
-      // fwrite to VFS (697 MB) + llama context (697 MB) = OOM / unreachable.
-      // VFS path: 32 MB chunk per write + accumulated VFS (697 MB) +
-      // llama context (697 MB) during finish = 1.4 GB peak, VFS freed after.
+      const bytes = new Uint8Array(modelBuffer);
+      const em = emscripten() as { __llamaWasmJspi?: boolean; __llamaWasmAsyncFile?: boolean } | null;
+      const asyncReady =
+        typeof mod.can_use_async_file === 'function'
+          ? mod.can_use_async_file()
+          : canUseAsyncFileRead(em?.__llamaWasmJspi ?? false);
+
+      // JSPI async fread: register JS reader — no full-model copy into WASM linear memory.
+      if (asyncReady) {
+        const reader = asyncReaderFromBytes(bytes);
+        loadViaAsyncFile(mod, modelId, reader.sizeBytes, reader.readChunk, opts);
+        return;
+      }
+
+      // HeapFS fallback: mmapAlloc places GGUF in WASM heap (wllama fallback when no JSPI).
       const begin = mod.model_vfs_begin;
       const write = mod.model_vfs_write;
       const finish = mod.load_model_from_vfs;
@@ -222,14 +274,12 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
 
       if (begin && write && finish) {
         ensureVfsReady();
-        const bytes = new Uint8Array(modelBuffer);
         const optsJson = wasmLoadOptsJson(opts);
         const vfsPath = begin(bytes.length, optsJson);
         if (!vfsPath) throw new Error('model_vfs_begin returned empty path');
         try {
-          const CHUNK = 32 * 1024 * 1024; // 32 MB — keeps per-iteration WASM alloc small
+          const CHUNK = 32 * 1024 * 1024;
           for (let offset = 0; offset < bytes.length; offset += CHUNK) {
-            // subarray is a zero-copy view; wasm-bindgen copies only 32 MB per call
             write(vfsPath, bytes.subarray(offset, offset + CHUNK));
           }
           finish(modelId, vfsPath, optsJson);
@@ -240,10 +290,9 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
         return;
       }
 
-      // Fallback for builds that pre-date the VFS streaming API.
       const loadModelFn = mod.load_model;
       if (!loadModelFn) throw new Error('Wasm module missing load_model export');
-      loadModelFn(modelId, new Uint8Array(modelBuffer), JSON.stringify(opts ?? {}));
+      loadModelFn(modelId, bytes, JSON.stringify(opts ?? {}));
     },
 
     loadModelFromOpfsReader: async (modelId, reader, opts) => {
@@ -253,6 +302,21 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
       const finish = mod.load_model_from_vfs;
       const abort = mod.model_vfs_abort;
       const chunkSize = 4 * 1024 * 1024;
+      const em = emscripten() as { __llamaWasmJspi?: boolean } | null;
+      const asyncReady =
+        typeof mod.can_use_async_file === 'function'
+          ? mod.can_use_async_file()
+          : canUseAsyncFileRead(em?.__llamaWasmJspi ?? false);
+
+      const loadViaAsyncOpfs = (): void => {
+        loadViaAsyncFile(
+          mod,
+          modelId,
+          reader.sizeBytes,
+          (offset, length) => reader.readChunk(offset, length),
+          opts,
+        );
+      };
 
       const streamOpfsToVfs = (useMmap: boolean): void => {
         if (!begin || !write || !finish) {
@@ -284,24 +348,29 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
         if (!loadFromPath) {
           throw new Error('Wasm module missing load_model_from_path');
         }
-        const em = ensureHeapFS();
+        const emMod = ensureHeapFS();
         const basename = `${modelId.replace(/[^\w.-]/g, '_')}.gguf`;
         const vfsPath = heapfsModelPath(basename);
-        em.FS.createDataFile('/models', basename, new ArrayBuffer(0), true, true, true);
-        const fileId = heapfsAlloc(em, basename, reader.sizeBytes, true);
+        emMod.FS.createDataFile('/models', basename, new ArrayBuffer(0), true, true, true);
+        const fileId = heapfsAlloc(emMod, basename, reader.sizeBytes, true);
         for (let offset = 0; offset < reader.sizeBytes; ) {
           const chunk = reader.readChunk(offset, chunkSize);
           if (chunk.byteLength === 0) break;
-          heapfsWrite(em, fileId, chunk, offset);
+          heapfsWrite(emMod, fileId, chunk, offset);
           offset += chunk.byteLength;
         }
         loadFromPath(modelId, vfsPath, wasmLoadOptsJson(opts, { use_mmap: true }));
       };
 
-      const preferVfs =
-        reader.sizeBytes >= LARGE_MODEL_BYTES || opts?.preferVfsStreaming === true;
-
       try {
+        if (asyncReady) {
+          loadViaAsyncOpfs();
+          return;
+        }
+
+        const preferVfs =
+          reader.sizeBytes >= LARGE_MODEL_BYTES || opts?.preferVfsStreaming === true;
+
         if (preferVfs) {
           streamOpfsToVfs(false);
           return;
@@ -417,12 +486,14 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
         : {};
       const em = emscripten() as (EmscriptenModule & {
         __llamaWasmJspi?: boolean;
+        __llamaWasmAsyncFile?: boolean;
         __llamaWasmPthread?: boolean;
       }) | null;
       return {
         ...base,
         ...wasmMemoryDiagnostics(em),
         wasmJspi: em?.__llamaWasmJspi ?? false,
+        wasmAsyncFile: em?.__llamaWasmAsyncFile ?? mod.can_use_async_file?.() ?? false,
         wasmPthread: em?.__llamaWasmPthread ?? false,
       };
     },

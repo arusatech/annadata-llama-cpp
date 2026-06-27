@@ -111,6 +111,7 @@ fn main() {
         "cap-embedding.cpp",
         "cap-ios-bridge.cpp",
         "cap-wasm-jspi.cpp",
+        "cap-wasm-fs.cpp",
         "cap-wasm-vfs.cpp",
         // cap-ios-bridge.cpp now contains WASM-specific code gated by CAPLLAMA_BUILD_WASM
     ];

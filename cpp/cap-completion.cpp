@@ -141,8 +141,17 @@ void llama_cap_context_completion::loadPrompt(const std::vector<std::string> &me
 
     if (!has_media) {
         std::vector<llama_token> text_tokens;
-        // Text-only path
-        text_tokens = ::common_tokenize(parent_ctx->ctx, parent_ctx->params.prompt, true, true);
+        // Text-only path — chat templates from the app already include BOS/start markers.
+        bool add_bos = true;
+#ifdef __EMSCRIPTEN__
+        const std::string & pr = parent_ctx->params.prompt;
+        if (pr.find("<|startoftext|>") != std::string::npos ||
+            pr.find("<|im_start|>") != std::string::npos ||
+            pr.rfind("<|startoftext|>", 0) == 0) {
+            add_bos = false;
+        }
+#endif
+        text_tokens = ::common_tokenize(parent_ctx->ctx, parent_ctx->params.prompt, add_bos, true);
         num_prompt_tokens = text_tokens.size();
 
         // LOG tokens
@@ -300,8 +309,10 @@ completion_token_output llama_cap_context_completion::nextToken()
 
     {
         // out of user input, sample next token
+#ifndef __EMSCRIPTEN__
         std::vector<llama_token_data> candidates;
         candidates.reserve(llama_vocab_n_tokens(vocab));
+#endif
 
         llama_token new_token_id = common_sampler_sample(ctx_sampling, parent_ctx->ctx, -1);
 

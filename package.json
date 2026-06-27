@@ -85,7 +85,7 @@
     "swiftlint": "node-swiftlint",
     "docgen": "npx docgen --api LlamaCppPlugin --output-readme README.md --output-json dist/docs.json",
     "build": "npm run clean && npm run docgen && tsc && rollup -c rollup.config.mjs",
-    "build:wasm": "./scripts/build-wasm.sh",
+    "build:wasm": "LLAMA_WASM_JSPI=1 LLAMA_WASM_PTHREAD=0 ./scripts/build-wasm.sh",
     "build:wasm:jspi": "LLAMA_WASM_JSPI=1 LLAMA_WASM_PTHREAD=0 ./scripts/build-wasm.sh",
     "build:wasm:pthreads": "LLAMA_WASM_JSPI=1 LLAMA_WASM_PTHREAD=1 ./scripts/build-wasm.sh",
     "build:wasm:full": "LLAMA_WASM_JSPI=1 LLAMA_WASM_PTHREAD=0 ./scripts/build-wasm.sh",

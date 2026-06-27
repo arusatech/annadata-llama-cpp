@@ -5620,6 +5620,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ctx_map.size() * ml.files.size();
     pimpl->bufs.reserve(n_max_backend_buffer);
 
+#ifdef __EMSCRIPTEN__
+    bool wasm_tensor_path_logged = false;
+#endif
+
     for (auto & it : ctx_map) {
         lm_ggml_backend_buffer_type_t buft = it.first;
         lm_ggml_context * ctx              = it.second;
@@ -5647,6 +5651,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         bool is_default_buft = buft == lm_ggml_backend_dev_buffer_type(dev);
 
         if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+#ifdef __EMSCRIPTEN__
+            if (!wasm_tensor_path_logged) {
+                LLAMA_LOG_INFO("%s: WASM tensor path = buffer_from_host_ptr (zero-copy mmap)\n", __func__);
+                wasm_tensor_path_logged = true;
+            }
+#endif
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
                 // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer, then we could just use metal for all layers
@@ -5667,6 +5677,15 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             }
         }
         else {
+#ifdef __EMSCRIPTEN__
+            if (!wasm_tensor_path_logged) {
+                LLAMA_LOG_WARN(
+                    "%s: WASM tensor path = COPY (ggml_backend_alloc_ctx_tensors) "
+                    "use_mmap=%d host_ptr=%d default_buft=%d — expect ~2x model RAM\n",
+                    __func__, ml.use_mmap ? 1 : 0, buffer_from_host_ptr_supported ? 1 : 0, is_default_buft ? 1 : 0);
+                wasm_tensor_path_logged = true;
+            }
+#endif
             lm_ggml_backend_buffer_t buf = lm_ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", lm_ggml_backend_buft_name(buft)));

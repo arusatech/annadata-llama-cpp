@@ -1005,18 +1005,26 @@ struct common_init_result common_init_from_params(common_params & params) {
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
 
+#ifdef __EMSCRIPTEN__
+    fprintf(stderr, "@@WASM_LOAD@@ common_init: post-lora, before sampling init\n");
+#endif
+
     if (params.sampling.ignore_eos && llama_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {
         LOG_WRN("%s: warning: vocab does not have an EOS token, ignoring --ignore-eos\n", __func__);
         params.sampling.ignore_eos = false;
     }
 
-    // initialize once
+#ifndef __EMSCRIPTEN__
+    // initialize once — scans full vocab; skipped on WASM (heap/stack pressure on large vocabs)
     for (llama_token i = 0; i < llama_vocab_n_tokens(vocab); i++) {
         if (llama_vocab_is_eog(vocab, i)) {
             LOG_INF("%s: added %s logit bias = %f\n", __func__, common_token_to_piece(lctx, i).c_str(), -INFINITY);
             params.sampling.logit_bias_eog.push_back({i, -INFINITY});
         }
     }
+#else
+    fprintf(stderr, "@@WASM_LOAD@@ skip EOG logit-bias vocab scan (n_tokens=%d)\n", llama_vocab_n_tokens(vocab));
+#endif
 
     if (params.sampling.ignore_eos) {
         // add EOG biases to the active set of logit biases
@@ -1026,12 +1034,16 @@ struct common_init_result common_init_from_params(common_params & params) {
     }
 
     if (params.sampling.penalty_last_n == -1) {
+#ifndef __EMSCRIPTEN__
         LOG_INF("%s: setting penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
+#endif
         params.sampling.penalty_last_n = llama_n_ctx(lctx);
     }
 
     if (params.sampling.dry_penalty_last_n == -1) {
+#ifndef __EMSCRIPTEN__
         LOG_INF("%s: setting dry_penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
+#endif
         params.sampling.dry_penalty_last_n = llama_n_ctx(lctx);
     }
 
@@ -1075,6 +1087,10 @@ struct common_init_result common_init_from_params(common_params & params) {
 
     iparams.model.reset(model);
     iparams.context.reset(lctx);
+
+#ifdef __EMSCRIPTEN__
+    fprintf(stderr, "@@WASM_LOAD@@ common_init_from_params done\n");
+#endif
 
     return iparams;
 }
