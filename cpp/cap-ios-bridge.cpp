@@ -826,6 +826,7 @@ const char * llama_completion_stream(
                    !ctx->completion->is_interrupted) {
                 capllama::completion_token_output token_output = ctx->completion->doCompletion();
                 if (token_output.tok < 0) {
+                    hit_eos = ctx->completion->stopped_eos;
                     break;
                 }
                 if (llama_vocab_is_eog(vocab, token_output.tok)) {

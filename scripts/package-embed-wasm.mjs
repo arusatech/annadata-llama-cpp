@@ -1071,6 +1071,10 @@ function wasmMemoryTarget(modelBytes) {
   if (modelBytes > 400 * 1024 * 1024) {
     return Math.min(modelBytes + 1024 * 1024 * 1024, WASM_MAX_BYTES);
   }
+  // Small embed models: context init can spike past modelBytes+512MB; grow to 1GB when heap is still 832MB.
+  if (modelBytes < 100 * 1024 * 1024) {
+    return Math.min(Math.max(modelBytes + 512 * 1024 * 1024, 1024 * 1024 * 1024), WASM_MAX_BYTES);
+  }
   return Math.min(modelBytes + 512 * 1024 * 1024, WASM_MAX_BYTES);
 }
 
@@ -1204,6 +1208,22 @@ function vfsLoadOptsJson(opts_json, mode, modelBytes) {
     opts = JSON.parse(opts_json || '{}');
   } catch (_) {}
   opts.n_threads = 1;
+  const embedding = opts.embedding === true || opts.embedding === 'true';
+  if (embedding) {
+    if (opts.n_ctx == null || opts.n_ctx > 256) {
+      opts.n_ctx = 256;
+    }
+    if (opts.n_batch == null || opts.n_batch > 32) {
+      opts.n_batch = 32;
+    }
+  } else if (modelBytes < 100 * 1024 * 1024) {
+    if (opts.n_ctx == null || opts.n_ctx > 256) {
+      opts.n_ctx = 256;
+    }
+    if (opts.n_batch == null || opts.n_batch > 32) {
+      opts.n_batch = 32;
+    }
+  }
   if (mode === 'heapfs') {
     opts.use_mmap = true;
     opts.n_ctx = effectiveNctx(modelBytes, opts_json);
