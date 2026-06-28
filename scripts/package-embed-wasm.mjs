@@ -77,7 +77,7 @@ if (emscriptenWasmBytes < MIN_EMBEDDED_BYTES) {
   if (BUILD_PTHREAD) {
     console.log('[package-embed-wasm] WASM memory: IMPORTED_MEMORY (pthread shared, wllama getWasmMemory) ✓');
   } else {
-    console.log('[package-embed-wasm] WASM memory: Emscripten-owned (832 MB initial, grow via mmapAlloc) ✓');
+    console.log('[package-embed-wasm] WASM memory: Emscripten-owned (20 MB initial, grow per model size) ✓');
   }
 }
 
@@ -219,8 +219,8 @@ function trySharedWasmMemory() {
   if (globalThis.crossOriginIsolated !== true || typeof SharedArrayBuffer === 'undefined') {
     return null;
   }
-  // wllama: 128 MB initial, step down max (4096 → 128 MB) on iOS OOM
-  const minBytes = 128 * 1024 * 1024;
+  // wllama-style: 20 MB initial, step down max (4096 → 20 MB) on iOS OOM
+  const minBytes = 20 * 1024 * 1024;
   let maxBytes = 4096 * 1024 * 1024;
   const stepBytes = 128 * 1024 * 1024;
   while (maxBytes >= minBytes) {
@@ -461,6 +461,7 @@ export function load_model(model_id, bytes, opts_json) {
 export function unload_model(model_id) {
   if (!_mod) throw new Error('llama_engine not ready — await init() first');
   _modelContextIds.delete(String(model_id));
+  _loadedModelBytes.delete(String(model_id));
   _mod.unload_model(model_id);
   const kept = _loadedHeapfsModels.get(model_id);
   if (kept) {
@@ -650,6 +651,8 @@ export function memory_snapshot() {
 // Model bytes stay in JS (Blob / OPFS reader). C++ fread → _cap_js_file_read.
 const _asyncFileHandlers = new Map();
 const _loadedAsyncModels = new Map();
+/** Bytes per loaded model — cumulative sizing when chat + embed share one worker. */
+const _loadedModelBytes = new Map();
 
 function stripModelsPrefix(path) {
   return String(path).replace(/^\\/?models\\//, '');
@@ -730,7 +733,7 @@ export function async_model_bind(vfs_path, size_bytes, readFn) {
     throw new Error('async_model_bind requires JSPI build + crossOriginIsolated (COOP/COEP)');
   }
   if (typeof size_bytes === 'number' && size_bytes > 0) {
-    ensureWasmMemoryHeadroom(size_bytes);
+    ensureWasmMemoryHeadroom(size_bytes, '{}', 'async');
   }
   asyncFileRegister(vfs_path, size_bytes, readFn);
   try {
@@ -760,7 +763,7 @@ export function async_model_bind(vfs_path, size_bytes, readFn) {
 // Ref: ref-code/wllama/src/workers-code/llama-cpp.js
 // - mmapAlloc places GGUF bytes in WASM linear memory (not JS heap MEMFS)
 // - patchHeapFS redirects MEMFS mmap/read to those bytes (zero-copy for llama)
-// - Targeted mem.grow() before model init reserves headroom for vocab/KV (after HeapFS stream)
+// - Targeted mem.grow() before model init: 20 MB at boot, then model size + headroom (BGE and LFM same policy)
 
 let _heapfsPatched = false;
 const _heapfsNameToFile = {};
@@ -1061,28 +1064,50 @@ function wasmLinearMb() {
   }
 }
 
+const WASM_INITIAL_BYTES = 20 * 1024 * 1024;
 const WASM_MAX_BYTES = 2147483648;
+const WASM_MIN_HEADROOM_BYTES = 128 * 1024 * 1024;
 
-function wasmMemoryTarget(modelBytes) {
-  // Large GGUF: grow to the 2GB cap so load_tensors has peak headroom (697MB file + mmap metadata + KV).
-  if (modelBytes > 600 * 1024 * 1024) {
-    return WASM_MAX_BYTES;
-  }
-  if (modelBytes > 400 * 1024 * 1024) {
-    return Math.min(modelBytes + 1024 * 1024 * 1024, WASM_MAX_BYTES);
-  }
-  // Small embed models: context init can spike past modelBytes+512MB; grow to 1GB when heap is still 832MB.
-  if (modelBytes < 100 * 1024 * 1024) {
-    return Math.min(Math.max(modelBytes + 512 * 1024 * 1024, 1024 * 1024 * 1024), WASM_MAX_BYTES);
-  }
-  return Math.min(modelBytes + 512 * 1024 * 1024, WASM_MAX_BYTES);
+function totalLoadedModelBytes() {
+  let sum = 0;
+  for (const b of _loadedModelBytes.values()) sum += b;
+  return sum;
 }
 
-/** Reserve headroom for vocab, BPE ranks, and KV cache after HeapFS stream (avoids OOB on malloc). */
-function ensureWasmMemoryHeadroom(modelBytes) {
+function loadOptsForMemory(opts_json, mode, modelBytes) {
+  let opts = {};
+  try {
+    opts = JSON.parse(opts_json || '{}');
+  } catch (_) {}
+  return {
+    mode,
+    n_ctx: typeof opts.n_ctx === 'number' && opts.n_ctx > 0
+      ? opts.n_ctx
+      : effectiveNctx(modelBytes, opts_json),
+    n_batch: typeof opts.n_batch === 'number' && opts.n_batch > 0 ? opts.n_batch : 16,
+    embedding: opts.embedding === true || opts.embedding === 'true',
+  };
+}
+
+/** Same growth policy for BGE and LFM: 20 MB at init, then model size + headroom (max 2 GB). */
+function wasmMemoryTarget(modelBytes, memOpts = {}) {
+  if (!(modelBytes > 0)) return WASM_INITIAL_BYTES;
+  const n_ctx = memOpts.n_ctx ?? 512;
+  const n_batch = memOpts.n_batch ?? 16;
+  const ctxBytes = n_ctx * n_batch * 4096;
+  const proportional = Math.ceil(modelBytes * 0.35);
+  const headroom = Math.max(WASM_MIN_HEADROOM_BYTES, proportional, ctxBytes);
+  const target = modelBytes + headroom;
+  return Math.min(Math.max(WASM_INITIAL_BYTES, target), WASM_MAX_BYTES);
+}
+
+/** Reserve headroom for vocab, BPE ranks, and KV cache before model init. */
+function ensureWasmMemoryHeadroom(modelBytes, opts_json, mode) {
   if (!_mod || !(modelBytes > 0)) return;
+  const cumulativeBytes = totalLoadedModelBytes() + modelBytes;
+  const memOpts = loadOptsForMemory(opts_json, mode, cumulativeBytes);
+  const target = wasmMemoryTarget(cumulativeBytes, memOpts);
   const current = _mod.HEAPU8?.length ?? _mod.wasmMemory?.buffer?.byteLength ?? 0;
-  const target = wasmMemoryTarget(modelBytes);
   if (current >= target) return;
 
   let grown = false;
@@ -1099,7 +1124,8 @@ function ensureWasmMemoryHeadroom(modelBytes) {
   if (typeof console !== 'undefined') {
     console.error(
       '[llama-wasm] memory grow: ' + (current / 1048576).toFixed(0) + 'MB -> ' +
-      (after / 1048576).toFixed(0) + 'MB (model=' + (modelBytes / 1048576).toFixed(0) + 'MB)',
+      (after / 1048576).toFixed(0) + 'MB (models=' + (cumulativeBytes / 1048576).toFixed(0) +
+      'MB target=' + (target / 1048576).toFixed(0) + 'MB mode=' + (mode || 'async') + ')',
     );
   }
 }
@@ -1122,11 +1148,11 @@ function heapfsStreamBegin(totalBytes, opts_json) {
 }
 
 /** Begin streaming a model into WASM VFS. Pass total_bytes + opts_json for HeapFS pre-grow. */
-function asyncFileStreamBegin(totalBytes) {
+function asyncFileStreamBegin(totalBytes, opts_json) {
   patchHeapFS();
   enableAsyncFileEnv();
   if (typeof totalBytes === 'number' && totalBytes > 0) {
-    ensureWasmMemoryHeadroom(totalBytes);
+    ensureWasmMemoryHeadroom(totalBytes, opts_json ?? '{}', 'async');
   }
   const basename = 'wasm_async_' + (_jsVfsCounter++) + '.gguf';
   const path = '/models/' + basename;
@@ -1143,7 +1169,7 @@ function asyncFileStreamBegin(totalBytes) {
 
 function jsModelVfsBegin(totalBytes, opts_json) {
   if (can_use_async_file() && typeof totalBytes === 'number' && totalBytes > 0) {
-    return asyncFileStreamBegin(totalBytes);
+    return asyncFileStreamBegin(totalBytes, opts_json);
   }
   if (typeof totalBytes === 'number' && totalBytes > 0 && supportsHeapFS()) {
     return heapfsStreamBegin(totalBytes, opts_json);
@@ -1302,13 +1328,16 @@ export function load_model_from_vfs(model_id, vfs_path, opts_json) {
   _jsVfsStreams.delete(vfs_path);
   try {
     if (mode === 'heapfs') {
-      ensureWasmMemoryHeadroom(bytes);
+      ensureWasmMemoryHeadroom(bytes, loadOpts, 'heapfs');
       heapfsFinalizeForLoad(vfs_path, entry.basename, bytes);
     } else if (mode === 'async') {
       enableAsyncFileEnv();
-      ensureWasmMemoryHeadroom(bytes);
+      ensureWasmMemoryHeadroom(bytes, loadOpts, 'async');
+    } else {
+      ensureWasmMemoryHeadroom(bytes, loadOpts, 'memfs');
     }
     wasmLoadContextFromPath(model_id, vfs_path, loadOpts);
+    _loadedModelBytes.set(String(model_id), bytes);
     if (mode === 'heapfs' && entry?.basename) {
       _loadedHeapfsModels.set(model_id, {
         path: vfs_path,

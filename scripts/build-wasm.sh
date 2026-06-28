@@ -252,9 +252,9 @@ emcc "${NEW_ARGS[@]}" \
   --js-library "$PATCHED_GLUE" \
   -sERROR_ON_UNDEFINED_SYMBOLS=0 \
   -sALLOW_MEMORY_GROWTH=1 \
-  -sINITIAL_MEMORY=872415232 \
+  -sINITIAL_MEMORY=20971520 \
   -sMAXIMUM_MEMORY=2147483648 \
-  -sSTACK_SIZE=16777216 \
+  -sSTACK_SIZE=8388608 \
   "${WLLAMA_LINK_FLAGS[@]}" \
   2>&1 | grep -v "^warning:" | grep -v "^emcc: warning:" || true
 

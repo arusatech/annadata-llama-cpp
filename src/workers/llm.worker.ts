@@ -18,8 +18,24 @@ type EmbedResult = {
 
 const state = {
   initialized: false,
+  wasmEngineContextInitialized: false,
   loadedModels: new Set<string>(),
+  modelLoadOutcomes: new Map<string, 'loaded' | 'failed'>(),
+  modelLoadFailureReasons: new Map<string, string>(),
+  modelLoadInflight: new Map<string, Promise<void>>(),
   engine: null as WasmEngine | null,
+};
+
+const isModelReadyInWorker = (modelId: string): boolean =>
+  state.wasmEngineContextInitialized &&
+  state.engine != null &&
+  state.loadedModels.has(modelId);
+
+const clearModelLoadMemo = (modelId: string): void => {
+  state.loadedModels.delete(modelId);
+  state.modelLoadOutcomes.delete(modelId);
+  state.modelLoadFailureReasons.delete(modelId);
+  state.modelLoadInflight.delete(modelId);
 };
 
 const postEvent = (evt: WorkerEvent): void => {
@@ -97,6 +113,7 @@ self.onmessage = async (evt: MessageEvent<WorkerRequest>) => {
           state.engine = await tryLoadEngine();
           await state.engine.init?.();
           state.initialized = true;
+          state.wasmEngineContextInitialized = true;
         }
         postEvent({
           id: req.id,
@@ -111,27 +128,73 @@ self.onmessage = async (evt: MessageEvent<WorkerRequest>) => {
           postError(req.id, 'WASM_INIT_FAILED', 'Worker is not initialized. Send INIT first.');
           return;
         }
-        const engine = ensureEngine();
 
-        // Fix #9: read from OPFS in the worker via sync-handle streaming when
-        // available; never on the main thread.
-        try {
-          await loadModelFromOpfs(engine, req.modelId, req.opts);
-        } catch (readErr) {
-          postError(req.id, 'STORAGE_IO_FAILED', `Failed to read model '${req.modelId}' from OPFS in worker: ${readErr instanceof Error ? readErr.message : String(readErr)}`);
+        const requestModelId = req.modelId;
+
+        if (isModelReadyInWorker(requestModelId)) {
+          postEvent({
+            id: req.id,
+            type: 'RESULT',
+            payload: { ok: true, modelId: requestModelId, alreadyLoaded: true, ready: true },
+          });
           return;
         }
-        state.loadedModels.add(req.modelId);
-        postEvent({
-          id: req.id,
-          type: 'RESULT',
-          payload: { ok: true, modelId: req.modelId },
-        });
+
+        const cachedFailure = state.modelLoadFailureReasons.get(requestModelId);
+        if (state.modelLoadOutcomes.get(requestModelId) === 'failed' && cachedFailure) {
+          postError(req.id, 'INSUFFICIENT_MEMORY', cachedFailure, {
+            modelId: requestModelId,
+            cachedFailure: true,
+          });
+          return;
+        }
+
+        let inflight = state.modelLoadInflight.get(requestModelId);
+        if (!inflight) {
+          const engine = ensureEngine();
+          inflight = (async () => {
+            try {
+              await loadModelFromOpfs(engine, requestModelId, req.opts);
+              state.loadedModels.add(requestModelId);
+              state.modelLoadOutcomes.set(requestModelId, 'loaded');
+              state.modelLoadFailureReasons.delete(requestModelId);
+            } catch (readErr) {
+              const reason =
+                readErr instanceof Error ? readErr.message : String(readErr);
+              state.modelLoadOutcomes.set(requestModelId, 'failed');
+              state.modelLoadFailureReasons.set(requestModelId, reason);
+              throw readErr;
+            }
+          })().finally(() => {
+            state.modelLoadInflight.delete(requestModelId);
+          });
+          state.modelLoadInflight.set(requestModelId, inflight);
+        }
+
+        try {
+          await inflight;
+          postEvent({
+            id: req.id,
+            type: 'RESULT',
+            payload: { ok: true, modelId: requestModelId, ready: true },
+          });
+        } catch (readErr) {
+          const reason =
+            state.modelLoadFailureReasons.get(requestModelId) ??
+            (readErr instanceof Error ? readErr.message : String(readErr));
+          postError(
+            req.id,
+            'STORAGE_IO_FAILED',
+            `Failed to read model '${requestModelId}' from OPFS in worker: ${reason}`,
+            { modelId: requestModelId, cachedFailure: true },
+          );
+        }
         return;
       }
 
       case 'UNLOAD_MODEL': {
         if (!state.loadedModels.has(req.modelId)) {
+          clearModelLoadMemo(req.modelId);
           postEvent({
             id: req.id,
             type: 'RESULT',
@@ -141,7 +204,7 @@ self.onmessage = async (evt: MessageEvent<WorkerRequest>) => {
         }
         const engine = ensureEngine();
         await engine.unloadModel(req.modelId);
-        state.loadedModels.delete(req.modelId);
+        clearModelLoadMemo(req.modelId);
         postEvent({
           id: req.id,
           type: 'RESULT',
