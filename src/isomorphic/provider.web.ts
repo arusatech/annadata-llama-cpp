@@ -12,6 +12,11 @@ import type { DetokenizeResult, TokenizeResult } from '../workers/wasm.engine';
 import { LlmError } from './errors';
 import { DefaultModelScheduler } from './model.scheduler';
 import {
+  WASM_MAX_CONCURRENT_MODELS,
+  WASM_POOL_CEILING_BYTES,
+  wasmMemoryPressure,
+} from './wasmMemoryPolicy';
+import {
   ensureModelInOpfs,
   getOpfsUsage,
 } from '../storage/opfs.store';
@@ -147,7 +152,7 @@ export class WebProvider implements LlmProvider {
   private reqCounter = 0;
   private pending = new Map<string, PendingRequest>();
   // Fix #5: wire the scheduler so admission control is enforced on the web path.
-  private scheduler = new DefaultModelScheduler(5);
+  private scheduler = new DefaultModelScheduler(WASM_MAX_CONCURRENT_MODELS);
 
   constructor(private workerFactoryOverride?: WorkerFactory) {}
 
@@ -290,13 +295,36 @@ export class WebProvider implements LlmProvider {
     // Fix #5: enforce admission control (memory guard + slot limit) BEFORE
     // asking the worker to load, using a real memory snapshot (#11).
     const memory = await getMemorySnapshotCrossBrowser();
-    // sizeBytes from manifest tells the scheduler how big the model is.
+    const wasmMemory = await this.fetchWorkerMemory().catch(
+      (): Record<string, unknown> => ({}),
+    );
+    const wasmLinearBytes =
+      typeof wasmMemory.wasmLinearBytes === 'number' ? wasmMemory.wasmLinearBytes : undefined;
     const manifestEntry = existing ?? (await getManifestEntry(opts.modelId));
     const modelBytes = manifestEntry?.sizeBytes ?? 0;
-    this.scheduler.ensureCapacity(opts.modelId, modelBytes, memory);
+    this.scheduler.ensureCapacity(
+      opts.modelId,
+      modelBytes,
+      memory,
+      undefined,
+      {
+        wasmLinearBytes,
+        wasmPoolCeilingBytes: WASM_POOL_CEILING_BYTES,
+        loadOpts: {
+          n_ctx: opts.n_ctx,
+          n_batch: opts.n_batch,
+          embedding: opts.embedding,
+        },
+      },
+    );
 
     // Fix #9: send modelId only — the worker reads from OPFS internally.
-    await this.sendRequest<{ ok: boolean }>(
+    const loadResult = await this.sendRequest<{
+      ok: boolean;
+      alreadyLoaded?: boolean;
+      measuredFootprintBytes?: number;
+      wasmLinearBytes?: number;
+    }>(
       {
         type: 'LOAD_MODEL',
         modelId: opts.modelId,
@@ -315,8 +343,44 @@ export class WebProvider implements LlmProvider {
       undefined,
       opts.onProgress,
     );
+
+    let measuredFootprint = loadResult.measuredFootprintBytes;
+    if (!(typeof measuredFootprint === 'number' && measuredFootprint > 0)) {
+      const workerMem = await this.fetchWorkerMemory().catch((): Record<string, unknown> => ({}));
+      measuredFootprint = this.readMeasuredFootprintFromWorker(workerMem, opts.modelId);
+    }
+
     this.loadedModelIds.add(opts.modelId);
-    this.scheduler.markLoaded(opts.modelId);
+    this.scheduler.markLoaded(
+      opts.modelId,
+      modelBytes,
+      {
+        n_ctx: opts.n_ctx,
+        n_batch: opts.n_batch,
+        embedding: opts.embedding,
+      },
+      measuredFootprint,
+    );
+    if (typeof measuredFootprint === 'number' && measuredFootprint > 0) {
+      this.scheduler.calibrateFootprint(opts.modelId, measuredFootprint);
+    }
+  }
+
+  private readMeasuredFootprintFromWorker(
+    workerMem: Record<string, unknown>,
+    modelId: string,
+  ): number | undefined {
+    const models = workerMem.loadedModels;
+    if (!Array.isArray(models)) return undefined;
+    for (const row of models) {
+      if (!row || typeof row !== 'object') continue;
+      const entry = row as Record<string, unknown>;
+      if (entry.modelId !== modelId) continue;
+      if (typeof entry.measuredFootprintBytes === 'number' && entry.measuredFootprintBytes > 0) {
+        return entry.measuredFootprintBytes;
+      }
+    }
+    return undefined;
   }
 
   async unloadModel(modelId: string): Promise<void> {
@@ -379,6 +443,38 @@ export class WebProvider implements LlmProvider {
   // Fix #11: use cross-browser memory snapshot instead of performance.memory only.
   async getMemorySnapshot(): Promise<MemorySnapshot> {
     return getMemorySnapshotCrossBrowser();
+  }
+
+  /** Worker WASM linear memory + loaded-model registry (for scheduling UI). */
+  async fetchWorkerMemory(): Promise<Record<string, unknown>> {
+    return this.sendRequest<Record<string, unknown>>({ type: 'MEMORY' });
+  }
+
+  async getWasmMemoryStatus(): Promise<Record<string, unknown>> {
+    const [browser, workerRaw] = await Promise.all([
+      getMemorySnapshotCrossBrowser(),
+      this.fetchWorkerMemory().catch((): Record<string, unknown> => ({})),
+    ]);
+    const worker = workerRaw;
+    const wasmLinearBytes =
+      typeof worker.wasmLinearBytes === 'number' ? worker.wasmLinearBytes : undefined;
+    return {
+      browser,
+      worker,
+      wasmLinearBytes,
+      wasmPoolCeilingBytes: WASM_POOL_CEILING_BYTES,
+      wasmHeadroomBytes:
+        typeof wasmLinearBytes === 'number'
+          ? Math.max(0, WASM_POOL_CEILING_BYTES - wasmLinearBytes)
+          : undefined,
+      pressure:
+        typeof wasmLinearBytes === 'number'
+          ? wasmMemoryPressure(wasmLinearBytes, WASM_POOL_CEILING_BYTES)
+          : browser.pressure,
+      loadedModels: this.loadedModelIds.size,
+      maxModels: WASM_MAX_CONCURRENT_MODELS,
+      schedulerFootprintBytes: this.scheduler.totalFootprintBytes(),
+    };
   }
 
   async tokenize(modelId: string, text: string): Promise<TokenizeResult> {

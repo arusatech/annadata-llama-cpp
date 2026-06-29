@@ -500,10 +500,7 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
 
     memory: async () => {
       const em = emscripten();
-      const snap = mod.memory_snapshot
-        ? safeJsonParse<Record<string, unknown>>(mod.memory_snapshot(), { pressure: 'unknown' })
-        : { pressure: 'unknown' };
-      return { ...snap, ...wasmMemoryDiagnostics(em) };
+      return { pressure: 'unknown', ...wasmMemoryDiagnostics(em) };
     },
   };
 };

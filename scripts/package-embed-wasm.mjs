@@ -462,6 +462,9 @@ export function unload_model(model_id) {
   if (!_mod) throw new Error('llama_engine not ready — await init() first');
   _modelContextIds.delete(String(model_id));
   _loadedModelBytes.delete(String(model_id));
+  _loadedModelOpts.delete(String(model_id));
+  _measuredFootprintBytes.delete(String(model_id));
+  _linearAtLoadStart.delete(String(model_id));
   _mod.unload_model(model_id);
   const kept = _loadedHeapfsModels.get(model_id);
   if (kept) {
@@ -473,6 +476,24 @@ export function unload_model(model_id) {
     asyncFileRelease(asyncPath);
     _loadedAsyncModels.delete(model_id);
   }
+}
+
+/** Select which resident model receives inference when model_id is omitted. */
+export function set_active_model(model_id) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  return _mod.set_active_model(model_id);
+}
+
+/** Return the active model id, or throw if none. */
+export function get_active_model() {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  return _mod.get_active_model();
+}
+
+/** List resident models (registry snapshot JSON). */
+export function list_loaded_models() {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  return _mod.list_loaded_models();
 }
 
 /** model_id → C++ context id (cwrap path — same pattern as llama_load_context_from_path). */
@@ -641,10 +662,36 @@ export function health() {
   return _mod.health();
 }
 
-/** Return memory usage as a JSON string. */
+/** Return memory usage as a JSON string (JS-only — never call Rust memory_snapshot; it can abort WASM). */
 export function memory_snapshot() {
   if (!_mod) throw new Error('llama_engine not ready — await init() first');
-  return _mod.memory_snapshot();
+  const linear = _mod.HEAPU8?.length ?? _mod.wasmMemory?.buffer?.byteLength ?? 0;
+  const loadedModels = [];
+  for (const [modelId, fileBytes] of _loadedModelBytes) {
+    const opts = _loadedModelOpts.get(modelId) ?? {};
+    const estimatedFootprintBytes = estimateModelWasmFootprint(fileBytes, opts);
+    const measuredFootprintBytes = _measuredFootprintBytes.get(modelId);
+    loadedModels.push({
+      modelId,
+      fileBytes,
+      estimatedFootprintBytes,
+      measuredFootprintBytes: measuredFootprintBytes ?? null,
+      footprintBytes: getModelFootprintBytes(modelId),
+      calibrated: typeof measuredFootprintBytes === 'number' && measuredFootprintBytes > 0,
+    });
+  }
+  return JSON.stringify({
+    pressure: 'unknown',
+    wasmLinearBytes: linear,
+    wasmLinearMb: linear ? +(linear / 1048576).toFixed(1) : 0,
+    wasmPoolCeilingBytes: WASM_POOL_CEILING_BYTES,
+    wasmHeadroomBytes: Math.max(0, WASM_POOL_CEILING_BYTES - linear),
+    maxModels: WASM_MAX_CONCURRENT_MODELS,
+    loadedModelCount: _loadedModelBytes.size,
+    loadedModels,
+    loadedFootprintBytes: loadedModelsFootprintBytes(null),
+    measuredFootprintBytes: loadedModelsFootprintBytes(null),
+  });
 }
 
 // ── JSPI async file read (wllama USE_ASYNC_FILE / cap-wasm-fs.cpp) ───────────
@@ -653,6 +700,53 @@ const _asyncFileHandlers = new Map();
 const _loadedAsyncModels = new Map();
 /** Bytes per loaded model — cumulative sizing when chat + embed share one worker. */
 const _loadedModelBytes = new Map();
+/** Load opts per model — for accurate footprint when summing resident models. */
+const _loadedModelOpts = new Map();
+/** Post-load measured WASM bytes per model (calibrated from linear heap delta). */
+const _measuredFootprintBytes = new Map();
+/** Linear heap bytes captured immediately before each model load. */
+const _linearAtLoadStart = new Map();
+
+function wasmLinearBytesNow() {
+  return _mod?.HEAPU8?.length ?? _mod?.wasmMemory?.buffer?.byteLength ?? 0;
+}
+
+function getModelFootprintBytes(modelId) {
+  const id = String(modelId);
+  if (_measuredFootprintBytes.has(id)) {
+    return _measuredFootprintBytes.get(id);
+  }
+  const fileBytes = _loadedModelBytes.get(id) ?? 0;
+  const opts = _loadedModelOpts.get(id) ?? {};
+  return estimateModelWasmFootprint(fileBytes, opts);
+}
+
+function calibrateModelFootprintAfterLoad(model_id) {
+  const id = String(model_id);
+  const after = wasmLinearBytesNow();
+  const before = _linearAtLoadStart.get(id) ?? 0;
+  const fileBytes = _loadedModelBytes.get(id) ?? 0;
+  const opts = _loadedModelOpts.get(id) ?? {};
+  const estimated = estimateModelWasmFootprint(fileBytes, opts);
+  const firstModel = _loadedModelBytes.size <= 1;
+  let measured = Math.max(0, after - before);
+  if (firstModel && after > 64 * 1024 * 1024) {
+    measured = after;
+  } else if (measured <= 0) {
+    measured = estimated;
+  }
+  _measuredFootprintBytes.set(id, measured);
+  _linearAtLoadStart.delete(id);
+  if (typeof console !== 'undefined') {
+    console.error(
+      '[llama-wasm] footprint calibrated: model=' + id +
+      ' measuredMB=' + (measured / 1048576).toFixed(1) +
+      ' estimatedMB=' + (estimated / 1048576).toFixed(1) +
+      ' heapMB=' + (after / 1048576).toFixed(1),
+    );
+  }
+  return measured;
+}
 
 function stripModelsPrefix(path) {
   return String(path).replace(/^\\/?models\\//, '');
@@ -731,9 +825,6 @@ export function async_model_bind(vfs_path, size_bytes, readFn) {
   if (!_mod) throw new Error('llama_engine not ready — await init() first');
   if (!can_use_async_file()) {
     throw new Error('async_model_bind requires JSPI build + crossOriginIsolated (COOP/COEP)');
-  }
-  if (typeof size_bytes === 'number' && size_bytes > 0) {
-    ensureWasmMemoryHeadroom(size_bytes, '{}', 'async');
   }
   asyncFileRegister(vfs_path, size_bytes, readFn);
   try {
@@ -1066,6 +1157,10 @@ function wasmLinearMb() {
 
 const WASM_INITIAL_BYTES = 20 * 1024 * 1024;
 const WASM_MAX_BYTES = 2147483648;
+/** Practical browser pool cap — below Emscripten 2 GB hard max. */
+const WASM_POOL_CEILING_BYTES = 1536 * 1024 * 1024;
+const WASM_POOL_RESERVE_BYTES = 64 * 1024 * 1024;
+const WASM_MAX_CONCURRENT_MODELS = 5;
 const WASM_MIN_HEADROOM_BYTES = 128 * 1024 * 1024;
 
 function totalLoadedModelBytes() {
@@ -1089,6 +1184,86 @@ function loadOptsForMemory(opts_json, mode, modelBytes) {
   };
 }
 
+/** Estimate WASM bytes for one model (weights + COPY path + KV/context headroom). */
+function estimateModelWasmFootprint(fileBytes, memOpts = {}) {
+  if (!(fileBytes > 0)) return 20 * 1024 * 1024;
+  const embedding = memOpts.embedding === true;
+  const n_ctx = typeof memOpts.n_ctx === 'number' && memOpts.n_ctx > 0
+    ? memOpts.n_ctx
+    : embedding ? 256 : 512;
+  const n_batch = typeof memOpts.n_batch === 'number' && memOpts.n_batch > 0
+    ? memOpts.n_batch
+    : embedding ? 32 : 16;
+  const weightMultiplier = embedding ? 1.25 : fileBytes > 200 * 1024 * 1024 ? 1.32 : 1.2;
+  const ctxBytes = n_ctx * n_batch * 4096;
+  const proportional = Math.ceil(fileBytes * 0.12);
+  const minHeadroom = embedding ? 48 * 1024 * 1024 : WASM_MIN_HEADROOM_BYTES;
+  const headroom = Math.max(minHeadroom, proportional, ctxBytes);
+  return Math.ceil(fileBytes * weightMultiplier + headroom);
+}
+
+function loadedModelsFootprintBytes(excludeModelId) {
+  let sum = 0;
+  for (const [id] of _loadedModelBytes) {
+    if (excludeModelId != null && String(id) === String(excludeModelId)) continue;
+    sum += getModelFootprintBytes(id);
+  }
+  return sum;
+}
+
+function isModelResidentInWasm(model_id) {
+  const id = String(model_id);
+  return _loadedModelBytes.has(id) || _modelContextIds.has(id);
+}
+
+/** Projected linear bytes after loading one more model (incremental — no double-count). */
+function projectedWasmAfterLoad(model_id, fileBytes, memOpts) {
+  const id = String(model_id);
+  const linear = _mod?.HEAPU8?.length ?? _mod?.wasmMemory?.buffer?.byteLength ?? 0;
+  if (isModelResidentInWasm(id)) {
+    return linear;
+  }
+  const estimated = estimateModelWasmFootprint(fileBytes, memOpts);
+  const residentCount = _loadedModelBytes.size;
+  const residentFootprint = loadedModelsFootprintBytes(id);
+  if (residentCount > 0) {
+    return linear + estimated;
+  }
+  if (linear > 64 * 1024 * 1024) {
+    return Math.max(linear, estimated);
+  }
+  return Math.max(linear, residentFootprint, estimated);
+}
+
+/** Reject load before grow when pool ceiling or slot limit would be exceeded. */
+function checkWasmLoadAdmission(model_id, fileBytes, opts_json, mode) {
+  const id = String(model_id);
+  if (isModelResidentInWasm(id)) {
+    return;
+  }
+
+  if (_loadedModelBytes.size >= WASM_MAX_CONCURRENT_MODELS) {
+    throw new Error(
+      '[llama-wasm] model slot limit reached (' + WASM_MAX_CONCURRENT_MODELS +
+      ' concurrent contexts) — unload a model first',
+    );
+  }
+  const memOpts = loadOptsForMemory(opts_json, mode, fileBytes);
+  const estimated = estimateModelWasmFootprint(fileBytes, memOpts);
+  const projected = projectedWasmAfterLoad(id, fileBytes, memOpts);
+  const linear = _mod?.HEAPU8?.length ?? _mod?.wasmMemory?.buffer?.byteLength ?? 0;
+  if (projected > WASM_POOL_CEILING_BYTES - WASM_POOL_RESERVE_BYTES) {
+    const ggufMb = (fileBytes / 1048576).toFixed(0);
+    const linearMb = (linear / 1048576).toFixed(0);
+    throw new Error(
+      '[llama-wasm] WASM pool would exceed ' + (WASM_POOL_CEILING_BYTES / 1048576).toFixed(0) +
+      ' MB (projected ' + (projected / 1048576).toFixed(0) +
+      ' MB, heap now ' + linearMb + ' MB, GGUF ' + ggufMb + ' MB → est. +~' +
+      (estimated / 1048576).toFixed(0) + ' MB for ' + id + ')',
+    );
+  }
+}
+
 /** Same growth policy for BGE and LFM: 20 MB at init, then model size + headroom (max 2 GB). */
 function wasmMemoryTarget(modelBytes, memOpts = {}) {
   if (!(modelBytes > 0)) return WASM_INITIAL_BYTES;
@@ -1102,12 +1277,35 @@ function wasmMemoryTarget(modelBytes, memOpts = {}) {
 }
 
 /** Reserve headroom for vocab, BPE ranks, and KV cache before model init. */
-function ensureWasmMemoryHeadroom(modelBytes, opts_json, mode) {
+function ensureWasmMemoryHeadroom(modelBytes, opts_json, mode, model_id) {
   if (!_mod || !(modelBytes > 0)) return;
-  const cumulativeBytes = totalLoadedModelBytes() + modelBytes;
-  const memOpts = loadOptsForMemory(opts_json, mode, cumulativeBytes);
-  const target = wasmMemoryTarget(cumulativeBytes, memOpts);
+  if (model_id != null && isModelResidentInWasm(model_id)) return;
+
   const current = _mod.HEAPU8?.length ?? _mod.wasmMemory?.buffer?.byteLength ?? 0;
+  const memOpts = loadOptsForMemory(opts_json, mode, modelBytes);
+  const modelsBytes = totalLoadedModelBytes() + modelBytes;
+  const warmHeap = current > 64 * 1024 * 1024;
+  let target;
+  if (warmHeap || _loadedModelBytes.size > 0) {
+    const estimate = estimateModelWasmFootprint(modelBytes, memOpts);
+    if (_loadedModelBytes.size > 0) {
+      // Second+ resident model — incremental footprint plus COPY tensor headroom (use_mmap=0).
+      const copyHeadroom = Math.max(32 * 1024 * 1024, Math.ceil(modelBytes * 1.5));
+      target = Math.min(current + estimate + copyHeadroom, WASM_MAX_BYTES);
+    } else {
+      // Async stream begin may have pre-grown; do not add estimate again.
+      target = Math.min(Math.max(current, estimate), WASM_MAX_BYTES);
+    }
+  } else {
+    target = wasmMemoryTarget(modelsBytes, memOpts);
+  }
+  if (target > WASM_POOL_CEILING_BYTES - WASM_POOL_RESERVE_BYTES) {
+    throw new Error(
+      '[llama-wasm] WASM pool would exceed ' + (WASM_POOL_CEILING_BYTES / 1048576).toFixed(0) +
+      ' MB (grow target ' + (target / 1048576).toFixed(0) + ' MB, heap now ' +
+      (current / 1048576).toFixed(0) + ' MB)',
+    );
+  }
   if (current >= target) return;
 
   let grown = false;
@@ -1124,7 +1322,7 @@ function ensureWasmMemoryHeadroom(modelBytes, opts_json, mode) {
   if (typeof console !== 'undefined') {
     console.error(
       '[llama-wasm] memory grow: ' + (current / 1048576).toFixed(0) + 'MB -> ' +
-      (after / 1048576).toFixed(0) + 'MB (models=' + (cumulativeBytes / 1048576).toFixed(0) +
+      (after / 1048576).toFixed(0) + 'MB (models=' + (modelsBytes / 1048576).toFixed(0) +
       'MB target=' + (target / 1048576).toFixed(0) + 'MB mode=' + (mode || 'async') + ')',
     );
   }
@@ -1326,18 +1524,35 @@ export function load_model_from_vfs(model_id, vfs_path, opts_json) {
     );
   }
   _jsVfsStreams.delete(vfs_path);
+  if (isModelResidentInWasm(model_id)) {
+    if (typeof console !== 'undefined') {
+      console.error(
+        '[llama-wasm] load_model_from_vfs: skip — already loaded model_id=' + model_id +
+        ' wasmMB=' + wasmLinearMb(),
+      );
+    }
+    return;
+  }
   try {
+    checkWasmLoadAdmission(model_id, bytes, loadOpts, mode);
     if (mode === 'heapfs') {
-      ensureWasmMemoryHeadroom(bytes, loadOpts, 'heapfs');
+      ensureWasmMemoryHeadroom(bytes, loadOpts, 'heapfs', model_id);
       heapfsFinalizeForLoad(vfs_path, entry.basename, bytes);
     } else if (mode === 'async') {
       enableAsyncFileEnv();
-      ensureWasmMemoryHeadroom(bytes, loadOpts, 'async');
+      // Heap pre-grown in asyncFileStreamBegin — skip second headroom pass.
     } else {
-      ensureWasmMemoryHeadroom(bytes, loadOpts, 'memfs');
+      ensureWasmMemoryHeadroom(bytes, loadOpts, 'memfs', model_id);
     }
+    _linearAtLoadStart.set(String(model_id), wasmLinearBytesNow());
     wasmLoadContextFromPath(model_id, vfs_path, loadOpts);
     _loadedModelBytes.set(String(model_id), bytes);
+    try {
+      _loadedModelOpts.set(String(model_id), JSON.parse(loadOpts || '{}'));
+    } catch (_) {
+      _loadedModelOpts.set(String(model_id), {});
+    }
+    calibrateModelFootprintAfterLoad(model_id);
     if (mode === 'heapfs' && entry?.basename) {
       _loadedHeapfsModels.set(model_id, {
         path: vfs_path,
@@ -1390,6 +1605,15 @@ export function load_model(model_id: string, bytes: Uint8Array, opts_json: strin
 
 /** Unload a loaded model and free resources. */
 export function unload_model(model_id: string): void;
+
+/** Point the active inference handler at a loaded model. */
+export function set_active_model(model_id: string): void;
+
+/** Return the active model id. */
+export function get_active_model(): string;
+
+/** List resident models as JSON. */
+export function list_loaded_models(): string;
 
 /** Run text generation. Returns JSON-serialised GenerateResponse. */
 export function generate(model_id: string, req_json: string): string;

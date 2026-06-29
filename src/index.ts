@@ -815,5 +815,7 @@ export * from './isomorphic/provider.native';
 export * from './isomorphic/provider.web';
 export * from './isomorphic/model.admission';
 export * from './isomorphic/model.scheduler';
+export * from './isomorphic/wasmMemoryPolicy';
+export * from './isomorphic/wasmMemoryCalibration';
 export * from './storage/manifest';
 export * from './storage/opfs.store';

@@ -3,6 +3,7 @@ mod engine;
 mod ffi;
 mod memory;
 mod model;
+mod model_registry;
 #[allow(dead_code)]
 mod stream;
 
@@ -11,6 +12,7 @@ use model::{
     CompletionParams, ContextParams, EmbedInput, EmbedRequest, EmbedResponse, GenerateRequest,
     GenerateResponse, ModelInitOptions,
 };
+use model_registry::kind_from_embedding_flag;
 use std::sync::{Mutex, OnceLock};
 use wasm_bindgen::prelude::*;
 
@@ -30,6 +32,52 @@ fn embedded_unavailable() -> JsValue {
 fn global_state() -> &'static Mutex<EngineState> {
     static STATE: OnceLock<Mutex<EngineState>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(EngineState::new()))
+}
+
+fn js_string_err(e: String) -> JsValue {
+    JsValue::from_str(&e)
+}
+
+fn register_loaded_model(
+    state: &mut EngineState,
+    model_id: &str,
+    context_id: i64,
+    embedding: bool,
+) -> Result<(), JsValue> {
+    let kind = kind_from_embedding_flag(embedding);
+    state
+        .registry_mut()
+        .register(model_id, context_id, kind)
+        .map_err(js_string_err)?;
+    Ok(())
+}
+
+fn context_params_from_opts(model_id: &str, opts: &ModelInitOptions) -> Result<ContextParams, JsValue> {
+    let mut ctx_params = ContextParams::default();
+    ctx_params.model = opts
+        .model_path
+        .clone()
+        .unwrap_or_else(|| model_id.to_string());
+    if let Some(n_ctx) = opts.n_ctx {
+        ctx_params.n_ctx = n_ctx;
+    }
+    if let Some(n_threads) = opts.n_threads {
+        ctx_params.n_threads = n_threads;
+    }
+    if let Some(n_batch) = opts.n_batch {
+        ctx_params.n_batch = n_batch;
+    }
+    if let Some(n_gpu_layers) = opts.n_gpu_layers {
+        ctx_params.n_gpu_layers = n_gpu_layers;
+    }
+    if let Some(embedding) = opts.embedding {
+        ctx_params.embedding = embedding;
+    }
+    ctx_params.use_mmap = false;
+    if let Some(use_mlock) = opts.use_mlock {
+        ctx_params.use_mlock = use_mlock;
+    }
+    Ok(ctx_params)
 }
 
 /// JSPI + wasm-bindgen describe can swap the 2nd/3rd string args (vfs_path ↔ opts_json).
@@ -73,29 +121,15 @@ pub fn load_model(model_id: String, bytes: &[u8], opts_json: String) -> Result<(
         let opts: ModelInitOptions = serde_json::from_str(&opts_json)
             .map_err(|e| JsValue::from_str(&format!("Invalid options JSON: {}", e)))?;
 
-        // Build context parameters from opts (model_path is ignored for WASM —
-        // bytes are the source of truth, fixing the silent-discard bug #1).
-        let mut ctx_params = ContextParams::default();
-        // Still populate model name from opts for logging / metadata purposes.
-        ctx_params.model = opts.model_path.unwrap_or_else(|| model_id.clone());
-        if let Some(n_ctx) = opts.n_ctx { ctx_params.n_ctx = n_ctx; }
-        if let Some(n_threads) = opts.n_threads { ctx_params.n_threads = n_threads; }
-        if let Some(n_batch) = opts.n_batch { ctx_params.n_batch = n_batch; }
-        if let Some(n_gpu_layers) = opts.n_gpu_layers { ctx_params.n_gpu_layers = n_gpu_layers; }
-        if let Some(embedding) = opts.embedding { ctx_params.embedding = embedding; }
-        // Disable mmap for WASM — no real filesystem mmap available.
-        ctx_params.use_mmap = false;
-        if let Some(use_mlock) = opts.use_mlock { ctx_params.use_mlock = use_mlock; }
-
+        let ctx_params = context_params_from_opts(&model_id, &opts)?;
+        let embedding = ctx_params.embedding;
         let params_json = serde_json::to_string(&ctx_params)
             .map_err(|e| JsValue::from_str(&format!("Failed to serialize params: {}", e)))?;
 
-        // Use bytes-based init so the model is loaded from the buffer the
-        // worker read from OPFS, not from a (nonexistent) file path (#1).
         let context_id = ffi::init_context_from_buffer(bytes, &params_json)
             .map_err(|e| JsValue::from_str(&e))?;
 
-        state.set_context(&model_id, context_id);
+        register_loaded_model(&mut state, &model_id, context_id, embedding)?;
         Ok(())
     }
 
@@ -161,9 +195,12 @@ pub fn load_model_from_vfs(model_id: String, vfs_path: String, opts_json: String
         }
 
         let (vfs_path, opts_json) = normalize_vfs_and_opts(vfs_path, opts_json);
+        let opts: ModelInitOptions = serde_json::from_str(&opts_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid options JSON: {}", e)))?;
+        let embedding = opts.embedding.unwrap_or(false);
         let context_id = ffi::model_vfs_finish(&vfs_path, &opts_json)
             .map_err(|e| JsValue::from_str(&e))?;
-        state.set_context(&model_id, context_id);
+        register_loaded_model(&mut state, &model_id, context_id, embedding)?;
         Ok(())
     }
     #[cfg(not(llama_embed_cpp))]
@@ -187,9 +224,12 @@ pub fn load_model_from_path(model_id: String, vfs_path: String, opts_json: Strin
         }
 
         let (vfs_path, opts_json) = normalize_vfs_and_opts(vfs_path, opts_json);
+        let opts: ModelInitOptions = serde_json::from_str(&opts_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid options JSON: {}", e)))?;
+        let embedding = opts.embedding.unwrap_or(false);
         let context_id = ffi::load_context_from_path(&vfs_path, &opts_json)
             .map_err(|e| JsValue::from_str(&e))?;
-        state.set_context(&model_id, context_id);
+        register_loaded_model(&mut state, &model_id, context_id, embedding)?;
         Ok(())
     }
 
@@ -215,7 +255,7 @@ pub fn register_model_context(model_id: String, context_id: i64) -> Result<(), J
         if !state.initialized {
             return Err(JsValue::from_str("Engine not initialized"));
         }
-        state.set_context(&model_id, context_id);
+        register_loaded_model(&mut state, &model_id, context_id, false)?;
         Ok(())
     }
     #[cfg(not(llama_embed_cpp))]
@@ -246,6 +286,71 @@ pub fn unload_model(model_id: String) -> Result<(), JsValue> {
     Ok(())
 }
 
+/// Point the active inference handler at a loaded model (weights stay resident).
+#[wasm_bindgen]
+pub fn set_active_model(model_id: String) -> Result<(), JsValue> {
+    let lock = global_state();
+    let mut state = lock
+        .lock()
+        .map_err(|_| JsValue::from_str("Failed to acquire engine state lock"))?;
+    state
+        .set_active_model(&model_id)
+        .map_err(js_string_err)
+}
+
+/// Return the model id currently selected by the active handler.
+#[wasm_bindgen]
+pub fn get_active_model() -> Result<String, JsValue> {
+    let lock = global_state();
+    let state = lock
+        .lock()
+        .map_err(|_| JsValue::from_str("Failed to acquire engine state lock"))?;
+    state
+        .active_model_id()
+        .map(|s| s.to_string())
+        .ok_or_else(|| JsValue::from_str("No active model"))
+}
+
+/// List resident models, context ids, kinds, and which one is active.
+#[wasm_bindgen]
+pub fn list_loaded_models() -> Result<String, JsValue> {
+    use model_registry::ModelKind;
+
+    let lock = global_state();
+    let state = lock
+        .lock()
+        .map_err(|_| JsValue::from_str("Failed to acquire engine state lock"))?;
+
+    let models: Vec<serde_json::Value> = state
+        .registry()
+        .list()
+        .into_iter()
+        .map(|(id, ctx, kind, active)| {
+            let kind_str = match kind {
+                ModelKind::Chat => "chat",
+                ModelKind::Embed => "embed",
+                ModelKind::Other => "other",
+            };
+            serde_json::json!({
+                "modelId": id,
+                "contextId": ctx,
+                "kind": kind_str,
+                "active": active,
+            })
+        })
+        .collect();
+
+    let payload = serde_json::json!({
+        "maxModels": model_registry::MAX_RESIDENT_MODELS,
+        "loadedCount": models.len(),
+        "activeModelId": state.active_model_id(),
+        "models": models,
+    });
+
+    serde_json::to_string(&payload)
+        .map_err(|e| JsValue::from_str(&format!("Failed to serialize model list: {}", e)))
+}
+
 /// Generate text from a prompt (non-streaming).
 /// The global state mutex is released before calling into C to avoid
 /// blocking all other WASM operations for the duration of inference (#2).
@@ -263,8 +368,8 @@ pub fn generate(model_id: String, req_json: String) -> Result<String, JsValue> {
                 return Err(JsValue::from_str("Engine not initialized"));
             }
             state
-                .get_context(&model_id)
-                .ok_or_else(|| JsValue::from_str("Model not loaded"))?
+                .resolve_context(&model_id)
+                .map_err(js_string_err)?
         }; // lock released here
 
         let req: GenerateRequest = serde_json::from_str(&req_json)
@@ -378,8 +483,8 @@ pub fn generate_stream(
                 return Err(JsValue::from_str("Engine not initialized"));
             }
             state
-                .get_context(&model_id)
-                .ok_or_else(|| JsValue::from_str("Model not loaded"))?
+                .resolve_context(&model_id)
+                .map_err(js_string_err)?
         };
 
         let req: GenerateRequest = serde_json::from_str(&req_json)
@@ -519,8 +624,8 @@ pub fn embed(model_id: String, req_json: String) -> Result<String, JsValue> {
                 return Err(JsValue::from_str("Engine not initialized"));
             }
             state
-                .get_context(&model_id)
-                .ok_or_else(|| JsValue::from_str("Model not loaded"))?
+                .resolve_context(&model_id)
+                .map_err(js_string_err)?
         };
 
         let request: EmbedRequest = serde_json::from_str(&req_json)
@@ -565,8 +670,8 @@ pub fn tokenize(model_id: String, text: String) -> Result<String, JsValue> {
                 return Err(JsValue::from_str("Engine not initialized"));
             }
             state
-                .get_context(&model_id)
-                .ok_or_else(|| JsValue::from_str("Model not loaded"))?
+                .resolve_context(&model_id)
+                .map_err(js_string_err)?
         };
 
         let raw = ffi::tokenize(context_id, &text)
@@ -597,8 +702,8 @@ pub fn detokenize(model_id: String, tokens_json: String) -> Result<String, JsVal
                 return Err(JsValue::from_str("Engine not initialized"));
             }
             state
-                .get_context(&model_id)
-                .ok_or_else(|| JsValue::from_str("Model not loaded"))?
+                .resolve_context(&model_id)
+                .map_err(js_string_err)?
         };
 
         let tokens: Vec<i32> = serde_json::from_str(&tokens_json)
@@ -645,7 +750,9 @@ pub fn health() -> Result<String, JsValue> {
         .map_err(|_| JsValue::from_str("Failed to acquire engine state lock"))?;
     let payload = serde_json::json!({
         "ok": state.initialized,
-        "loadedModels": state.contexts.len()
+        "loadedModels": state.registry().len(),
+        "maxModels": model_registry::MAX_RESIDENT_MODELS,
+        "activeModelId": state.active_model_id(),
     });
     Ok(payload.to_string())
 }

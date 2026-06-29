@@ -5,7 +5,9 @@ export interface InitializeOptions {
   modelPath?: string;
   modelUrl?: string;
   n_ctx?: number;
+  n_batch?: number;
   n_threads?: number;
+  n_gpu_layers?: number;
   embedding?: boolean;
   /** WASM: force VFS streaming instead of HeapFS (default: auto for models >500 MB). */
   preferVfsStreaming?: boolean;

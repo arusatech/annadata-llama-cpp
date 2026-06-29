@@ -4,6 +4,7 @@ import {
   openOpfsModelSyncReader,
   readModelBufferFromOpfs,
 } from '../storage/opfs.store';
+import { WASM_MAX_CONCURRENT_MODELS } from '../isomorphic/wasmMemoryPolicy';
 
 type GenerateResult = {
   text: string;
@@ -173,10 +174,35 @@ self.onmessage = async (evt: MessageEvent<WorkerRequest>) => {
 
         try {
           await inflight;
+          let measuredFootprintBytes: number | undefined;
+          let wasmLinearBytes: number | undefined;
+          try {
+            const engine = ensureEngine();
+            const mem = engine ? await engine.memory?.() : undefined;
+            if (mem && typeof mem.wasmLinearBytes === 'number') {
+              wasmLinearBytes = mem.wasmLinearBytes;
+            }
+            if (Array.isArray(mem?.loadedModels)) {
+              const row = mem.loadedModels.find(
+                (m: { modelId?: string }) => m?.modelId === requestModelId,
+              );
+              if (row && typeof row.measuredFootprintBytes === 'number' && row.measuredFootprintBytes > 0) {
+                measuredFootprintBytes = row.measuredFootprintBytes;
+              }
+            }
+          } catch {
+            /* optional calibration read */
+          }
           postEvent({
             id: req.id,
             type: 'RESULT',
-            payload: { ok: true, modelId: requestModelId, ready: true },
+            payload: {
+              ok: true,
+              modelId: requestModelId,
+              ready: true,
+              wasmLinearBytes,
+              measuredFootprintBytes,
+            },
           });
         } catch (readErr) {
           const reason =
@@ -316,11 +342,15 @@ self.onmessage = async (evt: MessageEvent<WorkerRequest>) => {
 
       case 'MEMORY': {
         const details = state.engine ? await state.engine.memory?.() : undefined;
+        const loadedModelIds = [...state.loadedModels];
         postEvent({
           id: req.id,
           type: 'RESULT',
           payload: {
             pressure: 'unknown',
+            loadedModelIds,
+            loadedModelCount: loadedModelIds.length,
+            maxModels: WASM_MAX_CONCURRENT_MODELS,
             ...(details ?? {}),
           },
         });
