@@ -90,6 +90,64 @@ extern "C" {
     pub fn llama_convert_json_schema_to_grammar(
         schema_json: *const c_char,
     ) -> *const c_char;
+
+    pub fn llama_cap_rerank(
+        context_id: i64,
+        query: *const c_char,
+        documents_json: *const c_char,
+    ) -> *const c_char;
+
+    pub fn llama_cap_bench(context_id: i64, pp: c_int, tg: c_int, pl: c_int, nr: c_int) -> *const c_char;
+
+    pub fn llama_cap_save_session(
+        context_id: i64,
+        filepath: *const c_char,
+        token_size: c_int,
+    ) -> *const c_char;
+
+    pub fn llama_cap_load_session(context_id: i64, filepath: *const c_char) -> *const c_char;
+
+    pub fn llama_cap_apply_lora(context_id: i64, lora_list_json: *const c_char) -> *const c_char;
+
+    pub fn llama_cap_remove_lora(context_id: i64) -> *const c_char;
+
+    pub fn llama_cap_get_lora(context_id: i64) -> *const c_char;
+
+    pub fn llama_cap_init_multimodal(
+        context_id: i64,
+        path: *const c_char,
+        use_gpu: c_int,
+    ) -> *const c_char;
+
+    pub fn llama_cap_multimodal_status(context_id: i64) -> *const c_char;
+
+    pub fn llama_cap_release_multimodal(context_id: i64) -> *const c_char;
+
+    pub fn llama_cap_init_vocoder(
+        context_id: i64,
+        path: *const c_char,
+        n_batch: c_int,
+    ) -> *const c_char;
+
+    pub fn llama_cap_vocoder_enabled(context_id: i64) -> *const c_char;
+
+    pub fn llama_cap_release_vocoder(context_id: i64) -> *const c_char;
+
+    pub fn llama_cap_formatted_audio_completion(
+        context_id: i64,
+        speaker_json: *const c_char,
+        text_to_speak: *const c_char,
+    ) -> *const c_char;
+
+    pub fn llama_cap_audio_guide_tokens(
+        context_id: i64,
+        text_to_speak: *const c_char,
+    ) -> *const c_char;
+
+    pub fn llama_cap_decode_audio_tokens(
+        context_id: i64,
+        tokens_json: *const c_char,
+    ) -> *const c_char;
 }
 
 /// Safe wrapper for initializing a context from raw in-memory model bytes (#1).
@@ -367,4 +425,132 @@ pub fn convert_json_schema_to_grammar(schema_json: &str) -> Result<String, Strin
             .map(|s| s.to_string())
             .map_err(|e| format!("Invalid UTF-8 in grammar result: {}", e))
     }
+}
+
+fn cstr_json_result(result_ptr: *const c_char, op: &str) -> Result<String, String> {
+    if result_ptr.is_null() {
+        return Err(format!("{} returned null", op));
+    }
+    unsafe {
+        CStr::from_ptr(result_ptr)
+            .to_str()
+            .map(|s| s.to_string())
+            .map_err(|e| format!("Invalid UTF-8 in {} result: {}", op, e))
+    }
+}
+
+fn cstr_json_call<F>(op: &str, f: F) -> Result<String, String>
+where
+    F: FnOnce() -> *const c_char,
+{
+    cstr_json_result(f(), op)
+}
+
+pub fn rerank(context_id: i64, query: &str, documents_json: &str) -> Result<String, String> {
+    let query_c = CString::new(query).map_err(|e| format!("Invalid query: {}", e))?;
+    let docs_c = CString::new(documents_json).map_err(|e| format!("Invalid documents JSON: {}", e))?;
+    cstr_json_call("llama_cap_rerank", || unsafe {
+        llama_cap_rerank(context_id, query_c.as_ptr(), docs_c.as_ptr())
+    })
+}
+
+pub fn bench(context_id: i64, pp: i32, tg: i32, pl: i32, nr: i32) -> Result<String, String> {
+    cstr_json_call("llama_cap_bench", || unsafe {
+        llama_cap_bench(context_id, pp, tg, pl, nr)
+    })
+}
+
+pub fn save_session(context_id: i64, filepath: &str, token_size: i32) -> Result<String, String> {
+    let path_c = CString::new(filepath).map_err(|e| format!("Invalid filepath: {}", e))?;
+    cstr_json_call("llama_cap_save_session", || unsafe {
+        llama_cap_save_session(context_id, path_c.as_ptr(), token_size)
+    })
+}
+
+pub fn load_session(context_id: i64, filepath: &str) -> Result<String, String> {
+    let path_c = CString::new(filepath).map_err(|e| format!("Invalid filepath: {}", e))?;
+    cstr_json_call("llama_cap_load_session", || unsafe {
+        llama_cap_load_session(context_id, path_c.as_ptr())
+    })
+}
+
+pub fn apply_lora(context_id: i64, lora_list_json: &str) -> Result<String, String> {
+    let lora_c = CString::new(lora_list_json).map_err(|e| format!("Invalid lora JSON: {}", e))?;
+    cstr_json_call("llama_cap_apply_lora", || unsafe {
+        llama_cap_apply_lora(context_id, lora_c.as_ptr())
+    })
+}
+
+pub fn remove_lora(context_id: i64) -> Result<String, String> {
+    cstr_json_call("llama_cap_remove_lora", || unsafe {
+        llama_cap_remove_lora(context_id)
+    })
+}
+
+pub fn get_lora(context_id: i64) -> Result<String, String> {
+    cstr_json_call("llama_cap_get_lora", || unsafe { llama_cap_get_lora(context_id) })
+}
+
+pub fn init_multimodal(context_id: i64, path: &str, use_gpu: bool) -> Result<String, String> {
+    let path_c = CString::new(path).map_err(|e| format!("Invalid path: {}", e))?;
+    cstr_json_call("llama_cap_init_multimodal", || unsafe {
+        llama_cap_init_multimodal(context_id, path_c.as_ptr(), if use_gpu { 1 } else { 0 })
+    })
+}
+
+pub fn multimodal_status(context_id: i64) -> Result<String, String> {
+    cstr_json_call("llama_cap_multimodal_status", || unsafe {
+        llama_cap_multimodal_status(context_id)
+    })
+}
+
+pub fn release_multimodal(context_id: i64) -> Result<String, String> {
+    cstr_json_call("llama_cap_release_multimodal", || unsafe {
+        llama_cap_release_multimodal(context_id)
+    })
+}
+
+pub fn init_vocoder(context_id: i64, path: &str, n_batch: i32) -> Result<String, String> {
+    let path_c = CString::new(path).map_err(|e| format!("Invalid path: {}", e))?;
+    cstr_json_call("llama_cap_init_vocoder", || unsafe {
+        llama_cap_init_vocoder(context_id, path_c.as_ptr(), n_batch)
+    })
+}
+
+pub fn vocoder_enabled(context_id: i64) -> Result<String, String> {
+    cstr_json_call("llama_cap_vocoder_enabled", || unsafe {
+        llama_cap_vocoder_enabled(context_id)
+    })
+}
+
+pub fn release_vocoder(context_id: i64) -> Result<String, String> {
+    cstr_json_call("llama_cap_release_vocoder", || unsafe {
+        llama_cap_release_vocoder(context_id)
+    })
+}
+
+pub fn formatted_audio_completion(
+    context_id: i64,
+    speaker_json: &str,
+    text_to_speak: &str,
+) -> Result<String, String> {
+    let speaker_c = CString::new(speaker_json).map_err(|e| format!("Invalid speaker JSON: {}", e))?;
+    let text_c = CString::new(text_to_speak).map_err(|e| format!("Invalid text: {}", e))?;
+    cstr_json_call("llama_cap_formatted_audio_completion", || unsafe {
+        llama_cap_formatted_audio_completion(context_id, speaker_c.as_ptr(), text_c.as_ptr())
+    })
+}
+
+pub fn audio_guide_tokens(context_id: i64, text_to_speak: &str) -> Result<String, String> {
+    let text_c = CString::new(text_to_speak).map_err(|e| format!("Invalid text: {}", e))?;
+    cstr_json_call("llama_cap_audio_guide_tokens", || unsafe {
+        llama_cap_audio_guide_tokens(context_id, text_c.as_ptr())
+    })
+}
+
+pub fn decode_audio_tokens(context_id: i64, tokens_json: &str) -> Result<String, String> {
+    let tokens_c = CString::new(tokens_json).map_err(|e| format!("Invalid tokens JSON: {}", e))?;
+    cstr_json_call("llama_cap_decode_audio_tokens", || unsafe {
+        llama_cap_decode_audio_tokens(context_id, tokens_c.as_ptr())
+    })
 }

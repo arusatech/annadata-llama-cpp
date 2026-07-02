@@ -21,7 +21,7 @@ A native Capacitor plugin that embeds [llama.cpp](https://github.com/ggerganov/l
 - **Session Management**: Save and load conversation states
 - **Benchmarking**: Performance testing and optimization tools
 - **Structured Output**: Generate JSON with schema validation
-- **Cross-Platform**: iOS and Android support with native optimizations
+- **Cross-Platform**: iOS, Android, and **Web/PWA** (WASM + OPFS) with native optimizations
 
 ## ✅ **Complete Implementation Status**
 
@@ -488,18 +488,31 @@ interface CompletionParams {
 
 ## 📱 Platform Support
 
-| Feature | iOS | Android | Web |
-|---------|-----|---------|-----|
-| Text Generation | ✅ | ✅ | ❌ |
-| Chat Conversations | ✅ | ✅ | ❌ |
-| Streaming | ✅ | ✅ | ❌ |
-| Multimodal | ✅ | ✅ | ❌ |
-| TTS | ✅ | ✅ | ❌ |
-| LoRA Adapters | ✅ | ✅ | ❌ |
-| Embeddings | ✅ | ✅ | ❌ |
-| Reranking | ✅ | ✅ | ❌ |
-| Session Management | ✅ | ✅ | ❌ |
-| Benchmarking | ✅ | ✅ | ❌ |
+| Feature | iOS | Android | Web (PWA) |
+|---------|-----|---------|-----------|
+| Text Generation | ✅ | ✅ | ✅ |
+| Chat Conversations | ✅ | ✅ | ✅ |
+| Streaming | ✅ | ✅ | ✅ |
+| Multimodal | ✅ | ✅ | ✅¹ |
+| TTS | ✅ | ✅ | ✅¹ |
+| LoRA Adapters | ✅ | ✅ | ✅¹ |
+| Embeddings | ✅ | ✅ | ✅ |
+| Reranking | ✅ | ✅ | ✅² |
+| Session Management | ✅ | ✅ | ✅³ |
+| Benchmarking | ✅ | ✅ | ✅ |
+
+¹ **Web:** auxiliary GGUF files (mmproj, vocoder, LoRA) must be staged in the WASM VFS (e.g. via OPFS download → `/tmp/` path). GPU offload is not available in browser WASM.
+
+² **Web:** requires a rank-pooling embedding model (same as native).
+
+³ **Web:** sessions persist in the worker MEMFS `/tmp/` for the lifetime of the WASM worker tab session.
+
+### PWA requirements
+
+- **OPFS** for model storage (`navigator.storage.getDirectory`)
+- **Dedicated worker** for inference (included in the package)
+- **COOP/COEP** optional — enables pthread builds; single-threaded WASM works without it
+- Rebuild WASM after updating: `npm run build:pwa:full`
 
 ## 🎨 Advanced Examples
 

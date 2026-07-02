@@ -56,6 +56,26 @@ export type WasmEngine = {
   detokenize?: (modelId: string, tokens: number[]) => Promise<DetokenizeResult> | DetokenizeResult;
   /** Convert a JSON Schema to a GBNF grammar string for constrained sampling. */
   convertJsonSchemaToGrammar?: (schemaJson: string) => Promise<string> | string;
+  rerank?: (modelId: string, query: string, documents: string[]) => Promise<Array<{ index: number; score: number }>>;
+  bench?: (modelId: string, pp: number, tg: number, pl: number, nr: number) => Promise<string>;
+  saveSession?: (modelId: string, filepath: string, tokenSize: number) => Promise<{ tokens_saved: number }>;
+  loadSession?: (modelId: string, filepath: string) => Promise<{ tokens_loaded: number; prompt: string }>;
+  applyLoraAdapters?: (modelId: string, loraAdapters: Array<{ path: string; scaled?: number }>) => Promise<void>;
+  removeLoraAdapters?: (modelId: string) => Promise<void>;
+  getLoadedLoraAdapters?: (modelId: string) => Promise<Array<{ path: string; scaled?: number }>>;
+  initMultimodal?: (modelId: string, path: string, useGpu?: boolean) => Promise<boolean>;
+  multimodalStatus?: (modelId: string) => Promise<{ enabled: boolean; vision: boolean; audio: boolean }>;
+  releaseMultimodal?: (modelId: string) => Promise<void>;
+  initVocoder?: (modelId: string, path: string, nBatch?: number) => Promise<boolean>;
+  vocoderEnabled?: (modelId: string) => Promise<boolean>;
+  releaseVocoder?: (modelId: string) => Promise<void>;
+  formattedAudioCompletion?: (
+    modelId: string,
+    speakerJson: string,
+    textToSpeak: string,
+  ) => Promise<{ prompt: string; grammar?: string }>;
+  audioGuideTokens?: (modelId: string, textToSpeak: string) => Promise<number[]>;
+  decodeAudioTokens?: (modelId: string, tokens: number[]) => Promise<number[]>;
   health?: () => Promise<Record<string, unknown>> | Record<string, unknown>;
   memory?: () => Promise<Record<string, unknown>> | Record<string, unknown>;
 };
@@ -92,6 +112,22 @@ type WasmModule = {
   tokenize?: (modelId: string, text: string) => string;
   detokenize?: (modelId: string, tokensJson: string) => string;
   convert_json_schema_to_grammar?: (schemaJson: string) => string;
+  rerank?: (modelId: string, query: string, documentsJson: string) => string;
+  bench?: (modelId: string, pp: number, tg: number, pl: number, nr: number) => string;
+  save_session?: (modelId: string, filepath: string, tokenSize: number) => string;
+  load_session?: (modelId: string, filepath: string) => string;
+  apply_lora_adapters?: (modelId: string, loraListJson: string) => void;
+  remove_lora_adapters?: (modelId: string) => void;
+  get_loaded_lora_adapters?: (modelId: string) => string;
+  init_multimodal?: (modelId: string, path: string, useGpu: boolean) => string;
+  multimodal_status?: (modelId: string) => string;
+  release_multimodal?: (modelId: string) => void;
+  init_vocoder?: (modelId: string, path: string, nBatch: number) => string;
+  vocoder_enabled?: (modelId: string) => string;
+  release_vocoder?: (modelId: string) => void;
+  formatted_audio_completion?: (modelId: string, speakerJson: string, textToSpeak: string) => string;
+  audio_guide_tokens?: (modelId: string, textToSpeak: string) => string;
+  decode_audio_tokens?: (modelId: string, tokensJson: string) => string;
   health?: () => string;
   memory_snapshot?: () => string;
 };
@@ -478,6 +514,159 @@ export const loadLlamaWasmEngine = async (): Promise<WasmEngine> => {
         throw new Error('Wasm module missing convert_json_schema_to_grammar export — rebuild with npm run build:wasm');
       }
       return mod.convert_json_schema_to_grammar(schemaJson);
+    },
+
+    rerank: async (modelId, query, documents) => {
+      if (!mod.rerank) {
+        throw new Error('Wasm module missing rerank export — rebuild with npm run build:wasm');
+      }
+      const raw = mod.rerank(modelId, query, JSON.stringify(documents));
+      const parsed = safeJsonParse<Array<{ index: number; score: number }>>(raw, []);
+      if (!Array.isArray(parsed)) {
+        throw new Error(typeof parsed === 'object' && parsed && 'error' in (parsed as object)
+          ? String((parsed as { error?: string }).error)
+          : 'Invalid rerank response');
+      }
+      return parsed;
+    },
+
+    bench: async (modelId, pp, tg, pl, nr) => {
+      if (!mod.bench) {
+        throw new Error('Wasm module missing bench export — rebuild with npm run build:wasm');
+      }
+      return mod.bench(modelId, pp, tg, pl, nr);
+    },
+
+    saveSession: async (modelId, filepath, tokenSize) => {
+      if (!mod.save_session) {
+        throw new Error('Wasm module missing save_session export — rebuild with npm run build:wasm');
+      }
+      const raw = mod.save_session(modelId, filepath, tokenSize);
+      const parsed = safeJsonParse<{ tokens_saved?: number; error?: string }>(raw, {});
+      if (parsed.error) throw new Error(parsed.error);
+      return { tokens_saved: parsed.tokens_saved ?? 0 };
+    },
+
+    loadSession: async (modelId, filepath) => {
+      if (!mod.load_session) {
+        throw new Error('Wasm module missing load_session export — rebuild with npm run build:wasm');
+      }
+      const raw = mod.load_session(modelId, filepath);
+      const parsed = safeJsonParse<{ tokens_loaded?: number; prompt?: string; error?: string }>(raw, {});
+      if (parsed.error) throw new Error(parsed.error);
+      return {
+        tokens_loaded: parsed.tokens_loaded ?? 0,
+        prompt: parsed.prompt ?? '',
+      };
+    },
+
+    applyLoraAdapters: async (modelId, loraAdapters) => {
+      if (!mod.apply_lora_adapters) {
+        throw new Error('Wasm module missing apply_lora_adapters export — rebuild with npm run build:wasm');
+      }
+      mod.apply_lora_adapters(modelId, JSON.stringify(loraAdapters));
+    },
+
+    removeLoraAdapters: async (modelId) => {
+      if (!mod.remove_lora_adapters) {
+        throw new Error('Wasm module missing remove_lora_adapters export — rebuild with npm run build:wasm');
+      }
+      mod.remove_lora_adapters(modelId);
+    },
+
+    getLoadedLoraAdapters: async (modelId) => {
+      if (!mod.get_loaded_lora_adapters) {
+        throw new Error('Wasm module missing get_loaded_lora_adapters export — rebuild with npm run build:wasm');
+      }
+      const raw = mod.get_loaded_lora_adapters(modelId);
+      return safeJsonParse<Array<{ path: string; scaled?: number }>>(raw, []);
+    },
+
+    initMultimodal: async (modelId, path, useGpu = false) => {
+      if (!mod.init_multimodal) {
+        throw new Error('Wasm module missing init_multimodal export — rebuild with npm run build:wasm');
+      }
+      const raw = mod.init_multimodal(modelId, path, useGpu);
+      const parsed = safeJsonParse<{ ok?: boolean; error?: string }>(raw, {});
+      if (parsed.error) throw new Error(parsed.error);
+      return !!parsed.ok;
+    },
+
+    multimodalStatus: async (modelId) => {
+      if (!mod.multimodal_status) {
+        throw new Error('Wasm module missing multimodal_status export — rebuild with npm run build:wasm');
+      }
+      const raw = mod.multimodal_status(modelId);
+      return safeJsonParse<{ enabled: boolean; vision: boolean; audio: boolean }>(raw, {
+        enabled: false,
+        vision: false,
+        audio: false,
+      });
+    },
+
+    releaseMultimodal: async (modelId) => {
+      mod.release_multimodal?.(modelId);
+    },
+
+    initVocoder: async (modelId, path, nBatch = 512) => {
+      if (!mod.init_vocoder) {
+        throw new Error('Wasm module missing init_vocoder export — rebuild with npm run build:wasm');
+      }
+      const raw = mod.init_vocoder(modelId, path, nBatch);
+      const parsed = safeJsonParse<{ ok?: boolean; error?: string }>(raw, {});
+      if (parsed.error) throw new Error(parsed.error);
+      return !!parsed.ok;
+    },
+
+    vocoderEnabled: async (modelId) => {
+      if (!mod.vocoder_enabled) {
+        return false;
+      }
+      const raw = mod.vocoder_enabled(modelId);
+      const parsed = safeJsonParse<{ enabled?: boolean }>(raw, {});
+      return !!parsed.enabled;
+    },
+
+    releaseVocoder: async (modelId) => {
+      mod.release_vocoder?.(modelId);
+    },
+
+    formattedAudioCompletion: async (modelId, speakerJson, textToSpeak) => {
+      if (!mod.formatted_audio_completion) {
+        throw new Error('Wasm module missing formatted_audio_completion export — rebuild with npm run build:wasm');
+      }
+      const raw = mod.formatted_audio_completion(modelId, speakerJson, textToSpeak);
+      const parsed = safeJsonParse<{ prompt?: string; grammar?: string; error?: string }>(raw, {});
+      if (parsed.error) throw new Error(parsed.error);
+      return { prompt: parsed.prompt ?? '', grammar: parsed.grammar };
+    },
+
+    audioGuideTokens: async (modelId, textToSpeak) => {
+      if (!mod.audio_guide_tokens) {
+        throw new Error('Wasm module missing audio_guide_tokens export — rebuild with npm run build:wasm');
+      }
+      const raw = mod.audio_guide_tokens(modelId, textToSpeak);
+      const parsed = safeJsonParse<number[] | { error?: string }>(raw, []);
+      if (!Array.isArray(parsed)) {
+        throw new Error(typeof parsed === 'object' && parsed && 'error' in parsed
+          ? String(parsed.error)
+          : 'Invalid audio guide tokens response');
+      }
+      return parsed;
+    },
+
+    decodeAudioTokens: async (modelId, tokens) => {
+      if (!mod.decode_audio_tokens) {
+        throw new Error('Wasm module missing decode_audio_tokens export — rebuild with npm run build:wasm');
+      }
+      const raw = mod.decode_audio_tokens(modelId, JSON.stringify(tokens));
+      const parsed = safeJsonParse<number[] | { error?: string }>(raw, []);
+      if (!Array.isArray(parsed)) {
+        throw new Error(typeof parsed === 'object' && parsed && 'error' in parsed
+          ? String(parsed.error)
+          : 'Invalid decode audio response');
+      }
+      return parsed;
     },
 
     health: async () => {

@@ -656,6 +656,114 @@ export function embed(model_id, req_json) {
   return _mod.embed(model_id, req_json);
 }
 
+/** Rank documents by relevance (rank-pooling embed models). Returns JSON array. */
+export function rerank(model_id, query, documents_json) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  const fn = _mod.rerank;
+  if (typeof fn !== 'function') throw new Error('rerank not exported — rebuild WASM');
+  return fn(model_id, query, documents_json);
+}
+
+/** Benchmark prompt/tg throughput. Returns JSON-ish bench string. */
+export function bench(model_id, pp, tg, pl, nr) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  const fn = _mod.bench;
+  if (typeof fn !== 'function') throw new Error('bench not exported — rebuild WASM');
+  return fn(model_id, pp, tg, pl, nr);
+}
+
+export function save_session(model_id, filepath, token_size) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  const fn = _mod.save_session;
+  if (typeof fn !== 'function') throw new Error('save_session not exported — rebuild WASM');
+  return fn(model_id, filepath, token_size);
+}
+
+export function load_session(model_id, filepath) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  const fn = _mod.load_session;
+  if (typeof fn !== 'function') throw new Error('load_session not exported — rebuild WASM');
+  return fn(model_id, filepath);
+}
+
+export function apply_lora_adapters(model_id, lora_list_json) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  const fn = _mod.apply_lora_adapters;
+  if (typeof fn !== 'function') throw new Error('apply_lora_adapters not exported — rebuild WASM');
+  return fn(model_id, lora_list_json);
+}
+
+export function remove_lora_adapters(model_id) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  _mod.remove_lora_adapters?.(model_id);
+}
+
+export function get_loaded_lora_adapters(model_id) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  const fn = _mod.get_loaded_lora_adapters;
+  if (typeof fn !== 'function') return '[]';
+  return fn(model_id);
+}
+
+export function init_multimodal(model_id, path, use_gpu) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  const fn = _mod.init_multimodal;
+  if (typeof fn !== 'function') throw new Error('init_multimodal not exported — rebuild WASM');
+  return fn(model_id, path, !!use_gpu);
+}
+
+export function multimodal_status(model_id) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  const fn = _mod.multimodal_status;
+  if (typeof fn !== 'function') return '{"enabled":false,"vision":false,"audio":false}';
+  return fn(model_id);
+}
+
+export function release_multimodal(model_id) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  _mod.release_multimodal?.(model_id);
+}
+
+export function init_vocoder(model_id, path, n_batch) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  const fn = _mod.init_vocoder;
+  if (typeof fn !== 'function') throw new Error('init_vocoder not exported — rebuild WASM');
+  return fn(model_id, path, n_batch ?? 512);
+}
+
+export function vocoder_enabled(model_id) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  const fn = _mod.vocoder_enabled;
+  if (typeof fn !== 'function') return '{"enabled":false}';
+  return fn(model_id);
+}
+
+export function release_vocoder(model_id) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  _mod.release_vocoder?.(model_id);
+}
+
+export function formatted_audio_completion(model_id, speaker_json, text_to_speak) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  const fn = _mod.formatted_audio_completion;
+  if (typeof fn !== 'function') throw new Error('formatted_audio_completion not exported — rebuild WASM');
+  return fn(model_id, speaker_json ?? '', text_to_speak ?? '');
+}
+
+export function audio_guide_tokens(model_id, text_to_speak) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  const fn = _mod.audio_guide_tokens;
+  if (typeof fn !== 'function') throw new Error('audio_guide_tokens not exported — rebuild WASM');
+  return fn(model_id, text_to_speak ?? '');
+}
+
+export function decode_audio_tokens(model_id, tokens_json) {
+  if (!_mod) throw new Error('llama_engine not ready — await init() first');
+  const fn = _mod.decode_audio_tokens;
+  if (typeof fn !== 'function') throw new Error('decode_audio_tokens not exported — rebuild WASM');
+  return fn(model_id, tokens_json);
+}
+
 /** Return engine health as a JSON string. */
 export function health() {
   if (!_mod) throw new Error('llama_engine not ready — await init() first');

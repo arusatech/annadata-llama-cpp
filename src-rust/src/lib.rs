@@ -38,6 +38,25 @@ fn js_string_err(e: String) -> JsValue {
     JsValue::from_str(&e)
 }
 
+fn resolve_context_id(model_id: &str) -> Result<i64, JsValue> {
+    let lock = global_state();
+    let state = lock
+        .lock()
+        .map_err(|_| JsValue::from_str("Failed to acquire engine state lock"))?;
+    if !state.initialized {
+        return Err(JsValue::from_str("Engine not initialized"));
+    }
+    state.resolve_context(model_id).map_err(js_string_err)
+}
+
+fn call_with_model<F>(model_id: String, f: F) -> Result<String, JsValue>
+where
+    F: FnOnce(i64) -> Result<String, String>,
+{
+    let context_id = resolve_context_id(&model_id)?;
+    f(context_id).map_err(js_string_err)
+}
+
 fn register_loaded_model(
     state: &mut EngineState,
     model_id: &str,
@@ -763,4 +782,227 @@ pub fn memory_snapshot() -> Result<String, JsValue> {
     let snap = memory::snapshot();
     serde_json::to_string(&snap)
         .map_err(|e| JsValue::from_str(&format!("Failed to serialize memory snapshot: {}", e)))
+}
+
+/// Rank documents by relevance to a query (requires rank-pooling embed model).
+#[wasm_bindgen]
+pub fn rerank(model_id: String, query: String, documents_json: String) -> Result<String, JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        call_with_model(model_id, |context_id| ffi::rerank(context_id, &query, &documents_json))
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = (model_id, query, documents_json);
+        Err(embedded_unavailable())
+    }
+}
+
+/// Benchmark prompt-processing and token-generation throughput.
+#[wasm_bindgen]
+pub fn bench(model_id: String, pp: i32, tg: i32, pl: i32, nr: i32) -> Result<String, JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        call_with_model(model_id, |context_id| ffi::bench(context_id, pp, tg, pl, nr))
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = (model_id, pp, tg, pl, nr);
+        Err(embedded_unavailable())
+    }
+}
+
+/// Save KV/session state to a VFS path.
+#[wasm_bindgen]
+pub fn save_session(model_id: String, filepath: String, token_size: i32) -> Result<String, JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        call_with_model(model_id, |context_id| ffi::save_session(context_id, &filepath, token_size))
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = (model_id, filepath, token_size);
+        Err(embedded_unavailable())
+    }
+}
+
+/// Load KV/session state from a VFS path.
+#[wasm_bindgen]
+pub fn load_session(model_id: String, filepath: String) -> Result<String, JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        call_with_model(model_id, |context_id| ffi::load_session(context_id, &filepath))
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = (model_id, filepath);
+        Err(embedded_unavailable())
+    }
+}
+
+/// Apply LoRA adapters from VFS-resident GGUF paths.
+#[wasm_bindgen]
+pub fn apply_lora_adapters(model_id: String, lora_list_json: String) -> Result<(), JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        call_with_model(model_id, |context_id| ffi::apply_lora(context_id, &lora_list_json))?;
+        Ok(())
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = (model_id, lora_list_json);
+        Err(embedded_unavailable())
+    }
+}
+
+#[wasm_bindgen]
+pub fn remove_lora_adapters(model_id: String) -> Result<(), JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        call_with_model(model_id, |context_id| ffi::remove_lora(context_id))?;
+        Ok(())
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = model_id;
+        Err(embedded_unavailable())
+    }
+}
+
+#[wasm_bindgen]
+pub fn get_loaded_lora_adapters(model_id: String) -> Result<String, JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        call_with_model(model_id, |context_id| ffi::get_lora(context_id))
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = model_id;
+        Err(embedded_unavailable())
+    }
+}
+
+#[wasm_bindgen]
+pub fn init_multimodal(model_id: String, path: String, use_gpu: bool) -> Result<String, JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        call_with_model(model_id, |context_id| ffi::init_multimodal(context_id, &path, use_gpu))
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = (model_id, path, use_gpu);
+        Err(embedded_unavailable())
+    }
+}
+
+#[wasm_bindgen]
+pub fn multimodal_status(model_id: String) -> Result<String, JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        call_with_model(model_id, |context_id| ffi::multimodal_status(context_id))
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = model_id;
+        Err(embedded_unavailable())
+    }
+}
+
+#[wasm_bindgen]
+pub fn release_multimodal(model_id: String) -> Result<(), JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        call_with_model(model_id, |context_id| ffi::release_multimodal(context_id))?;
+        Ok(())
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = model_id;
+        Err(embedded_unavailable())
+    }
+}
+
+#[wasm_bindgen]
+pub fn init_vocoder(model_id: String, path: String, n_batch: i32) -> Result<String, JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        call_with_model(model_id, |context_id| ffi::init_vocoder(context_id, &path, n_batch))
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = (model_id, path, n_batch);
+        Err(embedded_unavailable())
+    }
+}
+
+#[wasm_bindgen]
+pub fn vocoder_enabled(model_id: String) -> Result<String, JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        call_with_model(model_id, |context_id| ffi::vocoder_enabled(context_id))
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = model_id;
+        Err(embedded_unavailable())
+    }
+}
+
+#[wasm_bindgen]
+pub fn release_vocoder(model_id: String) -> Result<(), JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        call_with_model(model_id, |context_id| ffi::release_vocoder(context_id))?;
+        Ok(())
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = model_id;
+        Err(embedded_unavailable())
+    }
+}
+
+#[wasm_bindgen]
+pub fn formatted_audio_completion(
+    model_id: String,
+    speaker_json: String,
+    text_to_speak: String,
+) -> Result<String, JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        call_with_model(model_id, |context_id| {
+            ffi::formatted_audio_completion(context_id, &speaker_json, &text_to_speak)
+        })
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = (model_id, speaker_json, text_to_speak);
+        Err(embedded_unavailable())
+    }
+}
+
+#[wasm_bindgen]
+pub fn audio_guide_tokens(model_id: String, text_to_speak: String) -> Result<String, JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        call_with_model(model_id, |context_id| ffi::audio_guide_tokens(context_id, &text_to_speak))
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = (model_id, text_to_speak);
+        Err(embedded_unavailable())
+    }
+}
+
+#[wasm_bindgen]
+pub fn decode_audio_tokens(model_id: String, tokens_json: String) -> Result<String, JsValue> {
+    #[cfg(llama_embed_cpp)]
+    {
+        call_with_model(model_id, |context_id| ffi::decode_audio_tokens(context_id, &tokens_json))
+    }
+    #[cfg(not(llama_embed_cpp))]
+    {
+        let _ = (model_id, tokens_json);
+        Err(embedded_unavailable())
+    }
 }

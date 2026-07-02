@@ -501,6 +501,180 @@ export class WebProvider implements LlmProvider {
     return result.grammar;
   }
 
+  private requireLoaded(modelId: string): void {
+    if (!this.loadedModelIds.has(modelId)) {
+      throw new LlmError('MODEL_NOT_LOADED', `Model '${modelId}' is not loaded`);
+    }
+  }
+
+  async rerank(modelId: string, query: string, documents: string[]): Promise<Array<{ index: number; score: number }>> {
+    this.requireLoaded(modelId);
+    const result = await this.sendRequest<{ results: Array<{ index: number; score: number }> }>({
+      type: 'RERANK',
+      modelId,
+      query,
+      documents,
+    });
+    return result.results;
+  }
+
+  async bench(modelId: string, pp: number, tg: number, pl: number, nr: number): Promise<string> {
+    this.requireLoaded(modelId);
+    const result = await this.sendRequest<{ result: string }>({
+      type: 'BENCH',
+      modelId,
+      pp,
+      tg,
+      pl,
+      nr,
+    });
+    return result.result;
+  }
+
+  async saveSession(modelId: string, filepath: string, tokenSize: number): Promise<number> {
+    this.requireLoaded(modelId);
+    const result = await this.sendRequest<{ tokens_saved: number }>({
+      type: 'SAVE_SESSION',
+      modelId,
+      filepath,
+      tokenSize,
+    });
+    return result.tokens_saved;
+  }
+
+  async loadSession(
+    modelId: string,
+    filepath: string,
+  ): Promise<{ tokens_loaded: number; prompt: string }> {
+    this.requireLoaded(modelId);
+    return this.sendRequest<{ tokens_loaded: number; prompt: string }>({
+      type: 'LOAD_SESSION',
+      modelId,
+      filepath,
+    });
+  }
+
+  async applyLoraAdapters(
+    modelId: string,
+    loraAdapters: Array<{ path: string; scaled?: number }>,
+  ): Promise<void> {
+    this.requireLoaded(modelId);
+    await this.sendRequest<{ ok: boolean }>({
+      type: 'APPLY_LORA',
+      modelId,
+      loraAdapters,
+    });
+  }
+
+  async removeLoraAdapters(modelId: string): Promise<void> {
+    this.requireLoaded(modelId);
+    await this.sendRequest<{ ok: boolean }>({ type: 'REMOVE_LORA', modelId });
+  }
+
+  async getLoadedLoraAdapters(
+    modelId: string,
+  ): Promise<Array<{ path: string; scaled?: number }>> {
+    this.requireLoaded(modelId);
+    const result = await this.sendRequest<{ adapters: Array<{ path: string; scaled?: number }> }>({
+      type: 'GET_LORA',
+      modelId,
+    });
+    return result.adapters;
+  }
+
+  async initMultimodal(modelId: string, path: string, useGpu = false): Promise<boolean> {
+    this.requireLoaded(modelId);
+    const result = await this.sendRequest<{ ok: boolean }>({
+      type: 'INIT_MULTIMODAL',
+      modelId,
+      path,
+      useGpu,
+    });
+    return !!result.ok;
+  }
+
+  async isMultimodalEnabled(modelId: string): Promise<boolean> {
+    this.requireLoaded(modelId);
+    const result = await this.sendRequest<{ enabled: boolean }>({
+      type: 'MULTIMODAL_STATUS',
+      modelId,
+    });
+    return !!result.enabled;
+  }
+
+  async getMultimodalSupport(
+    modelId: string,
+  ): Promise<{ vision: boolean; audio: boolean }> {
+    this.requireLoaded(modelId);
+    const result = await this.sendRequest<{ vision: boolean; audio: boolean }>({
+      type: 'MULTIMODAL_STATUS',
+      modelId,
+    });
+    return { vision: !!result.vision, audio: !!result.audio };
+  }
+
+  async releaseMultimodal(modelId: string): Promise<void> {
+    await this.sendRequest<{ ok: boolean }>({ type: 'RELEASE_MULTIMODAL', modelId });
+  }
+
+  async initVocoder(modelId: string, path: string, nBatch = 512): Promise<boolean> {
+    this.requireLoaded(modelId);
+    const result = await this.sendRequest<{ ok: boolean }>({
+      type: 'INIT_VOCODER',
+      modelId,
+      path,
+      nBatch,
+    });
+    return !!result.ok;
+  }
+
+  async isVocoderEnabled(modelId: string): Promise<boolean> {
+    this.requireLoaded(modelId);
+    const result = await this.sendRequest<{ enabled: boolean }>({
+      type: 'VOCODER_ENABLED',
+      modelId,
+    });
+    return !!result.enabled;
+  }
+
+  async releaseVocoder(modelId: string): Promise<void> {
+    await this.sendRequest<{ ok: boolean }>({ type: 'RELEASE_VOCODER', modelId });
+  }
+
+  async getFormattedAudioCompletion(
+    modelId: string,
+    speaker: object | null,
+    textToSpeak: string,
+  ): Promise<{ prompt: string; grammar?: string }> {
+    this.requireLoaded(modelId);
+    return this.sendRequest<{ prompt: string; grammar?: string }>({
+      type: 'FORMATTED_AUDIO',
+      modelId,
+      speakerJson: speaker ? JSON.stringify(speaker) : '',
+      textToSpeak,
+    });
+  }
+
+  async getAudioCompletionGuideTokens(modelId: string, textToSpeak: string): Promise<number[]> {
+    this.requireLoaded(modelId);
+    const result = await this.sendRequest<{ tokens: number[] }>({
+      type: 'AUDIO_GUIDE_TOKENS',
+      modelId,
+      textToSpeak,
+    });
+    return result.tokens;
+  }
+
+  async decodeAudioTokens(modelId: string, tokens: number[]): Promise<number[]> {
+    this.requireLoaded(modelId);
+    const result = await this.sendRequest<{ audio: number[] }>({
+      type: 'DECODE_AUDIO_TOKENS',
+      modelId,
+      tokens,
+    });
+    return result.audio;
+  }
+
   /**
    * Terminate the worker mid-inference. WASM is single-threaded, so posting
    * an abort message cannot be received while generate() is running. Worker

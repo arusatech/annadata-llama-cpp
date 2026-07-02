@@ -357,6 +357,198 @@ self.onmessage = async (evt: MessageEvent<WorkerRequest>) => {
         return;
       }
 
+      case 'RERANK': {
+        if (!state.loadedModels.has(req.modelId)) {
+          postError(req.id, 'MODEL_NOT_LOADED', `Model '${req.modelId}' is not loaded in worker.`);
+          return;
+        }
+        const engine = ensureEngine();
+        if (typeof engine.rerank !== 'function') {
+          postError(req.id, 'INFERENCE_FAILED', 'rerank is not supported by this WASM build');
+          return;
+        }
+        const results = await engine.rerank(req.modelId, req.query, req.documents);
+        postEvent({ id: req.id, type: 'RESULT', payload: { results } });
+        return;
+      }
+
+      case 'BENCH': {
+        if (!state.loadedModels.has(req.modelId)) {
+          postError(req.id, 'MODEL_NOT_LOADED', `Model '${req.modelId}' is not loaded in worker.`);
+          return;
+        }
+        const engine = ensureEngine();
+        if (typeof engine.bench !== 'function') {
+          postError(req.id, 'INFERENCE_FAILED', 'bench is not supported by this WASM build');
+          return;
+        }
+        const result = await engine.bench(req.modelId, req.pp, req.tg, req.pl, req.nr);
+        postEvent({ id: req.id, type: 'RESULT', payload: { result } });
+        return;
+      }
+
+      case 'SAVE_SESSION': {
+        if (!state.loadedModels.has(req.modelId)) {
+          postError(req.id, 'MODEL_NOT_LOADED', `Model '${req.modelId}' is not loaded in worker.`);
+          return;
+        }
+        const engine = ensureEngine();
+        if (typeof engine.saveSession !== 'function') {
+          postError(req.id, 'INFERENCE_FAILED', 'saveSession is not supported by this WASM build');
+          return;
+        }
+        const result = await engine.saveSession(req.modelId, req.filepath, req.tokenSize);
+        postEvent({ id: req.id, type: 'RESULT', payload: result });
+        return;
+      }
+
+      case 'LOAD_SESSION': {
+        if (!state.loadedModels.has(req.modelId)) {
+          postError(req.id, 'MODEL_NOT_LOADED', `Model '${req.modelId}' is not loaded in worker.`);
+          return;
+        }
+        const engine = ensureEngine();
+        if (typeof engine.loadSession !== 'function') {
+          postError(req.id, 'INFERENCE_FAILED', 'loadSession is not supported by this WASM build');
+          return;
+        }
+        const result = await engine.loadSession(req.modelId, req.filepath);
+        postEvent({ id: req.id, type: 'RESULT', payload: result });
+        return;
+      }
+
+      case 'APPLY_LORA': {
+        if (!state.loadedModels.has(req.modelId)) {
+          postError(req.id, 'MODEL_NOT_LOADED', `Model '${req.modelId}' is not loaded in worker.`);
+          return;
+        }
+        const engine = ensureEngine();
+        if (typeof engine.applyLoraAdapters !== 'function') {
+          postError(req.id, 'INFERENCE_FAILED', 'applyLoraAdapters is not supported by this WASM build');
+          return;
+        }
+        await engine.applyLoraAdapters(req.modelId, req.loraAdapters);
+        postEvent({ id: req.id, type: 'RESULT', payload: { ok: true } });
+        return;
+      }
+
+      case 'REMOVE_LORA': {
+        if (!state.loadedModels.has(req.modelId)) {
+          postError(req.id, 'MODEL_NOT_LOADED', `Model '${req.modelId}' is not loaded in worker.`);
+          return;
+        }
+        const engine = ensureEngine();
+        await engine.removeLoraAdapters?.(req.modelId);
+        postEvent({ id: req.id, type: 'RESULT', payload: { ok: true } });
+        return;
+      }
+
+      case 'GET_LORA': {
+        if (!state.loadedModels.has(req.modelId)) {
+          postError(req.id, 'MODEL_NOT_LOADED', `Model '${req.modelId}' is not loaded in worker.`);
+          return;
+        }
+        const engine = ensureEngine();
+        const adapters = (await engine.getLoadedLoraAdapters?.(req.modelId)) ?? [];
+        postEvent({ id: req.id, type: 'RESULT', payload: { adapters } });
+        return;
+      }
+
+      case 'INIT_MULTIMODAL': {
+        if (!state.loadedModels.has(req.modelId)) {
+          postError(req.id, 'MODEL_NOT_LOADED', `Model '${req.modelId}' is not loaded in worker.`);
+          return;
+        }
+        const engine = ensureEngine();
+        const ok = await engine.initMultimodal?.(req.modelId, req.path, req.useGpu ?? false);
+        postEvent({ id: req.id, type: 'RESULT', payload: { ok: !!ok } });
+        return;
+      }
+
+      case 'MULTIMODAL_STATUS': {
+        if (!state.loadedModels.has(req.modelId)) {
+          postError(req.id, 'MODEL_NOT_LOADED', `Model '${req.modelId}' is not loaded in worker.`);
+          return;
+        }
+        const engine = ensureEngine();
+        const status = await engine.multimodalStatus?.(req.modelId);
+        postEvent({ id: req.id, type: 'RESULT', payload: status ?? { enabled: false, vision: false, audio: false } });
+        return;
+      }
+
+      case 'RELEASE_MULTIMODAL': {
+        const engine = ensureEngine();
+        await engine.releaseMultimodal?.(req.modelId);
+        postEvent({ id: req.id, type: 'RESULT', payload: { ok: true } });
+        return;
+      }
+
+      case 'INIT_VOCODER': {
+        if (!state.loadedModels.has(req.modelId)) {
+          postError(req.id, 'MODEL_NOT_LOADED', `Model '${req.modelId}' is not loaded in worker.`);
+          return;
+        }
+        const engine = ensureEngine();
+        const ok = await engine.initVocoder?.(req.modelId, req.path, req.nBatch ?? 512);
+        postEvent({ id: req.id, type: 'RESULT', payload: { ok: !!ok } });
+        return;
+      }
+
+      case 'VOCODER_ENABLED': {
+        if (!state.loadedModels.has(req.modelId)) {
+          postError(req.id, 'MODEL_NOT_LOADED', `Model '${req.modelId}' is not loaded in worker.`);
+          return;
+        }
+        const engine = ensureEngine();
+        const enabled = await engine.vocoderEnabled?.(req.modelId);
+        postEvent({ id: req.id, type: 'RESULT', payload: { enabled: !!enabled } });
+        return;
+      }
+
+      case 'RELEASE_VOCODER': {
+        const engine = ensureEngine();
+        await engine.releaseVocoder?.(req.modelId);
+        postEvent({ id: req.id, type: 'RESULT', payload: { ok: true } });
+        return;
+      }
+
+      case 'FORMATTED_AUDIO': {
+        if (!state.loadedModels.has(req.modelId)) {
+          postError(req.id, 'MODEL_NOT_LOADED', `Model '${req.modelId}' is not loaded in worker.`);
+          return;
+        }
+        const engine = ensureEngine();
+        const result = await engine.formattedAudioCompletion?.(
+          req.modelId,
+          req.speakerJson,
+          req.textToSpeak,
+        );
+        postEvent({ id: req.id, type: 'RESULT', payload: result ?? { prompt: '' } });
+        return;
+      }
+
+      case 'AUDIO_GUIDE_TOKENS': {
+        if (!state.loadedModels.has(req.modelId)) {
+          postError(req.id, 'MODEL_NOT_LOADED', `Model '${req.modelId}' is not loaded in worker.`);
+          return;
+        }
+        const engine = ensureEngine();
+        const tokens = await engine.audioGuideTokens?.(req.modelId, req.textToSpeak);
+        postEvent({ id: req.id, type: 'RESULT', payload: { tokens: tokens ?? [] } });
+        return;
+      }
+
+      case 'DECODE_AUDIO_TOKENS': {
+        if (!state.loadedModels.has(req.modelId)) {
+          postError(req.id, 'MODEL_NOT_LOADED', `Model '${req.modelId}' is not loaded in worker.`);
+          return;
+        }
+        const engine = ensureEngine();
+        const audio = await engine.decodeAudioTokens?.(req.modelId, req.tokens);
+        postEvent({ id: req.id, type: 'RESULT', payload: { audio: audio ?? [] } });
+        return;
+      }
+
       default: {
         const unknownReq = req as any;
         postError(

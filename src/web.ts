@@ -101,6 +101,13 @@ type ActiveDownload = {
 
 const activeDownloads = new Map<string, ActiveDownload>();
 
+/** Map a user-facing path to a WASM VFS path (MEMFS /tmp). */
+function vfsPathForWeb(filepath: string): string {
+  if (filepath.startsWith('/')) return filepath;
+  const base = filepath.split(/[/\\]/).pop() ?? 'file.bin';
+  return `/tmp/${base}`;
+}
+
 export class LlamaCppWeb implements LlamaCppPlugin {
   private provider = new WebProvider();
   // contextId → modelId
@@ -305,14 +312,32 @@ export class LlamaCppWeb implements LlamaCppPlugin {
   }
 
   // -------------------------------------------------------------------------
-  // Session management (not supported on web)
+  // Session management (WASM VFS — persist via /tmp paths in worker)
   // -------------------------------------------------------------------------
-  async loadSession(): Promise<any> {
-    throw new Error('LlamaCppWeb: session persistence is not supported on web');
+  async loadSession({
+    contextId,
+    filepath,
+  }: {
+    contextId: number;
+    filepath: string;
+  }): Promise<{ tokens_loaded: number; prompt: string }> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) throw new Error('LlamaCppWeb: context not found');
+    return this.provider.loadSession(modelId, vfsPathForWeb(filepath));
   }
 
-  async saveSession(): Promise<number> {
-    throw new Error('LlamaCppWeb: session persistence is not supported on web');
+  async saveSession({
+    contextId,
+    filepath,
+    size,
+  }: {
+    contextId: number;
+    filepath: string;
+    size: number;
+  }): Promise<number> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) throw new Error('LlamaCppWeb: context not found');
+    return this.provider.saveSession(modelId, vfsPathForWeb(filepath), size);
   }
 
   // -------------------------------------------------------------------------
@@ -356,57 +381,178 @@ export class LlamaCppWeb implements LlamaCppPlugin {
     return { embedding: result.vectors[0] ?? [] };
   }
 
-  async rerank(): Promise<Array<any>> {
-    throw new Error('LlamaCppWeb: rerank is not supported on web');
+  async rerank({
+    contextId,
+    query,
+    documents,
+  }: {
+    contextId: number;
+    query: string;
+    documents: string[];
+    params?: Record<string, unknown>;
+  }): Promise<Array<{ score: number; index: number }>> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) throw new Error('LlamaCppWeb: context not found');
+    return this.provider.rerank(modelId, query, documents);
   }
 
   // -------------------------------------------------------------------------
   // Benchmarking
   // -------------------------------------------------------------------------
-  async bench(): Promise<string> {
-    throw new Error('LlamaCppWeb: bench is not supported on web');
+  async bench({
+    contextId,
+    pp,
+    tg,
+    pl,
+    nr,
+  }: {
+    contextId: number;
+    pp: number;
+    tg: number;
+    pl: number;
+    nr: number;
+  }): Promise<string> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) throw new Error('LlamaCppWeb: context not found');
+    return this.provider.bench(modelId, pp, tg, pl, nr);
   }
 
   // -------------------------------------------------------------------------
-  // LoRA adapters (not available in WASM)
+  // LoRA adapters
   // -------------------------------------------------------------------------
-  async applyLoraAdapters(): Promise<void> {
-    throw new Error('LlamaCppWeb: LoRA adapters are not supported on web');
+  async applyLoraAdapters({
+    contextId,
+    loraAdapters,
+  }: {
+    contextId: number;
+    loraAdapters: Array<{ path: string; scaled?: number }>;
+  }): Promise<void> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) throw new Error('LlamaCppWeb: context not found');
+    const mapped = loraAdapters.map((la) => ({
+      ...la,
+      path: vfsPathForWeb(la.path),
+    }));
+    await this.provider.applyLoraAdapters(modelId, mapped);
   }
 
-  async removeLoraAdapters(): Promise<void> {
-    throw new Error('LlamaCppWeb: LoRA adapters are not supported on web');
+  async removeLoraAdapters({ contextId }: { contextId: number }): Promise<void> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) throw new Error('LlamaCppWeb: context not found');
+    await this.provider.removeLoraAdapters(modelId);
   }
 
-  async getLoadedLoraAdapters(): Promise<Array<{ path: string; scaled?: number }>> {
-    return [];
+  async getLoadedLoraAdapters({
+    contextId,
+  }: {
+    contextId: number;
+  }): Promise<Array<{ path: string; scaled?: number }>> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) throw new Error('LlamaCppWeb: context not found');
+    return this.provider.getLoadedLoraAdapters(modelId);
   }
 
   // -------------------------------------------------------------------------
-  // Multimodal (not available in WASM)
+  // Multimodal
   // -------------------------------------------------------------------------
-  async initMultimodal(): Promise<boolean> { return false; }
-  async isMultimodalEnabled(): Promise<boolean> { return false; }
-  async getMultimodalSupport(): Promise<{ vision: boolean; audio: boolean }> {
-    return { vision: false, audio: false };
+  async initMultimodal({
+    contextId,
+    params,
+  }: {
+    contextId: number;
+    params: { path: string; use_gpu?: boolean };
+  }): Promise<boolean> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) throw new Error('LlamaCppWeb: context not found');
+    return this.provider.initMultimodal(modelId, vfsPathForWeb(params.path), params.use_gpu ?? false);
   }
-  async releaseMultimodal(): Promise<void> {}
+
+  async isMultimodalEnabled({ contextId }: { contextId: number }): Promise<boolean> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) return false;
+    return this.provider.isMultimodalEnabled(modelId);
+  }
+
+  async getMultimodalSupport({ contextId }: { contextId: number }): Promise<{ vision: boolean; audio: boolean }> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) return { vision: false, audio: false };
+    return this.provider.getMultimodalSupport(modelId);
+  }
+
+  async releaseMultimodal({ contextId }: { contextId: number }): Promise<void> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) return;
+    await this.provider.releaseMultimodal(modelId);
+  }
 
   // -------------------------------------------------------------------------
-  // TTS (not available in WASM)
+  // TTS
   // -------------------------------------------------------------------------
-  async initVocoder(): Promise<boolean> { return false; }
-  async isVocoderEnabled(): Promise<boolean> { return false; }
-  async getFormattedAudioCompletion(): Promise<{ prompt: string; grammar?: string }> {
-    throw new Error('LlamaCppWeb: TTS is not supported on web');
+  async initVocoder({
+    contextId,
+    params,
+  }: {
+    contextId: number;
+    params: { path: string; n_batch?: number };
+  }): Promise<boolean> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) throw new Error('LlamaCppWeb: context not found');
+    return this.provider.initVocoder(
+      modelId,
+      vfsPathForWeb(params.path),
+      params.n_batch ?? 512,
+    );
   }
-  async getAudioCompletionGuideTokens(): Promise<Array<number>> {
-    throw new Error('LlamaCppWeb: TTS is not supported on web');
+
+  async isVocoderEnabled({ contextId }: { contextId: number }): Promise<boolean> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) return false;
+    return this.provider.isVocoderEnabled(modelId);
   }
-  async decodeAudioTokens(): Promise<Array<number>> {
-    throw new Error('LlamaCppWeb: TTS is not supported on web');
+
+  async getFormattedAudioCompletion({
+    contextId,
+    speaker,
+    textToSpeak,
+  }: {
+    contextId: number;
+    speaker: object | null;
+    textToSpeak: string;
+  }): Promise<{ prompt: string; grammar?: string }> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) throw new Error('LlamaCppWeb: context not found');
+    return this.provider.getFormattedAudioCompletion(modelId, speaker, textToSpeak);
   }
-  async releaseVocoder(): Promise<void> {}
+
+  async getAudioCompletionGuideTokens({
+    contextId,
+    textToSpeak,
+  }: {
+    contextId: number;
+    textToSpeak: string;
+  }): Promise<number[]> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) throw new Error('LlamaCppWeb: context not found');
+    return this.provider.getAudioCompletionGuideTokens(modelId, textToSpeak);
+  }
+
+  async decodeAudioTokens({
+    contextId,
+    tokens,
+  }: {
+    contextId: number;
+    tokens: number[];
+  }): Promise<number[]> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) throw new Error('LlamaCppWeb: context not found');
+    return this.provider.decodeAudioTokens(modelId, tokens);
+  }
+
+  async releaseVocoder({ contextId }: { contextId: number }): Promise<void> {
+    const modelId = this.contextToModel.get(contextId);
+    if (!modelId) return;
+    await this.provider.releaseVocoder(modelId);
+  }
 
   // -------------------------------------------------------------------------
   // Fix #8: Model download / management — implemented via OPFS (#8)

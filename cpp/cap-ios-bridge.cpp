@@ -1033,4 +1033,388 @@ const char * llama_convert_json_schema_to_grammar(const char * schema_json) {
     }
 }
 
+static std::string resolve_vfs_path(const char * path) {
+    if (!path || !std::strlen(path)) {
+        return {};
+    }
+    std::string primary(path);
+    std::string resolved = resolve_model_path(primary, nullptr);
+    if (!resolved.empty()) {
+        return resolved;
+    }
+    if (primary.front() == '/') {
+        return primary;
+    }
+#ifdef CAPLLAMA_BUILD_WASM
+    extern "C" void cap_wasm_ensure_tmp_dir(void);
+    cap_wasm_ensure_tmp_dir();
+    return std::string("/tmp/") + std::filesystem::path(primary).filename().string();
+#else
+    return primary;
+#endif
+}
+
+const char * llama_cap_rerank(int64_t context_id, const char * query, const char * documents_json) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto * ctx = get_ctx(context_id);
+        if (!ctx || !ctx->ctx) {
+            return tls_cstr("{\"error\":\"invalid context\"}");
+        }
+        if (!ensure_completion(ctx)) {
+            return tls_cstr("{\"error\":\"completion init failed\"}");
+        }
+        std::string query_str = query ? query : "";
+        std::vector<std::string> documents;
+        if (documents_json && std::strlen(documents_json) > 0) {
+            json arr = json::parse(documents_json);
+            if (arr.is_array()) {
+                for (const auto & el : arr) {
+                    if (el.is_string()) {
+                        documents.push_back(el.get<std::string>());
+                    }
+                }
+            }
+        }
+        auto scores = ctx->completion->rerank(query_str, documents);
+        json results = json::array();
+        std::vector<std::pair<size_t, float>> indexed;
+        indexed.reserve(scores.size());
+        for (size_t i = 0; i < scores.size(); ++i) {
+            indexed.emplace_back(i, scores[i]);
+        }
+        std::sort(indexed.begin(), indexed.end(), [](const auto & a, const auto & b) {
+            return a.second > b.second;
+        });
+        for (const auto & pr : indexed) {
+            results.push_back({{"index", static_cast<int>(pr.first)}, {"score", pr.second}});
+        }
+        return tls_cstr(results.dump());
+    } catch (const std::exception & e) {
+        json err = {{"error", e.what()}};
+        return tls_cstr(err.dump());
+    }
+}
+
+const char * llama_cap_bench(int64_t context_id, int pp, int tg, int pl, int nr) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto * ctx = get_ctx(context_id);
+        if (!ctx || !ctx->ctx) {
+            return tls_cstr("{\"error\":\"invalid context\"}");
+        }
+        if (!ensure_completion(ctx)) {
+            return tls_cstr("{\"error\":\"completion init failed\"}");
+        }
+        return tls_cstr(ctx->completion->bench(pp, tg, pl, nr).c_str());
+    } catch (const std::exception & e) {
+        json err = {{"error", e.what()}};
+        return tls_cstr(err.dump());
+    }
+}
+
+const char * llama_cap_save_session(int64_t context_id, const char * filepath, int token_size) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto * ctx = get_ctx(context_id);
+        if (!ctx || !ctx->ctx) {
+            return tls_cstr("{\"error\":\"invalid context\"}");
+        }
+        std::string path = resolve_vfs_path(filepath);
+        if (path.empty()) {
+            return tls_cstr("{\"error\":\"invalid session path\"}");
+        }
+        std::vector<llama_token> tokens;
+        if (ctx->completion && !ctx->completion->embd.empty()) {
+            tokens = ctx->completion->embd;
+        }
+        if (token_size > 0 && tokens.size() > static_cast<size_t>(token_size)) {
+            tokens.resize(static_cast<size_t>(token_size));
+        }
+        if (!llama_state_save_file(ctx->ctx, path.c_str(), tokens.data(), tokens.size())) {
+            return tls_cstr("{\"error\":\"session save failed\"}");
+        }
+        json out = {{"tokens_saved", static_cast<int>(tokens.size())}};
+        return tls_cstr(out.dump());
+    } catch (const std::exception & e) {
+        json err = {{"error", e.what()}};
+        return tls_cstr(err.dump());
+    }
+}
+
+const char * llama_cap_load_session(int64_t context_id, const char * filepath) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto * ctx = get_ctx(context_id);
+        if (!ctx || !ctx->ctx) {
+            return tls_cstr("{\"error\":\"invalid context\"}");
+        }
+        std::string path = resolve_vfs_path(filepath);
+        if (path.empty()) {
+            return tls_cstr("{\"error\":\"invalid session path\"}");
+        }
+        const size_t cap = 8192;
+        std::vector<llama_token> tokens(cap);
+        size_t n_loaded = 0;
+        if (!llama_state_load_file(ctx->ctx, path.c_str(), tokens.data(), cap, &n_loaded)) {
+            return tls_cstr("{\"error\":\"session load failed\"}");
+        }
+        tokens.resize(n_loaded);
+        std::string prompt = capllama::tokens_to_str(ctx->ctx, tokens.begin(), tokens.end());
+        json out = {
+            {"tokens_loaded", static_cast<int>(n_loaded)},
+            {"prompt", prompt},
+        };
+        return tls_cstr(out.dump());
+    } catch (const std::exception & e) {
+        json err = {{"error", e.what()}};
+        return tls_cstr(err.dump());
+    }
+}
+
+const char * llama_cap_apply_lora(int64_t context_id, const char * lora_list_json) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto * ctx = get_ctx(context_id);
+        if (!ctx || !ctx->model) {
+            return tls_cstr("{\"error\":\"invalid context\"}");
+        }
+        std::vector<common_adapter_lora_info> lora;
+        if (lora_list_json && std::strlen(lora_list_json) > 0) {
+            json arr = json::parse(lora_list_json);
+            if (arr.is_array()) {
+                for (const auto & el : arr) {
+                    if (!el.is_object() || !el.contains("path") || !el["path"].is_string()) {
+                        continue;
+                    }
+                    common_adapter_lora_info la;
+                    la.path = resolve_vfs_path(el["path"].get<std::string>().c_str());
+                    if (la.path.empty()) {
+                        la.path = el["path"].get<std::string>();
+                    }
+                    la.scale = el.value("scaled", el.value("scale", 1.0f));
+                    lora.push_back(std::move(la));
+                }
+            }
+        }
+        if (ctx->applyLoraAdapters(lora) != 0) {
+            return tls_cstr("{\"error\":\"apply lora failed\"}");
+        }
+        return tls_cstr("{\"ok\":true}");
+    } catch (const std::exception & e) {
+        json err = {{"error", e.what()}};
+        return tls_cstr(err.dump());
+    }
+}
+
+const char * llama_cap_remove_lora(int64_t context_id) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto * ctx = get_ctx(context_id);
+        if (!ctx) {
+            return tls_cstr("{\"error\":\"invalid context\"}");
+        }
+        ctx->removeLoraAdapters();
+        return tls_cstr("{\"ok\":true}");
+    } catch (const std::exception & e) {
+        json err = {{"error", e.what()}};
+        return tls_cstr(err.dump());
+    }
+}
+
+const char * llama_cap_get_lora(int64_t context_id) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto * ctx = get_ctx(context_id);
+        if (!ctx) {
+            return tls_cstr("[]");
+        }
+        json arr = json::array();
+        for (const auto & la : ctx->getLoadedLoraAdapters()) {
+            arr.push_back({{"path", la.path}, {"scaled", la.scale}});
+        }
+        return tls_cstr(arr.dump());
+    } catch (...) {
+        return tls_cstr("[]");
+    }
+}
+
+const char * llama_cap_init_multimodal(int64_t context_id, const char * path, int use_gpu) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto * ctx = get_ctx(context_id);
+        if (!ctx) {
+            return tls_cstr("{\"ok\":false,\"error\":\"invalid context\"}");
+        }
+        std::string resolved = resolve_vfs_path(path);
+        if (resolved.empty()) {
+            return tls_cstr("{\"ok\":false,\"error\":\"mmproj path not found\"}");
+        }
+        const bool ok = ctx->initMultimodal(resolved, use_gpu != 0);
+        return tls_cstr(json({{"ok", ok}}).dump());
+    } catch (const std::exception & e) {
+        json err = {{"ok", false}, {"error", e.what()}};
+        return tls_cstr(err.dump());
+    }
+}
+
+const char * llama_cap_multimodal_status(int64_t context_id) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto * ctx = get_ctx(context_id);
+        if (!ctx) {
+            return tls_cstr("{\"enabled\":false,\"vision\":false,\"audio\":false}");
+        }
+        json out = {
+            {"enabled", ctx->isMultimodalEnabled()},
+            {"vision", ctx->isMultimodalSupportVision()},
+            {"audio", ctx->isMultimodalSupportAudio()},
+        };
+        return tls_cstr(out.dump());
+    } catch (...) {
+        return tls_cstr("{\"enabled\":false,\"vision\":false,\"audio\":false}");
+    }
+}
+
+const char * llama_cap_release_multimodal(int64_t context_id) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto * ctx = get_ctx(context_id);
+        if (ctx) {
+            ctx->releaseMultimodal();
+        }
+        return tls_cstr("{\"ok\":true}");
+    } catch (const std::exception & e) {
+        json err = {{"error", e.what()}};
+        return tls_cstr(err.dump());
+    }
+}
+
+const char * llama_cap_init_vocoder(int64_t context_id, const char * path, int n_batch) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto * ctx = get_ctx(context_id);
+        if (!ctx) {
+            return tls_cstr("{\"ok\":false,\"error\":\"invalid context\"}");
+        }
+        std::string resolved = resolve_vfs_path(path);
+        if (resolved.empty()) {
+            return tls_cstr("{\"ok\":false,\"error\":\"vocoder path not found\"}");
+        }
+        const bool ok = ctx->initVocoder(resolved, n_batch > 0 ? n_batch : -1);
+        return tls_cstr(json({{"ok", ok}}).dump());
+    } catch (const std::exception & e) {
+        json err = {{"ok", false}, {"error", e.what()}};
+        return tls_cstr(err.dump());
+    }
+}
+
+const char * llama_cap_vocoder_enabled(int64_t context_id) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto * ctx = get_ctx(context_id);
+        if (!ctx) {
+            return tls_cstr("{\"enabled\":false}");
+        }
+        return tls_cstr(json({{"enabled", ctx->isVocoderEnabled()}}).dump());
+    } catch (...) {
+        return tls_cstr("{\"enabled\":false}");
+    }
+}
+
+const char * llama_cap_release_vocoder(int64_t context_id) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto * ctx = get_ctx(context_id);
+        if (ctx) {
+            ctx->releaseVocoder();
+        }
+        return tls_cstr("{\"ok\":true}");
+    } catch (const std::exception & e) {
+        json err = {{"error", e.what()}};
+        return tls_cstr(err.dump());
+    }
+}
+
+const char * llama_cap_formatted_audio_completion(
+    int64_t context_id,
+    const char * speaker_json,
+    const char * text_to_speak)
+{
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto * ctx = get_ctx(context_id);
+        if (!ctx || !ctx->isVocoderEnabled() || !ctx->tts_wrapper) {
+            return tls_cstr("{\"error\":\"vocoder not enabled\"}");
+        }
+        json speaker = json::object();
+        if (speaker_json && std::strlen(speaker_json) > 0) {
+            speaker = json::parse(speaker_json);
+        }
+        auto result = ctx->tts_wrapper->getFormattedAudioCompletion(
+            ctx,
+            speaker.is_null() ? std::string("null") : speaker.dump(),
+            text_to_speak ? text_to_speak : "");
+        json out = {{"prompt", result.prompt}};
+        if (result.grammar) {
+            out["grammar"] = result.grammar;
+        }
+        return tls_cstr(out.dump());
+    } catch (const std::exception & e) {
+        json err = {{"error", e.what()}};
+        return tls_cstr(err.dump());
+    }
+}
+
+const char * llama_cap_audio_guide_tokens(int64_t context_id, const char * text_to_speak) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto * ctx = get_ctx(context_id);
+        if (!ctx || !ctx->isVocoderEnabled() || !ctx->tts_wrapper) {
+            return tls_cstr("{\"error\":\"vocoder not enabled\"}");
+        }
+        auto tokens = ctx->tts_wrapper->getAudioCompletionGuideTokens(
+            ctx,
+            text_to_speak ? text_to_speak : "");
+        json arr = json::array();
+        for (llama_token t : tokens) {
+            arr.push_back(static_cast<int>(t));
+        }
+        return tls_cstr(arr.dump());
+    } catch (const std::exception & e) {
+        json err = {{"error", e.what()}};
+        return tls_cstr(err.dump());
+    }
+}
+
+const char * llama_cap_decode_audio_tokens(int64_t context_id, const char * tokens_json) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto * ctx = get_ctx(context_id);
+        if (!ctx || !ctx->isVocoderEnabled() || !ctx->tts_wrapper) {
+            return tls_cstr("{\"error\":\"vocoder not enabled\"}");
+        }
+        std::vector<llama_token> tokens;
+        if (tokens_json && std::strlen(tokens_json) > 0) {
+            json arr = json::parse(tokens_json);
+            if (arr.is_array()) {
+                for (const auto & el : arr) {
+                    if (el.is_number_integer()) {
+                        tokens.push_back(static_cast<llama_token>(el.get<int>()));
+                    }
+                }
+            }
+        }
+        auto audio = ctx->tts_wrapper->decodeAudioTokens(ctx, tokens);
+        json arr = json::array();
+        for (float v : audio) {
+            arr.push_back(v);
+        }
+        return tls_cstr(arr.dump());
+    } catch (const std::exception & e) {
+        json err = {{"error", e.what()}};
+        return tls_cstr(err.dump());
+    }
+}
+
 } // extern "C"
